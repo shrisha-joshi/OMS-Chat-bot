@@ -19,6 +19,19 @@ interface ChatMessage {
     url: string
     title: string
   }>
+  evaluation?: {
+    accuracy: number
+    relevance: number
+    completeness: number
+    coherence: number
+    overall_score: number
+    processing_strategy: string
+    query_type: string
+    query_complexity: 'simple' | 'complex' | 'multi_part'
+    cache_hit: boolean
+    retrieval_time: number
+    sources_count: number
+  }
 }
 
 interface ChatSession {
@@ -95,8 +108,8 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         // Update current message with new token
         updateCurrentMessage(data.content)
       } else if (data.type === 'sources') {
-        // Add sources to current message
-        updateCurrentMessageSources(data.sources, data.attachments)
+        // Add sources and evaluation to current message
+        updateCurrentMessageSources(data.sources, data.attachments, data.evaluation)
         setIsProcessing(false)
       } else if (data.type === 'error') {
         handleChatError(data.content)
@@ -195,12 +208,12 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     setSessions(prev => prev.map(s => s.id === updatedSession.id ? updatedSession : s))
   }
 
-  const updateCurrentMessageSources = (sources: any[], attachments: any[]) => {
+  const updateCurrentMessageSources = (sources: any[], attachments: any[], evaluation?: any) => {
     if (!currentSession) return
 
     const updatedMessages = currentSession.messages.map(msg => {
       if (msg.id === currentSession.messages[currentSession.messages.length - 1]?.id) {
-        return { ...msg, sources, attachments }
+        return { ...msg, sources, attachments, evaluation }
       }
       return msg
     })

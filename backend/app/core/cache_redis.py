@@ -24,19 +24,27 @@ class RedisClient:
     async def connect(self):
         """Establish connection to Redis."""
         try:
+            if not settings.redis_url:
+                logger.warning("Redis URL not configured, running without Redis cache")
+                return False
+                
+            logger.info("Attempting to connect to Redis Cloud...")
             self.client = redis.from_url(
                 settings.redis_url,
                 encoding="utf-8",
                 decode_responses=True
             )
-            
             # Test connection
+            # The redis client exposes an async ping; await it to avoid runtime warnings
             await self.client.ping()
-            logger.info("Connected to Redis")
+            logger.info("✅ Successfully connected to Redis Cloud!")
+            return True
             
         except Exception as e:
-            logger.error(f"Failed to connect to Redis: {e}")
-            raise
+            logger.error(f"❌ Failed to connect to Redis: {e}")
+            # Clean up failed connection
+            self.client = None
+            return False
     
     async def disconnect(self):
         """Close Redis connection."""
@@ -56,6 +64,10 @@ class RedisClient:
         Returns:
             bool: Success status
         """
+        if not self.client:
+            logger.debug("Redis not available, skipping cache set")
+            return False
+            
         try:
             serialized_value = json.dumps(value, default=str)
             await self.client.setex(key, expiry_seconds, serialized_value)
@@ -75,6 +87,10 @@ class RedisClient:
         Returns:
             Cached value or None if not found
         """
+        if not self.client:
+            logger.debug("Redis not available, skipping cache get")
+            return None
+            
         try:
             value = await self.client.get(key)
             if value:
@@ -86,6 +102,10 @@ class RedisClient:
     
     async def delete_cache(self, key: str) -> bool:
         """Delete a cached value."""
+        if not self.client:
+            logger.debug("Redis not available, skipping cache delete")
+            return False
+            
         try:
             result = await self.client.delete(key)
             logger.debug(f"Deleted cache key: {key}")
@@ -335,6 +355,20 @@ class RedisClient:
             logger.error(f"Failed to clear pattern {pattern}: {e}")
             return 0
 
+
+    async def is_connected(self) -> bool:
+        """Check if Redis is connected."""
+        return self.client is not None
+
+    async def get_json(self, key: str) -> Any:
+        """Get a JSON value from cache (alias for get_cache)."""
+        return await self.get_cache(key)
+    
+    async def set_json(self, key: str, value: Any, expiry_seconds: int = 3600, expire_seconds: int = None) -> bool:
+        """Set a JSON value in cache (alias for set_cache)."""
+        # Support both parameter names for backward compatibility
+        expiry = expire_seconds if expire_seconds is not None else expiry_seconds
+        return await self.set_cache(key, value, expiry)
 
 # Global Redis client instance
 redis_client = RedisClient()

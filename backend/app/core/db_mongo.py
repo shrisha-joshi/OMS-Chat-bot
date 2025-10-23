@@ -23,9 +23,19 @@ class MongoDBClient:
         self.database = None
         self.fs_bucket: Optional[AsyncIOMotorGridFSBucket] = None
     
+    @property
+    def db(self):
+        """Alias for database to maintain compatibility with service code."""
+        return self.database
+    
     async def connect(self):
         """Establish connection to MongoDB and initialize GridFS."""
         try:
+            if not settings.mongodb_uri:
+                logger.warning("MongoDB URI not configured, running without MongoDB")
+                return False
+                
+            logger.info("Attempting to connect to MongoDB Atlas...")
             self.client = AsyncIOMotorClient(
                 settings.mongodb_uri,
                 serverSelectionTimeoutMS=5000
@@ -35,14 +45,19 @@ class MongoDBClient:
             
             # Test connection
             await self.client.admin.command('ping')
-            logger.info(f"Connected to MongoDB: {settings.mongodb_db}")
+            logger.info(f"✅ Successfully connected to MongoDB: {settings.mongodb_db}")
             
             # Create indexes
             await self._create_indexes()
+            return True
             
         except Exception as e:
-            logger.error(f"Failed to connect to MongoDB: {e}")
-            raise
+            logger.error(f"❌ Failed to connect to MongoDB: {e}")
+            # Clean up failed connection
+            self.client = None
+            self.database = None
+            self.fs_bucket = None
+            return False
     
     async def disconnect(self):
         """Close MongoDB connection."""
@@ -95,6 +110,10 @@ class MongoDBClient:
     async def retrieve_file(self, file_id: ObjectId) -> bytes:
         """Retrieve a file from GridFS by file ID."""
         try:
+            # Handle both ObjectId and string file_id
+            if isinstance(file_id, str):
+                file_id = ObjectId(file_id)
+            
             stream = await self.fs_bucket.open_download_stream(file_id)
             content = await stream.read()
             return content
@@ -267,6 +286,21 @@ class MongoDBClient:
         except Exception as e:
             logger.error(f"Failed to store feedback: {e}")
             return False
+    
+    async def get_all_documents(self) -> List[Dict[str, Any]]:
+        """Get all documents for BM25 indexing."""
+        if not self.database:
+            logger.warning("MongoDB not available, returning empty document list")
+            return []
+            
+        try:
+            documents = await self.database.documents.find({
+                "ingest_status": "completed"
+            }, {"title": 1, "content": 1, "chunk_id": 1}).to_list(None)
+            return documents
+        except Exception as e:
+            logger.error(f"Failed to get all documents: {e}")
+            return []
 
 
 # Global MongoDB client instance

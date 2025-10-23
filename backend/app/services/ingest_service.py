@@ -13,6 +13,7 @@ import mimetypes
 from pathlib import Path
 import json
 import re
+from bson import ObjectId
 
 # Document processing imports
 import PyPDF2
@@ -26,6 +27,8 @@ from ..core.db_mongo import get_mongodb_client, MongoDBClient
 from ..core.db_qdrant import get_qdrant_client, QdrantDBClient
 from ..core.db_arango import get_arango_client, ArangoDBClient
 from ..core.cache_redis import get_redis_client, RedisClient
+from .hierarchical_indexing_service import hierarchical_indexing_service
+from .json_processor_service import JSONProcessorService
 from ..config import settings
 
 logger = logging.getLogger(__name__)
@@ -41,6 +44,7 @@ class IngestService:
         self.qdrant_client = None
         self.arango_client = None
         self.redis_client = None
+        self.json_processor = None
     
     async def initialize(self):
         """Initialize the service with required models and clients."""
@@ -66,6 +70,12 @@ class IngestService:
             
             # Initialize tokenizer for chunk size calculation
             self.tokenizer = tiktoken.get_encoding("cl100k_base")
+            
+            # Initialize JSON processor
+            self.json_processor = JSONProcessorService()
+            
+            # Initialize hierarchical indexing service
+            await hierarchical_indexing_service.initialize()
             
             logger.info("Ingest service initialized successfully")
             
@@ -94,12 +104,22 @@ class IngestService:
             
             logger.info(f"Processing document: {filename}")
             
+            # Check if this is a JSON file for special processing
+            file_ext = Path(filename).suffix.lower()
+            is_json_file = file_ext == ".json"
+            
             # Step 1: Extract file content
             await self.mongo_client.log_ingestion_step(
                 doc_id, "EXTRACT", "PROCESSING", "Extracting content from file"
             )
             
             file_content = await self.mongo_client.retrieve_file(gridfs_id)
+            
+            # Handle JSON files specially
+            if is_json_file:
+                await self._process_json_document(doc_id, file_content, filename)
+                return True
+            
             text_content = await self._extract_text(file_content, filename)
             
             if not text_content or len(text_content.strip()) < 10:
@@ -111,12 +131,18 @@ class IngestService:
                 {"text_length": len(text_content)}
             )
             
-            # Step 2: Chunk the text
+            # Step 2: Create hierarchical chunks with enhanced metadata
             await self.mongo_client.log_ingestion_step(
-                doc_id, "CHUNK", "PROCESSING", "Splitting text into chunks"
+                doc_id, "CHUNK", "PROCESSING", "Creating hierarchical chunks with metadata enrichment"
             )
             
-            chunks = await self._chunk_text(text_content, doc_id)
+            # Extract document type from filename
+            document_type = self._get_document_type(filename)
+            
+            # Use hierarchical chunking for better structure
+            chunks = await hierarchical_indexing_service.create_hierarchical_chunks(
+                text_content, doc_id, filename, document_type
+            )
             
             await self.mongo_client.log_ingestion_step(
                 doc_id, "CHUNK", "SUCCESS", 
@@ -185,6 +211,128 @@ class IngestService:
             
         except Exception as e:
             logger.error(f"Failed to process document {doc_id}: {e}")
+            return False
+    
+    async def _process_json_document(self, doc_id: str, file_content: bytes, filename: str) -> bool:
+        """
+        Process a JSON document with special handling.
+        
+        Args:
+            doc_id: Document ID
+            file_content: Raw file content
+            filename: File name
+            
+        Returns:
+            bool: Success status
+        """
+        try:
+            await self.mongo_client.log_ingestion_step(
+                doc_id, "JSON_PARSE", "PROCESSING", "Parsing JSON file structure"
+            )
+            
+            # Parse JSON and extract data
+            json_data = json.loads(file_content.decode("utf-8", errors="ignore"))
+            
+            # Use JSON processor to extract structured data
+            schema_type = self.json_processor.detect_schema_type(json_data)
+            extracted_data = self.json_processor.extract_structured_data(json_data)
+            
+            await self.mongo_client.log_ingestion_step(
+                doc_id, "JSON_PARSE", "SUCCESS", 
+                f"Detected schema type: {schema_type}, Extracted {len(extracted_data.get('records', []))} records"
+            )
+            
+            # Generate Q&A pairs from JSON data
+            await self.mongo_client.log_ingestion_step(
+                doc_id, "JSON_QA", "PROCESSING", "Generating Q&A pairs from JSON data"
+            )
+            
+            qa_pairs = self.json_processor.generate_qa_pairs(json_data, extracted_data)
+            
+            await self.mongo_client.log_ingestion_step(
+                doc_id, "JSON_QA", "SUCCESS", 
+                f"Generated {len(qa_pairs)} Q&A pairs from JSON data",
+                {"qa_count": len(qa_pairs)}
+            )
+            
+            # Create chunks from Q&A pairs for embedding
+            chunks = []
+            for idx, qa_pair in enumerate(qa_pairs):
+                chunk = {
+                    "text": f"Q: {qa_pair['question']}\nA: {qa_pair['answer']}",
+                    "type": "qa",
+                    "question": qa_pair['question'],
+                    "answer": qa_pair['answer'],
+                    "json_field": qa_pair.get('json_field', ''),
+                    "position": idx,
+                    "doc_id": doc_id,
+                    "filename": filename
+                }
+                chunks.append(chunk)
+            
+            # Generate embeddings for Q&A pairs
+            await self.mongo_client.log_ingestion_step(
+                doc_id, "EMBED", "PROCESSING", "Generating embeddings for Q&A pairs"
+            )
+            
+            qa_texts = [qa['question'] + " " + qa['answer'] for qa in qa_pairs]
+            embeddings = await self._generate_embeddings(qa_texts)
+            
+            await self.mongo_client.log_ingestion_step(
+                doc_id, "EMBED", "SUCCESS", 
+                f"Generated {len(embeddings)} embeddings for Q&A pairs"
+            )
+            
+            # Store chunks in MongoDB
+            await self.mongo_client.log_ingestion_step(
+                doc_id, "STORE_CHUNKS", "PROCESSING", "Storing JSON Q&A chunks in database"
+            )
+            
+            chunk_success = await self.mongo_client.store_chunks(doc_id, chunks)
+            if not chunk_success:
+                raise ValueError("Failed to store chunks in database")
+            
+            await self.mongo_client.log_ingestion_step(
+                doc_id, "STORE_CHUNKS", "SUCCESS", f"Stored {len(chunks)} chunks"
+            )
+            
+            # Store embeddings in Qdrant
+            await self.mongo_client.log_ingestion_step(
+                doc_id, "STORE_VECTORS", "PROCESSING", "Storing embeddings in vector database"
+            )
+            
+            vector_success = await self.qdrant_client.store_chunks(
+                chunks, embeddings, doc_id, filename
+            )
+            if not vector_success:
+                raise ValueError("Failed to store embeddings in vector database")
+            
+            await self.mongo_client.log_ingestion_step(
+                doc_id, "STORE_VECTORS", "SUCCESS", "Embeddings stored in vector database"
+            )
+            
+            # Store JSON metadata for reference
+            await self.mongo_client.update_document_status(doc_id, "COMPLETED")
+            
+            # Store additional JSON metadata in document
+            await self.mongo_client.db["documents"].update_one(
+                {"_id": ObjectId(doc_id)},
+                {"$set": {
+                    "json_metadata": {
+                        "schema_type": schema_type,
+                        "field_count": len(extracted_data.get('fields', {})),
+                        "record_count": len(extracted_data.get('records', [])),
+                        "qa_count": len(qa_pairs),
+                        "fields": extracted_data.get('fields', {})
+                    }
+                }}
+            )
+            
+            logger.info(f"JSON document {doc_id} processed successfully")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to process JSON document {doc_id}: {e}")
             return False
     
     async def _extract_text(self, file_content: bytes, filename: str) -> str:
@@ -507,6 +655,29 @@ class IngestService:
             if chunk["char_start"] <= char_position <= chunk["char_end"]:
                 return f"{chunk.get('doc_id', 'unknown')}_chunk_{chunk['chunk_index']}"
         return None
+    
+    def _get_document_type(self, filename: str) -> str:
+        """Extract document type from filename."""
+        extension = Path(filename).suffix.lower().lstrip('.')
+        
+        # Map file extensions to document types
+        type_mapping = {
+            'pdf': 'pdf',
+            'doc': 'docx',
+            'docx': 'docx',
+            'txt': 'txt',
+            'md': 'markdown',
+            'markdown': 'markdown',
+            'html': 'html',
+            'htm': 'html',
+            'xml': 'xml',
+            'json': 'json',
+            'csv': 'csv',
+            'xlsx': 'xlsx',
+            'xls': 'xlsx'
+        }
+        
+        return type_mapping.get(extension, 'unknown')
     
     async def _cache_document_metadata(self, doc_id: str, document: Dict, chunk_count: int):
         """Cache document metadata for faster access."""

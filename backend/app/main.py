@@ -32,52 +32,115 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator:
     """Application lifespan manager for startup and shutdown events."""
-    
     # Startup
-    logger.info("Starting RAG Graph Chatbot application...")
+    logger.info("=" * 80)
+    logger.info("LIFESPAN: Starting RAG Graph Chatbot application...")
+    logger.info("=" * 80)
     
     try:
-        # Connect to all databases
-        logger.info("Connecting to databases...")
-        await mongodb_client.connect()
-        await qdrant_client.connect()
-        await arango_client.connect()
-        await redis_client.connect()
+        # Connect to all databases (continue even if some fail)
+        logger.info("LIFESPAN: Connecting to databases...")
         
-        # Start background workers
-        logger.info("Starting background workers...")
-        ingest_worker_task = asyncio.create_task(start_ingest_worker())
+        # Try to connect to databases concurrently with per-service timeouts
+        logger.info("LIFESPAN: Attempting database connections concurrently (short timeouts)...")
+
+        async def _safe_connect(client_connect_coro, name: str, timeout: float = 5.0):
+            try:
+                result = await asyncio.wait_for(client_connect_coro, timeout=timeout)
+                logger.info(f"LIFESPAN: {name} connection completed")
+                return result
+            except asyncio.TimeoutError:
+                logger.warning(f"⚠️ {name} connection timed out after {timeout}s - continuing without {name}")
+                return False
+            except Exception as e:
+                logger.warning(f"⚠️ {name} connection failed: {e}")
+                return False
+
+        # Schedule concurrent connections
+        connect_tasks = [
+            _safe_connect(mongodb_client.connect(), "MongoDB", timeout=8.0),
+            _safe_connect(qdrant_client.connect(), "Qdrant", timeout=6.0),
+            _safe_connect(arango_client.connect(), "ArangoDB", timeout=4.0),
+            _safe_connect(redis_client.connect(), "Redis", timeout=4.0)
+        ]
+
+        mongo_success, qdrant_success, arango_success, redis_success = await asyncio.gather(*connect_tasks)
+
+        if not mongo_success:
+            logger.warning("⚠️ MongoDB connection failed - continuing without MongoDB")
+        if not qdrant_success:
+            logger.warning("⚠️ Qdrant connection failed - continuing without Qdrant")
+        if not arango_success:
+            logger.warning("⚠️ ArangoDB connection failed - continuing without ArangoDB")
+        if not redis_success:
+            logger.warning("⚠️ Redis connection failed - continuing without Redis")
         
-        logger.info("✅ Application startup completed successfully")
+        # Start background workers (lazy initialization on first use)
+        logger.info("LIFESPAN: Background workers configured for lazy initialization")
+        app.state.ingest_worker_task = None
+        app.state.ingest_worker_started = False
+        
+        # Schedule a background warmup to initialize heavy services (embeddings, LLMs)
+        async def _warmup_chat_service():
+            try:
+                logger.info("LIFESPAN: Starting background warmup for chat service (non-blocking)")
+                # Import here to avoid circular imports at module load
+                from .api.chat import get_chat_service
+                # Call dependency function to initialize and swallow exceptions
+                await get_chat_service()
+                logger.info("LIFESPAN: Chat service warmup completed")
+            except Exception as e:
+                logger.warning(f"LIFESPAN: Chat service warmup failed: {e}")
+
+        # Fire-and-forget warmup task
+        try:
+            asyncio.create_task(_warmup_chat_service())
+        except Exception:
+            pass
+        
+        logger.info("=" * 80)
+        logger.info("LIFESPAN: ✅ Application startup completed successfully")
+        logger.info("=" * 80)
+        logger.info("LIFESPAN: About to yield control to Uvicorn...")
         
         yield
         
+        logger.info("=" * 80)
+        logger.info("LIFESPAN: Returned from yield, entering shutdown phase")
+        logger.info("=" * 80)
+        
     except Exception as e:
-        logger.error(f"❌ Application startup failed: {e}")
+        logger.error(f"LIFESPAN: ❌ Application startup failed: {e}", exc_info=True)
         raise
     
     # Shutdown
-    logger.info("Shutting down RAG Graph Chatbot application...")
+    logger.info("=" * 80)
+    logger.info("LIFESPAN: Shutting down RAG Graph Chatbot application...")
+    logger.info("=" * 80)
     
     try:
         # Cancel background tasks
-        if 'ingest_worker_task' in locals():
-            ingest_worker_task.cancel()
+        if hasattr(app, 'state') and hasattr(app.state, 'ingest_worker_task') and app.state.ingest_worker_task:
+            logger.info("LIFESPAN: Cancelling ingest worker task...")
+            app.state.ingest_worker_task.cancel()
             try:
-                await ingest_worker_task
-            except asyncio.CancelledError:
-                pass
+                await app.state.ingest_worker_task
+            except (asyncio.CancelledError, Exception):
+                logger.info("LIFESPAN: Ingest worker task cancelled successfully")
         
+        logger.info("LIFESPAN: Disconnecting from databases...")
         # Disconnect from databases
         await mongodb_client.disconnect()
         await qdrant_client.disconnect()
         await arango_client.disconnect()
         await redis_client.disconnect()
         
-        logger.info("✅ Application shutdown completed successfully")
+        logger.info("=" * 80)
+        logger.info("LIFESPAN: ✅ Application shutdown completed successfully")
+        logger.info("=" * 80)
         
     except Exception as e:
-        logger.error(f"❌ Application shutdown failed: {e}")
+        logger.error(f"LIFESPAN: ❌ Application shutdown failed: {e}", exc_info=True)
 
 # Create FastAPI application
 app = FastAPI(
@@ -92,7 +155,13 @@ app = FastAPI(
 # Add middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000", settings.next_public_api_base],
+    allow_origins=[
+        "http://localhost:3000",
+        "http://localhost:3001",
+        "http://127.0.0.1:3000",
+        "http://127.0.0.1:3001",
+        settings.next_public_api_base
+    ],
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
@@ -247,21 +316,29 @@ async def system_info():
 @app.exception_handler(404)
 async def not_found_handler(request, exc):
     """Custom 404 handler."""
-    return {
-        "error": "Not Found",
-        "message": "The requested resource was not found",
-        "status_code": 404
-    }
+    from fastapi.responses import JSONResponse
+    return JSONResponse(
+        status_code=404,
+        content={
+            "error": "Not Found",
+            "message": "The requested resource was not found",
+            "status_code": 404
+        }
+    )
 
 @app.exception_handler(500)
 async def internal_server_error_handler(request, exc):
     """Custom 500 handler."""
+    from fastapi.responses import JSONResponse
     logger.error(f"Internal server error: {exc}")
-    return {
-        "error": "Internal Server Error",
-        "message": "An unexpected error occurred",
-        "status_code": 500
-    }
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": "Internal Server Error",
+            "message": "An unexpected error occurred",
+            "status_code": 500
+        }
+    )
 
 if __name__ == "__main__":
     import uvicorn

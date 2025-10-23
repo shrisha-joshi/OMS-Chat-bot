@@ -45,6 +45,7 @@ yarn-error.log*
 # Next.js
 .next/
 out/
+frontend/.next/
 
 # Logs
 *.log
@@ -59,6 +60,7 @@ redis_data/
 # Uploaded Files
 uploads/
 temp/
+data/
 
 # IDE
 .vscode/
@@ -84,3 +86,45 @@ htmlcov/
 .mypy_cache/
 .dmypy.json
 dmypy.json
+
+# Generated Documentation (Keep only core docs)
+/START_HERE.md
+/FINAL_STATUS.md
+/VISUAL_GUIDE.md
+/NO_AUTH_ADMIN_GUIDE.md
+/ALL_URLS.md
+/FIXED_SUMMARY.md
+/TOKEN_SYSTEM_GUIDE.md
+/SETUP_COMPLETE.md
+/VERIFICATION_CHECKLIST.md
+/ISSUE_ANALYSIS.md
+/SOLUTIONS_IMPLEMENTED.md
+/QUICK_START.txt
+
+# Test Results & Temporary Files
+test_results.json
+*.tmp
+*.temp
+debug.log
+
+# Build Artifacts
+backend/dist/
+frontend/build/
+frontend/.next/
+
+# Optional - Qdrant Source Code (can be excluded if not developing Qdrant)
+# qdrant/target/
+
+# Temporary/Setup Files
+*.msi
+*.exe
+NATIVE-SETUP-STATUS.md
+*.pdf
+oms_rag_project_*.pdf
+Neo4j-*.txt
+.env.example
+.env.minimal
+
+# Generated/Session Files
+e2e_test_runner.py
+package-lock.json (at root level only)

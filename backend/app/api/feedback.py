@@ -23,7 +23,7 @@ class FeedbackRequest(BaseModel):
     session_id: str
     query: str
     response: str
-    rating: str = Field(..., regex="^(thumbs_up|thumbs_down|helpful|not_helpful|1|2|3|4|5)$")
+    rating: str = Field(..., pattern="^(thumbs_up|thumbs_down|helpful|not_helpful|1|2|3|4|5)$")
     correction: Optional[str] = None
     feedback_text: Optional[str] = None
     response_time: Optional[float] = None
@@ -302,7 +302,7 @@ async def get_feedback_corrections(
 
 @router.get("/export")
 async def export_feedback_for_training(
-    format: str = Query("jsonl", regex="^(jsonl|csv)$"),
+    format: str = Query("jsonl", pattern="^(jsonl|csv)$"),
     days: int = Query(30, ge=1, le=365),
     min_rating: Optional[str] = Query(None),
     mongo_client: MongoDBClient = Depends(get_mongodb_client)

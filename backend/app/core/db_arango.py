@@ -11,6 +11,7 @@ from typing import Dict, List, Any, Optional, Tuple
 import logging
 from datetime import datetime
 import hashlib
+import asyncio
 
 from ..config import settings
 
@@ -28,53 +29,98 @@ class ArangoDBClient:
         self.relations_collection = "relations"
     
     async def connect(self):
-        """Establish connection to ArangoDB and setup graph structure."""
-        try:
-            # Initialize client
+        """Establish connection to ArangoDB and setup graph structure.
+
+        This method runs the blocking arango-python driver calls inside threads
+        and enforces a short overall timeout so backend startup doesn't hang
+        if ArangoDB is unreachable.
+        """
+        if not settings.arangodb_url:
+            logger.warning("ArangoDB URL not configured, running without ArangoDB")
+            return False
+
+        timeout_seconds = getattr(settings, "arangodb_connect_timeout", 5.0)
+        logger.info(f"Attempting to connect to ArangoDB at {settings.arangodb_url} with {timeout_seconds}s timeout...")
+
+        async def _do_connect():
+            # Initialize client (fast) and run blocking network/auth calls in a thread
             self.client = ArangoClient(hosts=settings.arangodb_url)
-            
+
             # Connect to system database first to create our database
-            sys_db = self.client.db(
-                "_system",
-                username=settings.arangodb_user,
-                password=settings.arangodb_password
-            )
-            
-            # Create database if it doesn't exist
-            if not sys_db.has_database(settings.arangodb_db):
-                sys_db.create_database(
-                    name=settings.arangodb_db,
-                    users=[{
-                        "username": settings.arangodb_user,
-                        "password": settings.arangodb_password,
-                        "active": True
-                    }]
+            sys_db = await asyncio.to_thread(
+                lambda: self.client.db(
+                    "_system",
+                    username=settings.arangodb_user,
+                    password=settings.arangodb_password
                 )
-                logger.info(f"Created ArangoDB database: {settings.arangodb_db}")
-            
-            # Connect to our database
-            self.database = self.client.db(
-                settings.arangodb_db,
-                username=settings.arangodb_user,
-                password=settings.arangodb_password
             )
-            
-            # Setup graph structure
-            await self._setup_graph()
-            
-            logger.info(f"Connected to ArangoDB: {settings.arangodb_db}")
-            
+
+            # Test connection (blocking) -> offload to thread
+            try:
+                await asyncio.to_thread(sys_db.properties)
+                logger.info("✅ Successfully connected to ArangoDB!")
+            except Exception as auth_error:
+                logger.error(f"❌ ArangoDB authentication failed: {auth_error}")
+                self.client = None
+                return False
+
+            # Create database if it doesn't exist (blocking calls -> thread)
+            def _ensure_database(sys_db_local):
+                if not sys_db_local.has_database(settings.arangodb_db):
+                    sys_db_local.create_database(
+                        name=settings.arangodb_db,
+                        users=[{
+                            "username": settings.arangodb_user,
+                            "password": settings.arangodb_password,
+                            "active": True
+                        }]
+                    )
+                    logger.info(f"Created ArangoDB database: {settings.arangodb_db}")
+
+                return self.client.db(
+                    settings.arangodb_db,
+                    username=settings.arangodb_user,
+                    password=settings.arangodb_password
+                )
+
+            # Ensure database and get database object in thread
+            self.database = await asyncio.to_thread(_ensure_database, sys_db)
+
+            # Setup graph structure (blocking operations) in a thread
+            await asyncio.to_thread(self._setup_graph)
+
+            logger.info(f"ArangoDB graph setup completed successfully")
+            return True
+
+        try:
+            return await asyncio.wait_for(_do_connect(), timeout=timeout_seconds)
+        except asyncio.TimeoutError:
+            logger.warning(f"ArangoDB connection timed out after {timeout_seconds}s - skipping ArangoDB for now")
+            # Clean up partial state
+            self.client = None
+            self.database = None
+            self.graph = None
+            return False
         except Exception as e:
-            logger.error(f"Failed to connect to ArangoDB: {e}")
-            raise
+            logger.error(f"❌ Failed to connect to ArangoDB: {e}")
+            # Clean up failed connection
+            self.client = None
+            self.database = None
+            self.graph = None
+            return False
     
     async def disconnect(self):
         """Close ArangoDB connection."""
         # ArangoDB client doesn't need explicit disconnection
         logger.info("Disconnected from ArangoDB")
     
-    async def _setup_graph(self):
-        """Setup graph collections and relationships."""
+    def _setup_graph(self):
+        """Setup graph collections and relationships.
+
+        This method is synchronous and intended to be executed inside a
+        thread via `asyncio.to_thread` because the underlying arango driver
+        is blocking.
+        """
         try:
             # Create vertex collection for entities
             if not self.database.has_collection(self.entities_collection):
@@ -83,7 +129,7 @@ class ArangoDBClient:
                     vertex=True
                 )
                 logger.info(f"Created entities collection: {self.entities_collection}")
-            
+
             # Create edge collection for relations
             if not self.database.has_collection(self.relations_collection):
                 relations_col = self.database.create_collection(
@@ -91,7 +137,7 @@ class ArangoDBClient:
                     edge=True
                 )
                 logger.info(f"Created relations collection: {self.relations_collection}")
-            
+
             # Create or get graph
             if not self.database.has_graph(self.graph_name):
                 self.graph = self.database.create_graph(
@@ -105,31 +151,34 @@ class ArangoDBClient:
                 logger.info(f"Created knowledge graph: {self.graph_name}")
             else:
                 self.graph = self.database.graph(self.graph_name)
-            
+
             # Create indexes for better performance
-            await self._create_indexes()
-            
+            self._create_indexes()
+
         except Exception as e:
             logger.error(f"Failed to setup graph: {e}")
             raise
     
-    async def _create_indexes(self):
-        """Create indexes for optimal graph performance."""
+    def _create_indexes(self):
+        """Create indexes for optimal graph performance.
+
+        This is synchronous and runs inside the same thread as _setup_graph.
+        """
         try:
             entities_col = self.database.collection(self.entities_collection)
             relations_col = self.database.collection(self.relations_collection)
-            
+
             # Entity indexes
             entities_col.add_hash_index(fields=["name"], unique=False)
             entities_col.add_hash_index(fields=["type"], unique=False)
             entities_col.add_hash_index(fields=["doc_id"], unique=False)
-            
+
             # Relation indexes
             relations_col.add_hash_index(fields=["relation_type"], unique=False)
             relations_col.add_hash_index(fields=["confidence"], unique=False)
-            
+
             logger.info("Created ArangoDB indexes")
-            
+
         except Exception as e:
             logger.error(f"Failed to create indexes: {e}")
     

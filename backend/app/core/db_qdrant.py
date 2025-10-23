@@ -10,6 +10,7 @@ from qdrant_client.http import models
 from typing import List, Dict, Any, Optional, Tuple
 import logging
 import uuid
+import asyncio
 from datetime import datetime
 
 from ..config import settings
@@ -26,49 +27,66 @@ class QdrantDBClient:
     async def connect(self):
         """Establish connection to Qdrant and create collection if needed."""
         try:
-            # Initialize client
+            if not settings.qdrant_url:
+                logger.warning("Qdrant URL not configured, running without Qdrant")
+                return False
+                
+            logger.info("Attempting to connect to Qdrant Cloud...")
+            
+            # Initialize client (synchronous but fast)
             client_kwargs = {"url": settings.qdrant_url}
             if settings.qdrant_api_key:
                 client_kwargs["api_key"] = settings.qdrant_api_key
             
             self.client = QdrantClient(**client_kwargs)
             
-            # Test connection
-            collections = self.client.get_collections()
-            logger.info(f"Connected to Qdrant. Available collections: {len(collections.collections)}")
+            # Test connection in thread to avoid blocking event loop
+            def _test_connection():
+                return self.client.get_collections()
+            
+            collections = await asyncio.to_thread(_test_connection)
+            logger.info(f"✅ Successfully connected to Qdrant Cloud! Available collections: {len(collections.collections)}")
             
             # Create collection if it doesn't exist
             await self._ensure_collection_exists()
+            return True
             
         except Exception as e:
-            logger.error(f"Failed to connect to Qdrant: {e}")
-            raise
+            logger.error(f"❌ Failed to connect to Qdrant: {e}")
+            # Clean up failed connection
+            self.client = None
+            return False
     
     async def disconnect(self):
         """Close Qdrant connection."""
         if self.client:
-            self.client.close()
+            await asyncio.to_thread(self.client.close)
             logger.info("Disconnected from Qdrant")
     
     async def _ensure_collection_exists(self):
         """Create collection if it doesn't exist."""
         try:
-            # Check if collection exists
-            collections = self.client.get_collections()
-            collection_names = [col.name for col in collections.collections]
-            
-            if self.collection_name not in collection_names:
-                # Create collection with appropriate vector configuration
-                self.client.create_collection(
-                    collection_name=self.collection_name,
-                    vectors_config=VectorParams(
-                        size=settings.embedding_dimension,
-                        distance=Distance.COSINE
+            # Check if collection exists (blocking) -> run in thread
+            def _check_and_create():
+                collections = self.client.get_collections()
+                collection_names = [col.name for col in collections.collections]
+                
+                if self.collection_name not in collection_names:
+                    # Create collection with appropriate vector configuration
+                    self.client.create_collection(
+                        collection_name=self.collection_name,
+                        vectors_config=VectorParams(
+                            size=settings.embedding_dimension,
+                            distance=Distance.COSINE
+                        )
                     )
-                )
-                logger.info(f"Created Qdrant collection: {self.collection_name}")
-            else:
-                logger.info(f"Qdrant collection already exists: {self.collection_name}")
+                    logger.info(f"Created Qdrant collection: {self.collection_name}")
+                    return "created"
+                else:
+                    logger.info(f"Qdrant collection already exists: {self.collection_name}")
+                    return "exists"
+            
+            await asyncio.to_thread(_check_and_create)
                 
         except Exception as e:
             logger.error(f"Failed to ensure collection exists: {e}")
@@ -110,12 +128,14 @@ class QdrantDBClient:
                 )
                 points.append(point)
             
-            # Batch upsert points
-            self.client.upsert(
-                collection_name=self.collection_name,
-                points=points
-            )
+            # Batch upsert points (blocking) -> run in thread
+            def _do_upsert():
+                self.client.upsert(
+                    collection_name=self.collection_name,
+                    points=points
+                )
             
+            await asyncio.to_thread(_do_upsert)
             logger.info(f"Upserted {len(points)} vectors for document {doc_id}")
             return True
             
@@ -152,15 +172,18 @@ class QdrantDBClient:
                     ]
                 )
             
-            # Perform search
-            search_results = self.client.search(
-                collection_name=self.collection_name,
-                query_vector=query_vector,
-                query_filter=search_filter,
-                limit=top_k,
-                with_payload=True,
-                with_vectors=False
-            )
+            # Perform search (blocking) -> run in thread
+            def _do_search():
+                return self.client.search(
+                    collection_name=self.collection_name,
+                    query_vector=query_vector,
+                    query_filter=search_filter,
+                    limit=top_k,
+                    with_payload=True,
+                    with_vectors=False
+                )
+            
+            search_results = await asyncio.to_thread(_do_search)
             
             # Format results
             results = []
@@ -191,21 +214,23 @@ class QdrantDBClient:
     async def delete_document_vectors(self, doc_id: str) -> bool:
         """Delete all vectors associated with a document."""
         try:
-            # Delete points by doc_id filter
-            self.client.delete(
-                collection_name=self.collection_name,
-                points_selector=models.FilterSelector(
-                    filter=Filter(
-                        must=[
-                            FieldCondition(
-                                key="doc_id",
-                                match=MatchValue(value=doc_id)
-                            )
-                        ]
+            # Delete points by doc_id filter (blocking) -> run in thread
+            def _do_delete():
+                self.client.delete(
+                    collection_name=self.collection_name,
+                    points_selector=models.FilterSelector(
+                        filter=Filter(
+                            must=[
+                                FieldCondition(
+                                    key="doc_id",
+                                    match=MatchValue(value=doc_id)
+                                )
+                            ]
+                        )
                     )
                 )
-            )
             
+            await asyncio.to_thread(_do_delete)
             logger.info(f"Deleted vectors for document {doc_id}")
             return True
             
@@ -216,7 +241,11 @@ class QdrantDBClient:
     async def get_collection_info(self) -> Dict[str, Any]:
         """Get information about the collection."""
         try:
-            collection_info = self.client.get_collection(self.collection_name)
+            # Get collection info (blocking) -> run in thread
+            def _get_info():
+                return self.client.get_collection(self.collection_name)
+            
+            collection_info = await asyncio.to_thread(_get_info)
             return {
                 "name": self.collection_name,
                 "vectors_count": collection_info.vectors_count,
@@ -259,18 +288,21 @@ class QdrantDBClient:
             if top_k is None:
                 top_k = settings.top_k_retrieval
             
-            # Perform batch search
-            batch_results = self.client.search_batch(
-                collection_name=self.collection_name,
-                requests=[
-                    models.SearchRequest(
-                        vector=vector,
-                        limit=top_k,
-                        with_payload=True,
-                        with_vector=False
-                    ) for vector in query_vectors
-                ]
-            )
+            # Perform batch search (blocking) -> run in thread
+            def _do_batch_search():
+                return self.client.search_batch(
+                    collection_name=self.collection_name,
+                    requests=[
+                        models.SearchRequest(
+                            vector=vector,
+                            limit=top_k,
+                            with_payload=True,
+                            with_vector=False
+                        ) for vector in query_vectors
+                    ]
+                )
+            
+            batch_results = await asyncio.to_thread(_do_batch_search)
             
             # Format results
             formatted_results = []

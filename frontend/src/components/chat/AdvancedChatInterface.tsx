@@ -3,7 +3,7 @@
 import React, { useState, useRef, useEffect } from 'react'
 import { useChat } from '@/contexts/ChatContext'
 import { useAuth } from '@/contexts/AuthContext'
-import { Send, Paperclip, Mic, StopCircle, Upload, FileText, Image, Bot, User, ExternalLink, Copy, ThumbsUp, ThumbsDown } from 'lucide-react'
+import { Send, Paperclip, Mic, StopCircle, Upload, FileText, Image, Bot, User, ExternalLink, Copy, ThumbsUp, ThumbsDown, BarChart3, Clock, Zap, Target, Brain, MessageSquare, Star } from 'lucide-react'
 
 interface Message {
   id: string
@@ -21,6 +21,19 @@ interface Message {
     url: string
     title: string
   }>
+  evaluation?: {
+    accuracy: number
+    relevance: number
+    completeness: number
+    coherence: number
+    overall_score: number
+    processing_strategy: string
+    query_type: string
+    query_complexity: 'simple' | 'complex' | 'multi_part'
+    cache_hit: boolean
+    retrieval_time: number
+    sources_count: number
+  }
 }
 
 export function AdvancedChatInterface() {
@@ -29,6 +42,9 @@ export function AdvancedChatInterface() {
   const [message, setMessage] = useState('')
   const [isRecording, setIsRecording] = useState(false)
   const [showAttachments, setShowAttachments] = useState(false)
+  const [showEvaluationDetails, setShowEvaluationDetails] = useState<{[key: string]: boolean}>({})
+  const [feedbackModal, setFeedbackModal] = useState<{messageId: string, rating?: number} | null>(null)
+  const [feedbackComment, setFeedbackComment] = useState('')
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
 
@@ -71,6 +87,50 @@ export function AdvancedChatInterface() {
     return new Date(timestamp).toLocaleTimeString()
   }
 
+  const toggleEvaluationDetails = (messageId: string) => {
+    setShowEvaluationDetails(prev => ({
+      ...prev,
+      [messageId]: !prev[messageId]
+    }))
+  }
+
+  const handleFeedback = (messageId: string, rating: number) => {
+    setFeedbackModal({ messageId, rating })
+  }
+
+  const submitFeedback = async () => {
+    if (!feedbackModal) return
+    
+    try {
+      // Submit feedback through API
+      console.log('Submitting feedback:', {
+        messageId: feedbackModal.messageId,
+        rating: feedbackModal.rating,
+        comment: feedbackComment
+      })
+      
+      setFeedbackModal(null)
+      setFeedbackComment('')
+    } catch (error) {
+      console.error('Failed to submit feedback:', error)
+    }
+  }
+
+  const getScoreColor = (score: number) => {
+    if (score >= 0.8) return 'text-green-600'
+    if (score >= 0.6) return 'text-yellow-600'
+    return 'text-red-600'
+  }
+
+  const getComplexityBadgeColor = (complexity: string) => {
+    switch (complexity) {
+      case 'simple': return 'bg-green-100 text-green-800'
+      case 'complex': return 'bg-yellow-100 text-yellow-800'
+      case 'multi_part': return 'bg-red-100 text-red-800'
+      default: return 'bg-gray-100 text-gray-800'
+    }
+  }
+
   return (
     <div className="flex flex-col h-full bg-gray-50">
       {/* Header */}
@@ -82,7 +142,16 @@ export function AdvancedChatInterface() {
           </h2>
         </div>
         <div className="flex items-center space-x-2 text-sm text-gray-500">
-          <span>RAG + Knowledge Graph</span>
+          <span className="flex items-center space-x-1">
+            <Brain className="w-4 h-4" />
+            <span>Advanced RAG</span>
+          </span>
+          <span className="text-xs bg-green-100 text-green-800 px-2 py-1 rounded-full">
+            Query Intelligence
+          </span>
+          <span className="text-xs bg-blue-100 text-blue-800 px-2 py-1 rounded-full">
+            Hybrid Search
+          </span>
           <Bot className="w-4 h-4" />
         </div>
       </div>
@@ -146,6 +215,91 @@ export function AdvancedChatInterface() {
                         </div>
                       )}
 
+                      {/* Evaluation Metrics */}
+                      {msg.evaluation && msg.role === 'assistant' && (
+                        <div className="mt-3 p-3 bg-blue-50 rounded-md border border-blue-200">
+                          <div className="flex items-center justify-between mb-2">
+                            <h4 className="text-xs font-medium text-blue-700 flex items-center">
+                              <BarChart3 className="w-3 h-3 mr-1" />
+                              Response Quality
+                            </h4>
+                            <button
+                              onClick={() => toggleEvaluationDetails(msg.id)}
+                              className="text-xs text-blue-600 hover:text-blue-800"
+                            >
+                              {showEvaluationDetails[msg.id] ? 'Hide Details' : 'Show Details'}
+                            </button>
+                          </div>
+                          
+                          <div className="flex items-center space-x-4 mb-2">
+                            <div className="flex items-center space-x-1">
+                              <Star className="w-3 h-3 text-yellow-500" />
+                              <span className={`text-sm font-medium ${getScoreColor(msg.evaluation.overall_score)}`}>
+                                {(msg.evaluation.overall_score * 100).toFixed(0)}%
+                              </span>
+                            </div>
+                            <span className={`text-xs px-2 py-1 rounded-full ${getComplexityBadgeColor(msg.evaluation.query_complexity)}`}>
+                              {msg.evaluation.query_complexity.replace('_', ' ')}
+                            </span>
+                            {msg.evaluation.cache_hit && (
+                              <div className="flex items-center space-x-1">
+                                <Zap className="w-3 h-3 text-green-500" />
+                                <span className="text-xs text-green-600">Cached</span>
+                              </div>
+                            )}
+                          </div>
+
+                          {showEvaluationDetails[msg.id] && (
+                            <div className="space-y-2">
+                              <div className="grid grid-cols-2 gap-2 text-xs">
+                                <div className="flex justify-between">
+                                  <span>Accuracy:</span>
+                                  <span className={getScoreColor(msg.evaluation.accuracy)}>
+                                    {(msg.evaluation.accuracy * 100).toFixed(0)}%
+                                  </span>
+                                </div>
+                                <div className="flex justify-between">
+                                  <span>Relevance:</span>
+                                  <span className={getScoreColor(msg.evaluation.relevance)}>
+                                    {(msg.evaluation.relevance * 100).toFixed(0)}%
+                                  </span>
+                                </div>
+                                <div className="flex justify-between">
+                                  <span>Completeness:</span>
+                                  <span className={getScoreColor(msg.evaluation.completeness)}>
+                                    {(msg.evaluation.completeness * 100).toFixed(0)}%
+                                  </span>
+                                </div>
+                                <div className="flex justify-between">
+                                  <span>Coherence:</span>
+                                  <span className={getScoreColor(msg.evaluation.coherence)}>
+                                    {(msg.evaluation.coherence * 100).toFixed(0)}%
+                                  </span>
+                                </div>
+                              </div>
+                              <div className="pt-2 border-t border-blue-200 text-xs space-y-1">
+                                <div className="flex justify-between">
+                                  <span>Strategy:</span>
+                                  <span className="text-blue-700">{msg.evaluation.processing_strategy}</span>
+                                </div>
+                                <div className="flex justify-between">
+                                  <span>Query Type:</span>
+                                  <span className="text-blue-700">{msg.evaluation.query_type}</span>
+                                </div>
+                                <div className="flex justify-between">
+                                  <span>Retrieval Time:</span>
+                                  <span className="text-blue-700">{msg.evaluation.retrieval_time.toFixed(2)}ms</span>
+                                </div>
+                                <div className="flex justify-between">
+                                  <span>Sources Used:</span>
+                                  <span className="text-blue-700">{msg.evaluation.sources_count}</span>
+                                </div>
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      )}
+
                       {/* Attachments */}
                       {msg.attachments && msg.attachments.length > 0 && (
                         <div className="mt-3 space-y-2">
@@ -167,20 +321,46 @@ export function AdvancedChatInterface() {
 
                       {/* Message Actions */}
                       {msg.role === 'assistant' && (
-                        <div className="flex items-center space-x-2 mt-3 pt-2 border-t border-gray-200">
-                          <button
-                            onClick={() => copyToClipboard(msg.content)}
-                            className="text-gray-400 hover:text-gray-600"
-                            title="Copy message"
-                          >
-                            <Copy className="w-4 h-4" />
-                          </button>
-                          <button className="text-gray-400 hover:text-green-600" title="Like">
-                            <ThumbsUp className="w-4 h-4" />
-                          </button>
-                          <button className="text-gray-400 hover:text-red-600" title="Dislike">
-                            <ThumbsDown className="w-4 h-4" />
-                          </button>
+                        <div className="flex items-center justify-between mt-3 pt-2 border-t border-gray-200">
+                          <div className="flex items-center space-x-2">
+                            <button
+                              onClick={() => copyToClipboard(msg.content)}
+                              className="text-gray-400 hover:text-gray-600"
+                              title="Copy message"
+                            >
+                              <Copy className="w-4 h-4" />
+                            </button>
+                            <button 
+                              onClick={() => handleFeedback(msg.id, 5)}
+                              className="text-gray-400 hover:text-green-600" 
+                              title="Helpful response"
+                            >
+                              <ThumbsUp className="w-4 h-4" />
+                            </button>
+                            <button 
+                              onClick={() => handleFeedback(msg.id, 1)}
+                              className="text-gray-400 hover:text-red-600" 
+                              title="Not helpful"
+                            >
+                              <ThumbsDown className="w-4 h-4" />
+                            </button>
+                            <button 
+                              onClick={() => setFeedbackModal({ messageId: msg.id })}
+                              className="text-gray-400 hover:text-blue-600" 
+                              title="Detailed feedback"
+                            >
+                              <MessageSquare className="w-4 h-4" />
+                            </button>
+                          </div>
+                          
+                          {msg.evaluation && (
+                            <div className="flex items-center space-x-2 text-xs text-gray-500">
+                              <Clock className="w-3 h-3" />
+                              <span>{msg.evaluation.retrieval_time.toFixed(0)}ms</span>
+                              <Target className="w-3 h-3" />
+                              <span>{(msg.evaluation.overall_score * 100).toFixed(0)}%</span>
+                            </div>
+                          )}
                         </div>
                       )}
                     </div>
@@ -194,15 +374,31 @@ export function AdvancedChatInterface() {
         {/* Processing Indicator */}
         {isProcessing && (
           <div className="flex justify-start">
-            <div className="bg-white rounded-lg shadow-sm p-4 max-w-xs">
-              <div className="flex items-center space-x-3">
-                <Bot className="w-6 h-6 text-gray-400" />
-                <div className="flex space-x-1">
-                  <div className="w-2 h-2 bg-gray-400 rounded-full animate-bounce"></div>
-                  <div className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '0.1s' }}></div>
-                  <div className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '0.2s' }}></div>
+            <div className="bg-white rounded-lg shadow-sm p-4 max-w-md">
+              <div className="space-y-2">
+                <div className="flex items-center space-x-3">
+                  <Brain className="w-5 h-5 text-blue-500 animate-pulse" />
+                  <div className="flex space-x-1">
+                    <div className="w-2 h-2 bg-blue-500 rounded-full animate-bounce"></div>
+                    <div className="w-2 h-2 bg-blue-500 rounded-full animate-bounce" style={{ animationDelay: '0.1s' }}></div>
+                    <div className="w-2 h-2 bg-blue-500 rounded-full animate-bounce" style={{ animationDelay: '0.2s' }}></div>
+                  </div>
+                  <span className="text-sm text-gray-700 font-medium">Advanced Processing...</span>
                 </div>
-                <span className="text-sm text-gray-500">Processing...</span>
+                <div className="text-xs text-gray-500 ml-8 space-y-1">
+                  <div className="flex items-center space-x-2">
+                    <div className="w-1 h-1 bg-green-500 rounded-full"></div>
+                    <span>Analyzing query complexity</span>
+                  </div>
+                  <div className="flex items-center space-x-2">
+                    <div className="w-1 h-1 bg-yellow-500 rounded-full"></div>
+                    <span>Hybrid retrieval (Vector + BM25)</span>
+                  </div>
+                  <div className="flex items-center space-x-2">
+                    <div className="w-1 h-1 bg-blue-500 rounded-full"></div>
+                    <span>Context optimization</span>
+                  </div>
+                </div>
               </div>
             </div>
           </div>
@@ -295,6 +491,71 @@ export function AdvancedChatInterface() {
           <span>Press Enter to send, Shift+Enter for new line</span>
         </div>
       </div>
+
+      {/* Feedback Modal */}
+      {feedbackModal && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+          <div className="bg-white rounded-lg p-6 max-w-md w-full mx-4">
+            <h3 className="text-lg font-medium mb-4">Provide Feedback</h3>
+            
+            <div className="mb-4">
+              <label className="block text-sm font-medium text-gray-700 mb-2">
+                How would you rate this response?
+              </label>
+              <div className="flex space-x-2">
+                {[1, 2, 3, 4, 5].map((rating) => (
+                  <button
+                    key={rating}
+                    onClick={() => setFeedbackModal({ ...feedbackModal, rating })}
+                    className={`w-8 h-8 rounded-full flex items-center justify-center text-sm font-medium border ${
+                      feedbackModal.rating === rating
+                        ? 'bg-blue-600 text-white border-blue-600'
+                        : 'bg-white text-gray-600 border-gray-300 hover:border-blue-500'
+                    }`}
+                  >
+                    {rating}
+                  </button>
+                ))}
+              </div>
+              <div className="flex justify-between text-xs text-gray-500 mt-1">
+                <span>Poor</span>
+                <span>Excellent</span>
+              </div>
+            </div>
+
+            <div className="mb-4">
+              <label className="block text-sm font-medium text-gray-700 mb-2">
+                Additional Comments (Optional)
+              </label>
+              <textarea
+                value={feedbackComment}
+                onChange={(e) => setFeedbackComment(e.target.value)}
+                placeholder="Tell us what could be improved..."
+                className="w-full p-3 border border-gray-300 rounded-md resize-none focus:outline-none focus:ring-2 focus:ring-blue-500"
+                rows={3}
+              />
+            </div>
+
+            <div className="flex justify-end space-x-3">
+              <button
+                onClick={() => {
+                  setFeedbackModal(null)
+                  setFeedbackComment('')
+                }}
+                className="px-4 py-2 text-gray-600 bg-gray-100 rounded-md hover:bg-gray-200"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={submitFeedback}
+                className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700"
+              >
+                Submit Feedback
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

@@ -30,42 +30,73 @@ class IngestWorker:
         self.processed_count = 0
         self.failed_count = 0
         self.ingest_service = None
+        self._initialized = False
         
     async def initialize(self):
-        """Initialize the worker with required services."""
+        """Initialize the worker with required services (lazy)."""
+        if self._initialized:
+            return
+            
         try:
+            logger.info("Lazy-initializing ingest worker services...")
             self.ingest_service = IngestService()
             await self.ingest_service.initialize()
+            self._initialized = True
             logger.info("Ingest worker initialized successfully")
         except Exception as e:
             logger.error(f"Failed to initialize ingest worker: {e}")
+            self._initialized = False
             raise
     
     async def start(self):
         """Start the background worker loop."""
         self.is_running = True
-        logger.info("Starting ingest worker...")
+        logger.info("Starting ingest worker loop...")
         
-        while self.is_running:
-            try:
-                # Wait for ingestion tasks
-                doc_id = await asyncio.wait_for(
-                    ingestion_queue.get(), 
-                    timeout=1.0
-                )
-                
-                logger.info(f"Processing document: {doc_id}")
-                await self._process_document(doc_id)
-                
-                # Mark task as done
-                ingestion_queue.task_done()
-                
-            except asyncio.TimeoutError:
-                # No tasks available, continue loop
-                continue
-            except Exception as e:
-                logger.error(f"Worker error: {e}")
-                await asyncio.sleep(1)
+        try:
+            while self.is_running:
+                try:
+                    # Wait for ingestion tasks with timeout to check is_running flag
+                    try:
+                        doc_id = await asyncio.wait_for(
+                            ingestion_queue.get(), 
+                            timeout=1.0
+                        )
+                        
+                        # Lazy initialize on first document
+                        if not self._initialized:
+                            logger.info("Lazy-initializing IngestService on first document...")
+                            await self.initialize()
+                        
+                        logger.info(f"Processing document: {doc_id}")
+                        await self._process_document(doc_id)
+                        
+                        # Mark task as done
+                        ingestion_queue.task_done()
+                        
+                    except asyncio.TimeoutError:
+                        # No tasks available, check flag and continue loop
+                        if not self.is_running:
+                            logger.info("Ingest worker is_running flag is False, breaking loop")
+                            break
+                        continue
+                        
+                except asyncio.CancelledError:
+                    logger.info("Ingest worker received cancellation signal in task processing")
+                    raise
+                except Exception as e:
+                    logger.error(f"Worker error during document processing: {e}", exc_info=True)
+                    await asyncio.sleep(1)
+                    
+        except asyncio.CancelledError:
+            logger.info("Ingest worker loop was cancelled")
+            self.is_running = False
+        except Exception as e:
+            logger.error(f"Fatal error in ingest worker loop: {e}", exc_info=True)
+            self.is_running = False
+            raise
+        finally:
+            logger.info("Ingest worker loop exited successfully")
     
     async def stop(self):
         """Stop the background worker."""
@@ -179,17 +210,19 @@ async def get_queue_status() -> Dict[str, Any]:
 
 
 async def start_ingest_worker():
-    """Start the ingestion worker (called from main.py)."""
+    """Start the ingestion worker (called from main.py as a background task)."""
     try:
-        await worker.initialize()
+        logger.info("Ingest worker startup: initializing core components (lazy loading)...")
+        # Don't wait for full initialization - it happens on first document
+        logger.info("Ingest worker startup: starting main loop")
         await worker.start()
+        logger.info("Ingest worker startup: worker.start() returned normally")
     except asyncio.CancelledError:
-        logger.info("Ingest worker was cancelled")
+        logger.info("Ingest worker task was cancelled by system")
         await worker.stop()
     except Exception as e:
-        logger.error(f"Ingest worker failed: {e}")
+        logger.error(f"Ingest worker failed during startup: {e}", exc_info=True)
         await worker.stop()
-        raise
 
 
 async def stop_ingest_worker():

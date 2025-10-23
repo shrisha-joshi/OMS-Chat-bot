@@ -26,11 +26,17 @@ security = HTTPBearer()
 ADMIN_CREDENTIALS = {
     "admin": {
         "username": "admin",
-        "password_hash": pwd_context.hash("admin123"),  # Change in production
+        "password_hash": None,  # Will be set when needed
         "role": "admin",
         "permissions": ["read", "write", "delete", "manage"]
     }
 }
+
+def get_admin_password_hash():
+    """Get admin password hash, creating it if needed."""
+    if ADMIN_CREDENTIALS["admin"]["password_hash"] is None:
+        ADMIN_CREDENTIALS["admin"]["password_hash"] = pwd_context.hash("admin123")
+    return ADMIN_CREDENTIALS["admin"]["password_hash"]
 
 class AuthService:
     """Authentication service for user management and JWT operations."""
@@ -71,7 +77,8 @@ class AuthService:
                 return None
             
             # Verify password
-            if not self.verify_password(password, user["password_hash"]):
+            password_hash = user["password_hash"] or get_admin_password_hash()
+            if not self.verify_password(password, password_hash):
                 logger.warning(f"Authentication failed: invalid password for user {username}")
                 return None
             

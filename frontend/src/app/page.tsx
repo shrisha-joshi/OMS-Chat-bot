@@ -1,7 +1,7 @@
 'use client'
 
 import React from 'react'
-import { ChatInterface } from '@/components/chat/ChatInterface'
+import { ChatInterfaceReal } from '@/components/chat/ChatInterfaceReal'
 import { Sidebar } from '@/components/layout/Sidebar'
 import { Header } from '@/components/layout/Header'
 
@@ -18,7 +18,7 @@ export default function HomePage() {
         
         {/* Chat interface */}
         <main className="flex-1 relative overflow-hidden">
-          <ChatInterface />
+          <ChatInterfaceReal />
         </main>
       </div>
     </div>

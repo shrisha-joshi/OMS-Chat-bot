@@ -16,11 +16,18 @@ import re
 
 from sentence_transformers import SentenceTransformer, CrossEncoder
 import spacy
+from rank_bm25 import BM25Okapi
 
 from ..core.db_mongo import get_mongodb_client, MongoDBClient
 from ..core.db_qdrant import get_qdrant_client, QdrantDBClient
 from ..core.db_arango import get_arango_client, ArangoDBClient
 from ..core.cache_redis import get_redis_client, RedisClient
+from .query_intelligence_service import query_intelligence_service
+from .context_optimization_service import context_optimization_service
+from .evaluation_service import evaluation_service
+from .llm_handler import llm_handler
+from .prompt_service import prompt_service
+from .response_formatter_service import get_response_formatter
 from ..config import settings
 
 logger = logging.getLogger(__name__)
@@ -37,6 +44,8 @@ class ChatService:
         self.arango_client = None
         self.redis_client = None
         self.http_client = None
+        self.bm25_index = None
+        self.document_texts = []
     
     async def initialize(self):
         """Initialize the chat service with required models and clients."""
@@ -68,6 +77,27 @@ class ChatService:
                 logger.warning("spaCy model not found. Entity extraction will be limited.")
                 self.nlp_model = None
             
+            # Initialize query intelligence service
+            await query_intelligence_service.initialize()
+            
+            # Initialize context optimization service
+            await context_optimization_service.initialize()
+            
+            # Initialize evaluation service
+            await evaluation_service.initialize()
+            
+            # Initialize LLM handler
+            await llm_handler.initialize()
+
+            # Prompt service is synchronous (templates loaded at import); do not await
+            # Keep interface consistent: prompt_service is ready to use
+
+            # Initialize response formatter
+            self.response_formatter = await get_response_formatter()
+            
+            # Initialize BM25 index for keyword search
+            await self._initialize_bm25_index()
+            
             logger.info("Chat service initialized successfully")
             
         except Exception as e:
@@ -81,7 +111,7 @@ class ChatService:
         Args:
             query: User's query
             session_id: Session identifier
-            context: Previous conversation context
+            context: Previous conversation context (optional, auto-retrieved if not provided)
         
         Returns:
             Dictionary with response, sources, and attachments
@@ -89,18 +119,50 @@ class ChatService:
         try:
             start_time = time.time()
             
-            # Step 1: Query preprocessing and enhancement
-            processed_query = await self._preprocess_query(query)
-            logger.info(f"Processing query: {processed_query[:100]}...")
+            # Retrieve conversation context if not provided
+            if context is None:
+                context = await self._get_conversation_context(session_id)
             
-            # Step 2: Generate query embedding
+            # Check cache for similar queries first
+            cached_response = await self._check_query_cache(query)
+            if cached_response:
+                logger.info("Returning cached response")
+                return cached_response
+            
+            # Step 1: Advanced query understanding and enhancement
+            query_enhancement = await query_intelligence_service.enhance_query(query)
+            processed_query = query_enhancement["rewritten_queries"][0]  # Use best rewrite
+            logger.info(f"Processing query: {processed_query[:100]}... (Type: {query_enhancement['query_type']})")
+            
+            # Step 2: Generate multiple query embeddings for hybrid approach
             query_embedding = await self._generate_query_embedding(processed_query)
+            hyde_embedding = query_enhancement.get("hyde_embedding")
             
-            # Step 3: Retrieve relevant chunks from vector database
-            vector_results = await self.qdrant_client.search_similar(
-                query_vector=query_embedding,
-                top_k=settings.top_k_retrieval * 2  # Get more for reranking
-            )
+            # Step 3: Hybrid retrieval - Vector + Keyword + HyDE (with caching)
+            
+            # Check for cached retrieval results
+            vector_results = await self._get_cached_retrieval_results(query_embedding)
+            
+            if not vector_results:
+                vector_results = await self.qdrant_client.search_similar(
+                    query_vector=query_embedding,
+                    top_k=settings.top_k_retrieval * 2  # Get more for reranking
+                )
+                # Cache the results
+                await self._cache_retrieval_results(query_embedding, vector_results)
+            else:
+                logger.info("Using cached vector search results")
+            
+            # Additional HyDE search if available
+            hyde_results = []
+            if hyde_embedding:
+                hyde_results = await self.qdrant_client.search_similar(
+                    query_vector=hyde_embedding,
+                    top_k=settings.top_k_retrieval
+                )
+            
+            # BM25 keyword search
+            keyword_results = await self._bm25_search(processed_query)
             
             # Step 4: Extract entities from query for graph search
             graph_results = []
@@ -111,16 +173,27 @@ class ChatService:
                         entities, max_depth=2, limit=5
                     )
             
-            # Step 5: Merge and rerank results
-            merged_results = await self._merge_and_rerank_results(
-                vector_results, graph_results, processed_query
+            # Step 5: Merge and rerank results with adaptive strategy
+            merged_results = await self._advanced_merge_and_rerank(
+                vector_results, hyde_results, keyword_results, graph_results, 
+                processed_query, query_enhancement["processing_strategy"]
             )
             
-            # Step 6: Build context for LLM
-            context_text, sources = await self._build_llm_context(merged_results, processed_query)
+            # Step 6: Optimize context using advanced compression and CoT
+            optimization_result = await context_optimization_service.optimize_context(
+                merged_results, processed_query, 
+                max_tokens=settings.max_context_tokens,
+                strategy=query_enhancement["processing_strategy"]
+            )
             
-            # Step 7: Generate response using LMStudio
-            response = await self._generate_llm_response(processed_query, context_text, context)
+            context_text = optimization_result["formatted_context"]
+            reasoning_template = optimization_result["reasoning_template"]
+            sources = optimization_result["sources_used"]
+            
+            # Step 7: Generate response using LMStudio with CoT reasoning
+            response = await self._generate_llm_response_with_cot(
+                processed_query, context_text, reasoning_template, context
+            )
             
             # Step 8: Extract attachments from sources
             attachments = self._extract_attachments(sources)
@@ -131,13 +204,31 @@ class ChatService:
             processing_time = time.time() - start_time
             logger.info(f"Query processed in {processing_time:.2f}s")
             
-            return {
+            # Step 9: Evaluate response quality
+            try:
+                evaluation_metrics = await evaluation_service.evaluate_query_response(
+                    query, response, sources, processing_time, context_text, session_id
+                )
+                logger.info(f"Query evaluation - Accuracy: {evaluation_metrics.answer_accuracy:.2f}, "
+                          f"Relevance: {evaluation_metrics.response_relevance:.2f}")
+            except Exception as e:
+                logger.warning(f"Evaluation failed: {e}")
+                evaluation_metrics = None
+            
+            result = {
                 "response": response,
                 "sources": sources,
                 "attachments": attachments,
                 "processing_time": processing_time,
-                "tokens_generated": len(response.split())  # Rough token estimate
+                "tokens_generated": len(response.split()),  # Rough token estimate
+                "evaluation_metrics": evaluation_metrics.__dict__ if evaluation_metrics else None
             }
+            
+            # Cache the result if quality is good
+            if evaluation_metrics and evaluation_metrics.answer_accuracy > 0.7:
+                await self._cache_query_result(query, result)
+            
+            return result
             
         except Exception as e:
             logger.error(f"Query processing failed: {e}")
@@ -196,14 +287,26 @@ class ChatService:
                 full_response += token
                 yield {"type": "token", "content": token}
             
-            # Step 6: Send final data
-            attachments = self._extract_attachments(sources)
+            # Step 6: Send final data with formatting
+            formatted_response = await self.response_formatter.format_response(
+                response_text=full_response,
+                sources=sources,
+                original_query=query
+            )
+            
             await self._store_conversation_turn(session_id, query, full_response, sources)
             
             yield {
+                "type": "response",
+                "text": formatted_response.text,
+                "attachments": formatted_response.attachments,
+                "citations": formatted_response.citations,
+                "metadata": formatted_response.metadata
+            }
+            
+            yield {
                 "type": "sources",
-                "sources": sources,
-                "attachments": attachments
+                "sources": sources
             }
             
         except Exception as e:
@@ -212,6 +315,21 @@ class ChatService:
                 "type": "error",
                 "content": "I encountered an error while processing your query."
             }
+    
+    async def _get_conversation_context(self, session_id: str, limit: int = 3) -> List[Dict]:
+        """Retrieve conversation history from session."""
+        try:
+            session_data = await self.redis_client.get_session_data(session_id)
+            if not session_data or "messages" not in session_data:
+                return []
+            
+            messages = session_data["messages"]
+            # Return last N messages (limit parameter)
+            return messages[-limit:] if len(messages) > limit else messages
+            
+        except Exception as e:
+            logger.warning(f"Failed to get conversation context: {e}")
+            return []
     
     async def _preprocess_query(self, query: str) -> str:
         """Preprocess and enhance the user query."""
@@ -378,96 +496,209 @@ class ChatService:
         return context_text, sources
     
     async def _generate_llm_response(self, query: str, context: str, conversation_context: List[Dict] = None) -> str:
-        """Generate response using LMStudio."""
+        """Generate response using LLM handler with prompt service."""
         try:
-            # Build the prompt
-            system_prompt = self._build_system_prompt()
-            user_prompt = self._build_user_prompt(query, context, conversation_context)
+            # Detect task type from query (synchronous)
+            task_type = prompt_service.detect_task_type(query)
+            logger.info(f"Detected task type: {task_type}")
+
+            # Get task-optimized system prompt (synchronous)
+            system_prompt = prompt_service.get_system_prompt(task_type)
+
+            # Build complete prompt with enhanced formatting. build_complete_prompt
+            # returns (system_prompt, user_prompt). If it fails (e.g., unexpected
+            # context type), fall back to a simple enhanced query string.
+            try:
+                built_system, user_prompt = prompt_service.build_complete_prompt(
+                    query=query,
+                    context=[],  # pass empty chunks to avoid format errors here
+                    conversation_context=conversation_context[-3:] if conversation_context else None,
+                    task_type=task_type,
+                    include_few_shot=True
+                )
+                # Prefer the built system prompt if it provides more context
+                if built_system:
+                    system_prompt = built_system
+            except Exception as e:
+                logger.debug(f"Prompt building failed, falling back: {e}")
+                user_prompt = prompt_service.enhance_query(query, task_type)
             
-            # Prepare the request
-            payload = {
-                "model": "mistral-3b",  # This should match your loaded model
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                "temperature": settings.default_temperature,
-                "top_p": settings.default_top_p,
-                "max_tokens": 512,
-                "stream": False
-            }
+            # Count tokens before generation
+            input_tokens = llm_handler.count_tokens(f"{system_prompt}\n{user_prompt}")
+            available_tokens = settings.max_llm_output_tokens - input_tokens
             
-            # Add API key if available
-            headers = {"Content-Type": "application/json"}
-            if settings.lmstudio_api_key:
-                headers["Authorization"] = f"Bearer {settings.lmstudio_api_key}"
+            if available_tokens < 100:
+                logger.warning(f"Low available tokens: {available_tokens}. Input might be too long.")
             
-            # Make the request
-            response = await self.http_client.post(
-                settings.lmstudio_api_url,
-                json=payload,
-                headers=headers
+            # Generate response with LLM handler
+            response = await llm_handler.generate_response(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                max_tokens=min(available_tokens, 512),
+                temperature=settings.default_temperature,
+                top_p=settings.default_top_p,
+                stream=False
             )
             
-            response.raise_for_status()
-            result = response.json()
-            
-            # Extract the response text
-            if "choices" in result and len(result["choices"]) > 0:
-                return result["choices"][0]["message"]["content"].strip()
-            else:
-                raise ValueError("Invalid response format from LMStudio")
+            logger.info(f"Generated response ({len(response)} chars)")
+            return response
                 
         except Exception as e:
             logger.error(f"LLM generation failed: {e}")
+            # Fallback response
             return "I apologize, but I'm having trouble generating a response right now. Please try again."
     
-    async def _stream_llm_response(self, query: str, context: str) -> AsyncGenerator[str, None]:
-        """Stream response from LMStudio token by token."""
+    async def _generate_llm_response_with_cot(self, query: str, context: str, reasoning_template: str, 
+                                            conversation_context: List[Dict] = None) -> str:
+        """Generate response using LLM handler with Chain-of-Thought reasoning and prompt service."""
         try:
-            system_prompt = self._build_system_prompt()
-            user_prompt = self._build_user_prompt(query, context)
+            # Get analyze task prompt for CoT reasoning (synchronous)
+            system_prompt = prompt_service.get_system_prompt("analyze")
             
-            payload = {
-                "model": "mistral-3b",
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                "temperature": settings.default_temperature,
-                "top_p": settings.default_top_p,
-                "max_tokens": 512,
-                "stream": True
-            }
+            # Build CoT-enhanced user prompt
+            user_prompt = f"""{reasoning_template}
+
+Context information:
+{context}
+
+Question: {query}
+
+Please provide your reasoning step by step, then give your final answer:"""
             
-            headers = {"Content-Type": "application/json"}
-            if settings.lmstudio_api_key:
-                headers["Authorization"] = f"Bearer {settings.lmstudio_api_key}"
+            # Count tokens
+            input_tokens = llm_handler.count_tokens(f"{system_prompt}\n{user_prompt}")
+            available_tokens = settings.max_llm_output_tokens - input_tokens
             
-            async with self.http_client.stream(
-                "POST",
-                settings.lmstudio_api_url,
-                json=payload,
-                headers=headers
-            ) as response:
-                response.raise_for_status()
+            # Generate response with CoT (using more tokens for reasoning)
+            response = await llm_handler.generate_response(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                max_tokens=min(available_tokens, 768),
+                temperature=settings.default_temperature * 0.8,  # Slightly lower for focused reasoning
+                top_p=settings.default_top_p,
+                stream=False
+            )
+            
+            # Extract final answer from CoT response
+            final_answer = self._extract_final_answer(response)
+            logger.info(f"Generated CoT response ({len(final_answer)} chars)")
+            return final_answer
                 
-                async for line in response.aiter_lines():
-                    if line.startswith("data: "):
-                        data_str = line[6:]  # Remove "data: " prefix
-                        if data_str.strip() == "[DONE]":
-                            break
-                        
-                        try:
-                            data = json.loads(data_str)
-                            if "choices" in data and len(data["choices"]) > 0:
-                                delta = data["choices"][0].get("delta", {})
-                                content = delta.get("content", "")
-                                if content:
-                                    yield content
-                        except json.JSONDecodeError:
-                            continue
-                            
+        except Exception as e:
+            logger.error(f"CoT LLM generation failed: {e}")
+            # Fallback to regular generation
+            return await self._generate_llm_response(query, context, conversation_context)
+    
+    def _build_cot_system_prompt(self, reasoning_template: str) -> str:
+        """Build the system prompt for Chain-of-Thought reasoning."""
+        return f"""You are a helpful AI assistant that answers questions using structured reasoning. 
+
+REASONING PROCESS:
+{reasoning_template}
+
+RESPONSE FORMAT:
+Always structure your response as follows:
+
+## Analysis
+[Your step-by-step reasoning process]
+
+## Answer
+[Your clear, concise final answer to the question]
+
+IMPORTANT GUIDELINES:
+1. Always follow the reasoning process outlined above
+2. Base all analysis on the provided context only
+3. Be explicit about your reasoning steps
+4. Clearly separate your analysis from your final answer
+5. If information is insufficient, state this in your analysis
+6. Reference specific sources when making claims
+7. Keep your final answer focused and actionable
+
+Remember: Show your thinking process, then provide a clear answer."""
+    
+    def _build_cot_user_prompt(self, query: str, context: str, conversation_context: List[Dict] = None) -> str:
+        """Build the user prompt for Chain-of-Thought reasoning."""
+        prompt_parts = []
+        
+        # Add conversation context if available
+        if conversation_context:
+            prompt_parts.append("CONVERSATION HISTORY:")
+            for msg in conversation_context[-3:]:  # Last 3 messages for context
+                role = msg.get("role", "user")
+                content = msg.get("content", "")
+                prompt_parts.append(f"{role.title()}: {content}")
+            prompt_parts.append("")
+        
+        # Add the context
+        prompt_parts.append("CONTEXT INFORMATION:")
+        prompt_parts.append(context)
+        prompt_parts.append("")
+        
+        # Add the current query
+        prompt_parts.append(f"QUESTION: {query}")
+        prompt_parts.append("")
+        prompt_parts.append("Please analyze this question using the reasoning process and provide a structured response:")
+        
+        return "\n".join(prompt_parts)
+    
+    def _extract_final_answer(self, full_response: str) -> str:
+        """Extract the final answer from a Chain-of-Thought response."""
+        try:
+            # Look for the "## Answer" section
+            answer_match = re.search(r'##\s*Answer\s*\n(.*?)(?:\n##|\Z)', full_response, re.DOTALL | re.IGNORECASE)
+            if answer_match:
+                answer = answer_match.group(1).strip()
+                if answer:
+                    return answer
+            
+            # Fallback: look for "Answer:" pattern
+            answer_match = re.search(r'Answer:\s*(.*?)(?:\n\n|\Z)', full_response, re.DOTALL | re.IGNORECASE)
+            if answer_match:
+                answer = answer_match.group(1).strip()
+                if answer:
+                    return answer
+            
+            # If no clear answer section found, return the full response
+            return full_response.strip()
+            
+        except Exception as e:
+            logger.warning(f"Failed to extract final answer: {e}")
+            return full_response.strip()
+    
+    async def _stream_llm_response(self, query: str, context: str) -> AsyncGenerator[str, None]:
+        """Stream response from LLM handler token by token."""
+        try:
+            # Detect task type (synchronous)
+            task_type = prompt_service.detect_task_type(query)
+
+            # Get optimized prompts (synchronous)
+            system_prompt = prompt_service.get_system_prompt(task_type)
+            try:
+                built_system, user_prompt = prompt_service.build_complete_prompt(
+                    query=query,
+                    context=[],
+                    task_type=task_type,
+                    include_few_shot=True
+                )
+                if built_system:
+                    system_prompt = built_system
+            except Exception:
+                user_prompt = prompt_service.enhance_query(query, task_type)
+            
+            # Count tokens
+            input_tokens = llm_handler.count_tokens(f"{system_prompt}\n{user_prompt}")
+            available_tokens = settings.max_llm_output_tokens - input_tokens
+            
+            # Stream from LLM handler
+            async for token in llm_handler._stream_response(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                max_tokens=min(available_tokens, 512),
+                temperature=settings.default_temperature,
+                top_p=settings.default_top_p
+            ):
+                yield token
+                
         except Exception as e:
             logger.error(f"Streaming response failed: {e}")
             yield "I apologize, but I'm having trouble generating a response right now."
@@ -632,6 +863,316 @@ Remember: Your knowledge is limited to the context provided. Do not make up info
             logger.error(f"Failed to get suggestions: {e}")
             return []
     
+    async def _initialize_bm25_index(self):
+        """Initialize BM25 index for keyword search."""
+        try:
+            # Get all document texts for BM25 indexing
+            documents = await self.mongo_client.get_all_documents()
+            self.document_texts = []
+            
+            for doc in documents:
+                # Get chunks for this document
+                chunks = await self.mongo_client.get_document_chunks(doc["_id"])
+                for chunk in chunks:
+                    self.document_texts.append({
+                        "text": chunk.get("text", ""),
+                        "doc_id": doc["_id"],
+                        "chunk_id": chunk.get("_id"),
+                        "metadata": chunk.get("metadata", {})
+                    })
+            
+            # Create BM25 index
+            if self.document_texts:
+                tokenized_docs = [doc["text"].lower().split() for doc in self.document_texts]
+                self.bm25_index = BM25Okapi(tokenized_docs)
+                logger.info(f"BM25 index initialized with {len(self.document_texts)} documents")
+            else:
+                logger.warning("No documents found for BM25 indexing")
+                
+        except Exception as e:
+            logger.error(f"Failed to initialize BM25 index: {e}")
+            self.bm25_index = None
+    
+    async def _bm25_search(self, query: str, top_k: int = 10) -> List[Dict]:
+        """Perform BM25 keyword search."""
+        if not self.bm25_index or not self.document_texts:
+            return []
+        
+        try:
+            # Tokenize query
+            query_tokens = query.lower().split()
+            
+            # Get BM25 scores
+            scores = self.bm25_index.get_scores(query_tokens)
+            
+            # Create results with scores
+            results = []
+            for idx, score in enumerate(scores):
+                if score > 0:  # Only include results with positive scores
+                    doc = self.document_texts[idx]
+                    results.append({
+                        "id": f"bm25_{doc['chunk_id']}",
+                        "score": float(score),
+                        "doc_id": doc["doc_id"],
+                        "text": doc["text"],
+                        "metadata": {**doc["metadata"], "source": "bm25"}
+                    })
+            
+            # Sort by score and return top results
+            results.sort(key=lambda x: x["score"], reverse=True)
+            return results[:top_k]
+            
+        except Exception as e:
+            logger.error(f"BM25 search failed: {e}")
+            return []
+    
+    async def _advanced_merge_and_rerank(self, vector_results: List[Dict], hyde_results: List[Dict],
+                                       keyword_results: List[Dict], graph_results: List[Dict], 
+                                       query: str, processing_strategy: str) -> List[Dict]:
+        """Advanced merging and reranking with adaptive strategies."""
+        try:
+            # Combine all results with weighted scores based on strategy
+            all_results = {}
+            
+            # Vector results (semantic similarity)
+            for result in vector_results:
+                result_id = result.get("id", "")
+                weight = self._get_vector_weight(processing_strategy)
+                all_results[result_id] = {
+                    **result,
+                    "combined_score": result.get("score", 0) * weight,
+                    "sources": ["vector"]
+                }
+            
+            # HyDE results (hypothetical document similarity)
+            for result in hyde_results:
+                result_id = result.get("id", "")
+                weight = self._get_hyde_weight(processing_strategy)
+                if result_id in all_results:
+                    all_results[result_id]["combined_score"] += result.get("score", 0) * weight
+                    all_results[result_id]["sources"].append("hyde")
+                else:
+                    all_results[result_id] = {
+                        **result,
+                        "combined_score": result.get("score", 0) * weight,
+                        "sources": ["hyde"]
+                    }
+            
+            # Keyword results (BM25)
+            for result in keyword_results:
+                result_id = result.get("id", "")
+                weight = self._get_keyword_weight(processing_strategy)
+                normalized_score = min(result.get("score", 0) / 10.0, 1.0)  # Normalize BM25 scores
+                if result_id in all_results:
+                    all_results[result_id]["combined_score"] += normalized_score * weight
+                    all_results[result_id]["sources"].append("keyword")
+                else:
+                    all_results[result_id] = {
+                        **result,
+                        "combined_score": normalized_score * weight,
+                        "sources": ["keyword"]
+                    }
+            
+            # Graph results (relationship-based)
+            for result in graph_results:
+                result_id = result.get("id", "")
+                weight = self._get_graph_weight(processing_strategy)
+                if result_id in all_results:
+                    all_results[result_id]["combined_score"] += result.get("score", 0) * weight
+                    all_results[result_id]["sources"].append("graph")
+                else:
+                    all_results[result_id] = {
+                        **result,
+                        "combined_score": result.get("score", 0) * weight,
+                        "sources": ["graph"]
+                    }
+            
+            # Convert back to list and apply final reranking
+            merged_results = list(all_results.values())
+            
+            # Apply cross-encoder reranking if available
+            if self.reranker_model and settings.use_reranker and len(merged_results) > 1:
+                merged_results = await self._cross_encoder_rerank(merged_results, query)
+            
+            # Sort by combined score
+            merged_results.sort(key=lambda x: x.get("combined_score", 0), reverse=True)
+            
+            return merged_results[:settings.top_k_retrieval]
+            
+        except Exception as e:
+            logger.error(f"Advanced merge and rerank failed: {e}")
+            # Fallback to simple merging
+            return (vector_results + hyde_results + keyword_results + graph_results)[:settings.top_k_retrieval]
+    
+    def _get_vector_weight(self, strategy: str) -> float:
+        """Get vector search weight based on processing strategy."""
+        weights = {
+            "high_precision": 0.7,
+            "multi_perspective": 0.4,
+            "time_weighted": 0.5,
+            "step_by_step": 0.6,
+            "broad_search": 0.3,
+            "solution_focused": 0.5,
+            "balanced": 0.5
+        }
+        return weights.get(strategy, 0.5)
+    
+    def _get_hyde_weight(self, strategy: str) -> float:
+        """Get HyDE search weight based on processing strategy."""
+        weights = {
+            "high_precision": 0.2,
+            "multi_perspective": 0.3,
+            "time_weighted": 0.1,
+            "step_by_step": 0.2,
+            "broad_search": 0.4,
+            "solution_focused": 0.3,
+            "balanced": 0.25
+        }
+        return weights.get(strategy, 0.25)
+    
+    def _get_keyword_weight(self, strategy: str) -> float:
+        """Get keyword search weight based on processing strategy."""
+        weights = {
+            "high_precision": 0.1,
+            "multi_perspective": 0.2,
+            "time_weighted": 0.3,
+            "step_by_step": 0.1,
+            "broad_search": 0.2,
+            "solution_focused": 0.1,
+            "balanced": 0.15
+        }
+        return weights.get(strategy, 0.15)
+    
+    def _get_graph_weight(self, strategy: str) -> float:
+        """Get graph search weight based on processing strategy."""
+        weights = {
+            "high_precision": 0.0,
+            "multi_perspective": 0.1,
+            "time_weighted": 0.1,
+            "step_by_step": 0.1,
+            "broad_search": 0.1,
+            "solution_focused": 0.1,
+            "balanced": 0.1
+        }
+        return weights.get(strategy, 0.1)
+    
+    async def _cross_encoder_rerank(self, results: List[Dict], query: str) -> List[Dict]:
+        """Apply cross-encoder reranking to results."""
+        try:
+            if len(results) <= 1:
+                return results
+            
+            # Prepare query-document pairs
+            pairs = [(query, result.get("text", "")) for result in results]
+            
+            # Get cross-encoder scores
+            cross_scores = self.reranker_model.predict(pairs)
+            
+            # Update scores and sort
+            for i, result in enumerate(results):
+                # Combine original score with cross-encoder score
+                original_score = result.get("combined_score", 0)
+                cross_score = float(cross_scores[i])
+                result["combined_score"] = (original_score * 0.3) + (cross_score * 0.7)
+                result["cross_encoder_score"] = cross_score
+            
+            return results
+            
+        except Exception as e:
+            logger.error(f"Cross-encoder reranking failed: {e}")
+            return results
+    
+    async def _check_query_cache(self, query: str) -> Optional[Dict[str, Any]]:
+        """Check if we have a cached response for this query."""
+        try:
+            # Create query hash for caching
+            query_hash = hashlib.md5(query.lower().strip().encode()).hexdigest()
+            cache_key = f"query_response:{query_hash}"
+            
+            cached_result = await self.redis_client.get_json(cache_key)
+            
+            if cached_result:
+                # Update processing time to reflect cache hit
+                cached_result["processing_time"] = 0.1
+                cached_result["cached"] = True
+                logger.info(f"Cache hit for query: {query[:50]}...")
+                return cached_result
+            
+            return None
+            
+        except Exception as e:
+            logger.warning(f"Cache check failed: {e}")
+            return None
+    
+    async def _cache_query_result(self, query: str, result: Dict[str, Any]):
+        """Cache query result for future use."""
+        try:
+            # Create query hash for caching
+            query_hash = hashlib.md5(query.lower().strip().encode()).hexdigest()
+            cache_key = f"query_response:{query_hash}"
+            
+            # Prepare cacheable result (remove large objects)
+            cacheable_result = result.copy()
+            
+            # Limit sources for caching
+            if "sources" in cacheable_result:
+                cacheable_result["sources"] = cacheable_result["sources"][:3]
+            
+            # Cache for 1 hour for high-quality responses
+            await self.redis_client.set_json(
+                cache_key, 
+                cacheable_result,
+                expire_seconds=3600
+            )
+            
+            logger.info(f"Cached high-quality response for query: {query[:50]}...")
+            
+        except Exception as e:
+            logger.warning(f"Failed to cache query result: {e}")
+    
+    async def _cache_retrieval_results(self, query_embedding: List[float], 
+                                     results: List[Dict]) -> str:
+        """Cache retrieval results for reuse."""
+        try:
+            # Create embedding hash for caching
+            embedding_str = ",".join([f"{x:.4f}" for x in query_embedding[:10]])  # First 10 dims
+            embedding_hash = hashlib.md5(embedding_str.encode()).hexdigest()
+            cache_key = f"retrieval:{embedding_hash}"
+            
+            # Cache retrieval results for 30 minutes
+            await self.redis_client.set_json(
+                cache_key,
+                {"results": results, "timestamp": time.time()},
+                expire_seconds=1800
+            )
+            
+            return cache_key
+            
+        except Exception as e:
+            logger.warning(f"Failed to cache retrieval results: {e}")
+            return ""
+    
+    async def _get_cached_retrieval_results(self, query_embedding: List[float]) -> Optional[List[Dict]]:
+        """Get cached retrieval results."""
+        try:
+            # Create embedding hash for lookup
+            embedding_str = ",".join([f"{x:.4f}" for x in query_embedding[:10]])
+            embedding_hash = hashlib.md5(embedding_str.encode()).hexdigest()
+            cache_key = f"retrieval:{embedding_hash}"
+            
+            cached_data = await self.redis_client.get_json(cache_key)
+            
+            if cached_data:
+                # Check if cache is still fresh (within 30 minutes)
+                if time.time() - cached_data.get("timestamp", 0) < 1800:
+                    return cached_data.get("results", [])
+            
+            return None
+            
+        except Exception as e:
+            logger.warning(f"Failed to get cached retrieval results: {e}")
+            return None
+
     async def health_check(self) -> bool:
         """Perform health check of chat service components."""
         try:
