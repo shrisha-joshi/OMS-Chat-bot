@@ -27,6 +27,11 @@ class ArangoDBClient:
         self.graph_name = "knowledge_graph"
         self.entities_collection = "entities"
         self.relations_collection = "relations"
+        self.available = False  # Flag to indicate if service is available
+    
+    def is_connected(self) -> bool:
+        """Check if ArangoDB is currently connected."""
+        return self.available and self.client is not None
     
     async def connect(self):
         """Establish connection to ArangoDB and setup graph structure.
@@ -93,16 +98,23 @@ class ArangoDBClient:
             return True
 
         try:
-            return await asyncio.wait_for(_do_connect(), timeout=timeout_seconds)
+            result = await asyncio.wait_for(_do_connect(), timeout=timeout_seconds)
+            if result:
+                self.available = True
+            else:
+                self.available = False
+            return result
         except asyncio.TimeoutError:
             logger.warning(f"ArangoDB connection timed out after {timeout_seconds}s - skipping ArangoDB for now")
             # Clean up partial state
             self.client = None
             self.database = None
             self.graph = None
+            self.available = False
             return False
         except Exception as e:
             logger.error(f"❌ Failed to connect to ArangoDB: {e}")
+            self.available = False
             # Clean up failed connection
             self.client = None
             self.database = None

@@ -1,7 +1,6 @@
 'use client'
 
 import React, { createContext, useContext, useState, useEffect, ReactNode } from 'react'
-import { io, Socket } from 'socket.io-client'
 
 interface ChatMessage {
   id: string
@@ -9,29 +8,16 @@ interface ChatMessage {
   content: string
   timestamp: string
   sources?: Array<{
-    id: string
     filename: string
+    similarity: number
     text: string
-    score: number
   }>
   attachments?: Array<{
     type: string
-    url: string
-    title: string
+    url?: string
   }>
-  evaluation?: {
-    accuracy: number
-    relevance: number
-    completeness: number
-    coherence: number
-    overall_score: number
-    processing_strategy: string
-    query_type: string
-    query_complexity: 'simple' | 'complex' | 'multi_part'
-    cache_hit: boolean
-    retrieval_time: number
-    sources_count: number
-  }
+  processing_time?: number
+  tokens_generated?: number
 }
 
 interface ChatSession {
@@ -55,70 +41,44 @@ interface ChatContextType {
 
 const ChatContext = createContext<ChatContextType | undefined>(undefined)
 
+const API_BASE_URL = typeof window !== 'undefined' 
+  ? (process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000')
+  : 'http://localhost:8000'
+
 export function ChatProvider({ children }: { children: ReactNode }) {
   const [sessions, setSessions] = useState<ChatSession[]>([])
   const [currentSession, setCurrentSession] = useState<ChatSession | null>(null)
-  const [socket, setSocket] = useState<Socket | null>(null)
-  const [isConnected, setIsConnected] = useState(false)
+  const [isConnected] = useState(true)
   const [isProcessing, setIsProcessing] = useState(false)
 
+  // Load sessions from localStorage
   useEffect(() => {
-    // Load sessions from localStorage
-    const savedSessions = localStorage.getItem('chat_sessions')
-    if (savedSessions) {
-      const parsedSessions = JSON.parse(savedSessions)
-      setSessions(parsedSessions)
-      if (parsedSessions.length > 0) {
-        setCurrentSession(parsedSessions[0])
+    if (typeof window === 'undefined') return
+    
+    try {
+      const savedSessions = localStorage.getItem('chat_sessions')
+      if (savedSessions) {
+        const parsedSessions = JSON.parse(savedSessions)
+        setSessions(parsedSessions)
+        if (parsedSessions.length > 0) {
+          setCurrentSession(parsedSessions[0])
+        }
       }
-    }
-
-    // Initialize WebSocket connection
-    initializeWebSocket()
-
-    return () => {
-      if (socket) {
-        socket.disconnect()
-      }
+    } catch (e) {
+      console.error('Failed to load sessions:', e)
     }
   }, [])
 
+  // Save sessions to localStorage
   useEffect(() => {
-    // Save sessions to localStorage whenever sessions change
-    localStorage.setItem('chat_sessions', JSON.stringify(sessions))
+    if (typeof window === 'undefined') return
+    
+    try {
+      localStorage.setItem('chat_sessions', JSON.stringify(sessions))
+    } catch (e) {
+      console.error('Failed to save sessions:', e)
+    }
   }, [sessions])
-
-  const initializeWebSocket = () => {
-    const wsUrl = (typeof process !== 'undefined' ? process.env.NEXT_PUBLIC_WS_URL : undefined) || 'ws://localhost:8000'
-    const newSocket = io(wsUrl, {
-      transports: ['websocket'],
-      autoConnect: true
-    })
-
-    newSocket.on('connect', () => {
-      setIsConnected(true)
-    })
-
-    newSocket.on('disconnect', () => {
-      setIsConnected(false)
-    })
-
-    newSocket.on('chat_response', (data) => {
-      if (data.type === 'token') {
-        // Update current message with new token
-        updateCurrentMessage(data.content)
-      } else if (data.type === 'sources') {
-        // Add sources and evaluation to current message
-        updateCurrentMessageSources(data.sources, data.attachments, data.evaluation)
-        setIsProcessing(false)
-      } else if (data.type === 'error') {
-        handleChatError(data.content)
-        setIsProcessing(false)
-      }
-    })
-
-    setSocket(newSocket)
-  }
 
   const createNewSession = (): ChatSession => {
     const newSession: ChatSession = {
@@ -141,8 +101,8 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     }
   }
 
-  const sendMessage = (content: string) => {
-    if (!currentSession || !socket || isProcessing) return
+  const sendMessage = async (content: string) => {
+    if (!currentSession || isProcessing || !content.trim()) return
 
     // Add user message
     const userMessage: ChatMessage = {
@@ -152,106 +112,102 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       timestamp: new Date().toISOString()
     }
 
-    const updatedSession = {
+    let updatedSession = {
       ...currentSession,
       messages: [...currentSession.messages, userMessage],
       updated_at: new Date().toISOString(),
-      title: currentSession.messages.length === 0 ? content.slice(0, 50) + '...' : currentSession.title
+      title: currentSession.messages.length === 0 ? content.slice(0, 50) : currentSession.title
     }
 
     setCurrentSession(updatedSession)
     setSessions(prev => prev.map(s => s.id === updatedSession.id ? updatedSession : s))
 
-    // Create assistant message placeholder
-    const assistantMessage: ChatMessage = {
+    // Add loading message
+    const loadingMessage: ChatMessage = {
       id: `msg_${Date.now() + 1}`,
       role: 'assistant',
-      content: '',
+      content: '⏳ Thinking...',
       timestamp: new Date().toISOString()
     }
 
-    const sessionWithAssistant = {
+    updatedSession = {
       ...updatedSession,
-      messages: [...updatedSession.messages, assistantMessage]
+      messages: [...updatedSession.messages, loadingMessage]
     }
 
-    setCurrentSession(sessionWithAssistant)
-    setSessions(prev => prev.map(s => s.id === sessionWithAssistant.id ? sessionWithAssistant : s))
-
+    setCurrentSession(updatedSession)
+    setSessions(prev => prev.map(s => s.id === updatedSession.id ? updatedSession : s))
     setIsProcessing(true)
 
-    // Send to WebSocket
-    socket.emit('chat_message', {
-      session_id: currentSession.id,
-      message: content
-    })
-  }
+    try {
+      // Call REST API
+      const response = await fetch(`${API_BASE_URL}/chat/query`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          query: content,
+          session_id: currentSession.id,
+          context: []
+        })
+      })
 
-  const updateCurrentMessage = (token: string) => {
-    if (!currentSession) return
-
-    const updatedMessages = currentSession.messages.map(msg => {
-      if (msg.role === 'assistant' && msg.content === '' || 
-          msg.id === currentSession.messages[currentSession.messages.length - 1]?.id) {
-        return { ...msg, content: msg.content + token }
+      if (!response.ok) {
+        throw new Error(`API error: ${response.statusText}`)
       }
-      return msg
-    })
 
-    const updatedSession = {
-      ...currentSession,
-      messages: updatedMessages,
-      updated_at: new Date().toISOString()
-    }
+      const data = await response.json()
 
-    setCurrentSession(updatedSession)
-    setSessions(prev => prev.map(s => s.id === updatedSession.id ? updatedSession : s))
-  }
-
-  const updateCurrentMessageSources = (sources: any[], attachments: any[], evaluation?: any) => {
-    if (!currentSession) return
-
-    const updatedMessages = currentSession.messages.map(msg => {
-      if (msg.id === currentSession.messages[currentSession.messages.length - 1]?.id) {
-        return { ...msg, sources, attachments, evaluation }
+      // Replace loading message with response
+      const assistantMessage: ChatMessage = {
+        id: `msg_${Date.now()}`,
+        role: 'assistant',
+        content: data.response || 'I apologize, but I could not generate a response.',
+        timestamp: new Date().toISOString(),
+        sources: data.sources || [],
+        attachments: data.attachments || [],
+        processing_time: data.processing_time,
+        tokens_generated: data.tokens_generated
       }
-      return msg
-    })
 
-    const updatedSession = {
-      ...currentSession,
-      messages: updatedMessages,
-      updated_at: new Date().toISOString()
+      updatedSession = {
+        ...updatedSession,
+        messages: [...updatedSession.messages.slice(0, -1), assistantMessage],
+        updated_at: new Date().toISOString()
+      }
+
+      setCurrentSession(updatedSession)
+      setSessions(prev => prev.map(s => s.id === updatedSession.id ? updatedSession : s))
+    } catch (error) {
+      console.error('Failed to send message:', error)
+
+      // Show error message
+      const errorMessage: ChatMessage = {
+        id: `msg_${Date.now()}`,
+        role: 'assistant',
+        content: `I apologize, but I encountered an error: ${error instanceof Error ? error.message : 'Unknown error'}`,
+        timestamp: new Date().toISOString()
+      }
+
+      updatedSession = {
+        ...updatedSession,
+        messages: [...updatedSession.messages.slice(0, -1), errorMessage]
+      }
+
+      setCurrentSession(updatedSession)
+      setSessions(prev => prev.map(s => s.id === updatedSession.id ? updatedSession : s))
+    } finally {
+      setIsProcessing(false)
     }
-
-    setCurrentSession(updatedSession)
-    setSessions(prev => prev.map(s => s.id === updatedSession.id ? updatedSession : s))
-  }
-
-  const handleChatError = (error: string) => {
-    if (!currentSession) return
-
-    const errorMessage: ChatMessage = {
-      id: `msg_${Date.now()}`,
-      role: 'assistant',
-      content: `I apologize, but I encountered an error: ${error}`,
-      timestamp: new Date().toISOString()
-    }
-
-    const updatedSession = {
-      ...currentSession,
-      messages: [...currentSession.messages.slice(0, -1), errorMessage],
-      updated_at: new Date().toISOString()
-    }
-
-    setCurrentSession(updatedSession)
-    setSessions(prev => prev.map(s => s.id === updatedSession.id ? updatedSession : s))
   }
 
   const clearSessions = () => {
     setSessions([])
     setCurrentSession(null)
-    localStorage.removeItem('chat_sessions')
+    if (typeof window !== 'undefined') {
+      localStorage.removeItem('chat_sessions')
+    }
   }
 
   const value = {

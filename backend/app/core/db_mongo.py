@@ -22,17 +22,23 @@ class MongoDBClient:
         self.client: Optional[AsyncIOMotorClient] = None
         self.database = None
         self.fs_bucket: Optional[AsyncIOMotorGridFSBucket] = None
+        self.available = False  # Flag to indicate if service is available
     
     @property
     def db(self):
         """Alias for database to maintain compatibility with service code."""
         return self.database
     
+    def is_connected(self) -> bool:
+        """Check if MongoDB is currently connected."""
+        return self.available and self.client is not None
+    
     async def connect(self):
         """Establish connection to MongoDB and initialize GridFS."""
         try:
             if not settings.mongodb_uri:
                 logger.warning("MongoDB URI not configured, running without MongoDB")
+                self.available = False
                 return False
                 
             logger.info("Attempting to connect to MongoDB Atlas...")
@@ -46,6 +52,7 @@ class MongoDBClient:
             # Test connection
             await self.client.admin.command('ping')
             logger.info(f"✅ Successfully connected to MongoDB: {settings.mongodb_db}")
+            self.available = True
             
             # Create indexes
             await self._create_indexes()
@@ -57,6 +64,7 @@ class MongoDBClient:
             self.client = None
             self.database = None
             self.fs_bucket = None
+            self.available = False
             return False
     
     async def disconnect(self):
@@ -128,6 +136,46 @@ class MongoDBClient:
             logger.info(f"File deleted from GridFS: {file_id}")
         except Exception as e:
             logger.error(f"Failed to delete file {file_id}: {e}")
+            raise
+    
+    async def save_document(
+        self, 
+        filename: str, 
+        content: bytes, 
+        content_type: str = "application/octet-stream",
+        size: int = 0
+    ) -> str:
+        """
+        Save a document: store file in GridFS and create metadata record.
+        Returns the document ID for tracking.
+        """
+        try:
+            # Step 1: Store file in GridFS
+            file_id = await self.store_file(
+                filename=filename,
+                content=content,
+                metadata={
+                    "content_type": content_type,
+                    "size": size,
+                    "uploaded_at": datetime.utcnow().isoformat()
+                }
+            )
+            
+            # Step 2: Create document metadata record
+            doc_id = await self.create_document({
+                "filename": filename,
+                "gridfs_id": file_id,
+                "size": size,
+                "content_type": content_type,
+                "uploader": "api",
+                "ingest_status": "PENDING"
+            })
+            
+            logger.info(f"✅ Document saved: {filename} (GridFS: {file_id}, Doc: {doc_id})")
+            return doc_id
+        
+        except Exception as e:
+            logger.error(f"❌ Failed to save document {filename}: {e}")
             raise
     
     async def create_document(self, document_data: Dict) -> str:
@@ -301,6 +349,179 @@ class MongoDBClient:
         except Exception as e:
             logger.error(f"Failed to get all documents: {e}")
             return []
+    
+    async def create_document_relationship(self, from_doc_id: str, to_doc_id: str, 
+                                         relationship_type: str, metadata: Dict[str, Any] = None) -> bool:
+        """
+        Create a graph relationship between two documents in MongoDB.
+        
+        Relationship types:
+        - "references": Document A references Document B
+        - "related_topic": Documents discuss similar topics
+        - "child": Document A is a subsection of Document B
+        - "similar": Documents have similar content
+        """
+        try:
+            if not self.database:
+                logger.warning("MongoDB not available for relationship storage")
+                return False
+            
+            relationship = {
+                "from_doc_id": from_doc_id,
+                "to_doc_id": to_doc_id,
+                "type": relationship_type,
+                "metadata": metadata or {},
+                "created_at": datetime.utcnow()
+            }
+            
+            # Create composite index for fast lookups
+            await self.database.document_relationships.create_index([
+                ("from_doc_id", 1),
+                ("type", 1)
+            ])
+            await self.database.document_relationships.create_index([
+                ("to_doc_id", 1),
+                ("type", 1)
+            ])
+            
+            # Insert or update relationship
+            await self.database.document_relationships.update_one(
+                {
+                    "from_doc_id": from_doc_id,
+                    "to_doc_id": to_doc_id,
+                    "type": relationship_type
+                },
+                {"$set": relationship},
+                upsert=True
+            )
+            
+            logger.info(f"Created relationship: {from_doc_id} --{relationship_type}--> {to_doc_id}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to create document relationship: {e}")
+            return False
+    
+    async def get_related_documents(self, doc_id: str, relationship_type: str = None) -> List[str]:
+        """
+        Get all documents related to the given document.
+        
+        Returns: List of related document IDs
+        """
+        try:
+            if not self.database:
+                return []
+            
+            query = {"from_doc_id": doc_id}
+            if relationship_type:
+                query["type"] = relationship_type
+            
+            cursor = self.database.document_relationships.find(query, {"to_doc_id": 1})
+            related_docs = []
+            async for rel in cursor:
+                related_docs.append(rel["to_doc_id"])
+            
+            logger.info(f"Found {len(related_docs)} related documents for {doc_id}")
+            return related_docs
+            
+        except Exception as e:
+            logger.error(f"Failed to get related documents: {e}")
+            return []
+    
+    async def extract_topics_and_create_relationships(self, doc_id: str, topics: List[str], 
+                                                     all_docs: List[Dict[str, Any]]) -> int:
+        """
+        Extract topics from document and create relationships with other documents
+        that share the same topics.
+        
+        Returns: Number of relationships created
+        """
+        try:
+            if not self.database:
+                return 0
+            
+            relationships_created = 0
+            
+            # For each extracted topic, find other documents with same topic
+            for topic in topics:
+                # Search other documents for this topic
+                for other_doc in all_docs:
+                    if other_doc.get("_id") == doc_id:
+                        continue
+                    
+                    # Check if other document has this topic
+                    other_topics = other_doc.get("topics", [])
+                    if topic in other_topics:
+                        # Create relationship
+                        success = await self.create_document_relationship(
+                            doc_id,
+                            str(other_doc.get("_id")),
+                            "related_topic",
+                            {"topic": topic}
+                        )
+                        if success:
+                            relationships_created += 1
+            
+            logger.info(f"Created {relationships_created} topic-based relationships for {doc_id}")
+            return relationships_created
+            
+        except Exception as e:
+            logger.error(f"Failed to extract topics and create relationships: {e}")
+            return 0
+    
+    async def get_document_graph(self, doc_id: str, depth: int = 2) -> Dict[str, Any]:
+        """
+        Get the complete relationship graph for a document up to specified depth.
+        
+        Returns: Graph structure with nodes and edges
+        """
+        try:
+            if not self.database:
+                return {"nodes": [], "edges": []}
+            
+            nodes = set()
+            edges = []
+            visited = set()
+            queue = [(doc_id, 0)]
+            
+            while queue:
+                current_doc, current_depth = queue.pop(0)
+                
+                if current_depth > depth or current_doc in visited:
+                    continue
+                
+                visited.add(current_doc)
+                nodes.add(current_doc)
+                
+                # Get related documents
+                cursor = self.database.document_relationships.find(
+                    {"from_doc_id": current_doc},
+                    {"to_doc_id": 1, "type": 1}
+                )
+                
+                async for rel in cursor:
+                    related_doc = rel["to_doc_id"]
+                    rel_type = rel["type"]
+                    
+                    nodes.add(related_doc)
+                    edges.append({
+                        "from": current_doc,
+                        "to": related_doc,
+                        "type": rel_type
+                    })
+                    
+                    if related_doc not in visited and current_depth < depth:
+                        queue.append((related_doc, current_depth + 1))
+            
+            logger.info(f"Generated graph with {len(nodes)} nodes and {len(edges)} edges for {doc_id}")
+            return {
+                "nodes": list(nodes),
+                "edges": edges
+            }
+            
+        except Exception as e:
+            logger.error(f"Failed to get document graph: {e}")
+            return {"nodes": [], "edges": []}
 
 
 # Global MongoDB client instance

@@ -23,12 +23,18 @@ class QdrantDBClient:
     def __init__(self):
         self.client: Optional[QdrantClient] = None
         self.collection_name = settings.qdrant_collection
+        self.available = False  # Flag to indicate if service is available
+    
+    def is_connected(self) -> bool:
+        """Check if Qdrant is currently connected."""
+        return self.available and self.client is not None
     
     async def connect(self):
         """Establish connection to Qdrant and create collection if needed."""
         try:
             if not settings.qdrant_url:
                 logger.warning("Qdrant URL not configured, running without Qdrant")
+                self.available = False
                 return False
                 
             logger.info("Attempting to connect to Qdrant Cloud...")
@@ -46,6 +52,7 @@ class QdrantDBClient:
             
             collections = await asyncio.to_thread(_test_connection)
             logger.info(f"✅ Successfully connected to Qdrant Cloud! Available collections: {len(collections.collections)}")
+            self.available = True
             
             # Create collection if it doesn't exist
             await self._ensure_collection_exists()
@@ -55,6 +62,7 @@ class QdrantDBClient:
             logger.error(f"❌ Failed to connect to Qdrant: {e}")
             # Clean up failed connection
             self.client = None
+            self.available = False
             return False
     
     async def disconnect(self):

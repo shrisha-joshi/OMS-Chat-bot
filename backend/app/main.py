@@ -12,6 +12,7 @@ from contextlib import asynccontextmanager
 import logging
 import asyncio
 from typing import AsyncGenerator
+from datetime import datetime
 
 from .config import settings
 from .core.db_mongo import mongodb_client
@@ -38,6 +39,24 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     logger.info("=" * 80)
     
     try:
+        # Log effective configuration (sanitize secrets)
+        import os
+        logger.info("=" * 80)
+        logger.info("CONFIGURATION CHECK:")
+        logger.info(f"  APP_ENV: {settings.app_env}")
+        logger.info(f"  DEBUG_MODE: {settings.debug_mode}")
+        logger.info(f"  MONGODB_URI configured: {bool(settings.mongodb_uri)}")
+        logger.info(f"  QDRANT_URL: {settings.qdrant_url if settings.qdrant_url else 'NOT SET'}")
+        logger.info(f"  REDIS_URL configured: {bool(settings.redis_url)}")
+        logger.info(f"  ARANGODB_URL configured: {bool(settings.arangodb_url)}")
+        logger.info(f"  LMSTUDIO_API_URL: {settings.lmstudio_api_url}")
+        logger.info(f"  USE_GRAPH_SEARCH: {settings.use_graph_search}")
+        logger.info(f"  USE_RERANKER: {settings.use_reranker}")
+        logger.info(f"  CHUNK_SIZE: {settings.chunk_size}")
+        logger.info(f"  TOP_K_RETRIEVAL: {settings.top_k_retrieval}")
+        logger.info(f"  MAX_LLM_OUTPUT_TOKENS: {settings.max_llm_output_tokens}")
+        logger.info("=" * 80)
+        
         # Connect to all databases (continue even if some fail)
         logger.info("LIFESPAN: Connecting to databases...")
         
@@ -197,28 +216,62 @@ app.include_router(
 # Health check endpoint
 @app.get("/health")
 async def health_check():
-    """Health check endpoint for monitoring."""
+    """Health check endpoint - liveness probe (app is running)."""
     try:
-        # Check database connections
-        mongo_status = "connected" if mongodb_client.client else "disconnected"
-        qdrant_status = "connected" if qdrant_client.client else "disconnected"
-        arango_status = "connected" if arango_client.client else "disconnected"
-        redis_status = "connected" if redis_client.client else "disconnected"
+        mongo_status = "connected" if mongodb_client.is_connected() else "disconnected"
+        qdrant_status = "connected" if qdrant_client.is_connected() else "disconnected"
+        arango_status = "connected" if arango_client.is_connected() else "disconnected"
+        redis_status = "connected" if redis_client.is_connected() else "disconnected"
+        
+        status_code = 200
+        databases = {
+            "mongodb": mongo_status,
+            "qdrant": qdrant_status,
+            "arangodb": arango_status,
+            "redis": redis_status
+        }
+        
+        logger.debug(f"Health check: {databases}")
         
         return {
-            "status": "healthy",
+            "status": "alive",
             "environment": settings.app_env,
             "version": "1.0.0",
-            "databases": {
-                "mongodb": mongo_status,
-                "qdrant": qdrant_status,
-                "arangodb": arango_status,
-                "redis": redis_status
-            }
+            "databases": databases,
+            "timestamp": datetime.utcnow().isoformat()
         }
     except Exception as e:
         logger.error(f"Health check failed: {e}")
-        raise HTTPException(status_code=503, detail="Service unavailable")
+        raise HTTPException(status_code=500, detail="Health check failed")
+
+@app.get("/ready")
+async def readiness_check():
+    """Readiness probe - returns 200 only if critical services available."""
+    try:
+        critical_services_ok = mongodb_client.is_connected() and redis_client.is_connected()
+        
+        databases = {
+            "mongodb": "ok" if mongodb_client.is_connected() else "down",
+            "qdrant": "ok" if qdrant_client.is_connected() else "down",
+            "redis": "ok" if redis_client.is_connected() else "down",
+            "arangodb": "ok" if arango_client.is_connected() else "down"
+        }
+        
+        if not critical_services_ok:
+            logger.warning(f"Not ready - critical services down: {databases}")
+            raise HTTPException(status_code=503, detail="Critical services unavailable")
+        
+        logger.debug("Readiness check passed")
+        return {
+            "status": "ready",
+            "databases": databases,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Readiness check failed: {e}")
+        raise HTTPException(status_code=503, detail="Readiness check failed")
 
 @app.get("/")
 async def root():

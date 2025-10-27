@@ -33,23 +33,45 @@ interface ChatSession {
   created_at: string
 }
 
+interface ChatInterfaceProps {
+  sessionId: string
+}
+
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE || 'http://localhost:8000'
 
-export function ChatInterfaceReal() {
+export function ChatInterfaceReal({ sessionId: propSessionId }: ChatInterfaceProps) {
   const [messages, setMessages] = useState<Message[]>([])
   const [input, setInput] = useState('')
   const [isLoading, setIsLoading] = useState(false)
-  const [sessionId, setSessionId] = useState<string>('')
+  const [sessionId, setSessionId] = useState<string>(propSessionId)
   const [isMounted, setIsMounted] = useState(false)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
 
-  // Initialize session
+  // Initialize session and load history
   useEffect(() => {
     setIsMounted(true)
-    const newSessionId = `session-${Date.now()}`
-    setSessionId(newSessionId)
-  }, [])
+    setSessionId(propSessionId)
+    
+    // Load previous messages from API
+    const loadSessionHistory = async () => {
+      try {
+        const response = await fetch(`${API_BASE_URL}/chat/history/${propSessionId}`)
+        if (response.ok) {
+          const data = await response.json()
+          if (data.messages && Array.isArray(data.messages) && data.messages.length > 0) {
+            setMessages(data.messages)
+            console.info(`✅ Loaded ${data.messages.length} messages from session history`)
+          }
+        }
+      } catch (error) {
+        console.warn('Could not load history:', error)
+        // Graceful degradation - continue with empty chat
+      }
+    }
+    
+    loadSessionHistory()
+  }, [propSessionId])
 
   // Auto-scroll to bottom
   const scrollToBottom = useCallback(() => {
@@ -89,10 +111,17 @@ export function ChatInterfaceReal() {
       })
 
       if (!response.ok) {
-        throw new Error(`API error: ${response.statusText}`)
+        const errorData = await response.json().catch(() => ({}))
+        const errorMsg = errorData.detail || errorData.error || response.statusText
+        throw new Error(`API error (${response.status}): ${errorMsg}`)
       }
 
       const data = await response.json()
+
+      // Check if response is empty or error
+      if (!data.response) {
+        throw new Error('Empty response from LLM. The service may be experiencing issues.')
+      }
 
       const assistantMessage: Message = {
         id: `msg-${Date.now()}`,
@@ -106,10 +135,29 @@ export function ChatInterfaceReal() {
       }
 
       setMessages(prev => [...prev, assistantMessage])
-      toast.success('Response received!')
+      toast.success(`✅ Response received (${data.tokens_generated || 0} tokens)`)
     } catch (error) {
-      toast.error(`Failed to send message: ${error instanceof Error ? error.message : 'Unknown error'}`)
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error'
       console.error('Chat error:', error)
+      
+      // Show detailed error message
+      const errorDetails = errorMessage.includes('API error') 
+        ? errorMessage 
+        : `Failed to send message: ${errorMessage}`
+      
+      toast.error(errorDetails, {
+        duration: 5000
+      })
+      
+      // Add error message to chat for visibility
+      const errorMessage_obj: Message = {
+        id: `msg-${Date.now()}`,
+        role: 'assistant',
+        content: `❌ Error: ${errorMessage}\n\nPlease try again or check the backend logs for details.`,
+        timestamp: new Date().toISOString()
+      }
+      
+      setMessages(prev => [...prev, errorMessage_obj])
     } finally {
       setIsLoading(false)
     }

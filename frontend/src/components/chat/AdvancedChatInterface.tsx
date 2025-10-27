@@ -11,10 +11,9 @@ interface Message {
   content: string
   timestamp: string
   sources?: Array<{
-    id: string
     filename: string
+    similarity: number
     text: string
-    score: number
   }>
   attachments?: Array<{
     type: string
@@ -202,7 +201,7 @@ export function AdvancedChatInterface() {
                               <div key={idx} className="text-xs bg-white p-2 rounded border">
                                 <div className="flex items-center justify-between mb-1">
                                   <span className="font-medium text-blue-600">{source.filename}</span>
-                                  <span className="text-gray-500">Score: {(source.score * 100).toFixed(1)}%</span>
+                                  <span className="text-gray-500">Score: {(source.similarity * 100).toFixed(1)}%</span>
                                 </div>
                                 <p className="text-gray-600 line-clamp-2">{source.text}</p>
                                 <button className="text-blue-500 hover:text-blue-700 mt-1 flex items-center">

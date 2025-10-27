@@ -20,12 +20,18 @@ class RedisClient:
     def __init__(self):
         self.client: Optional[redis.Redis] = None
         self.pubsub = None
+        self.available = False  # Flag to indicate if service is available
+    
+    def is_connected(self) -> bool:
+        """Check if Redis is currently connected."""
+        return self.available and self.client is not None
     
     async def connect(self):
         """Establish connection to Redis."""
         try:
             if not settings.redis_url:
                 logger.warning("Redis URL not configured, running without Redis cache")
+                self.available = False
                 return False
                 
             logger.info("Attempting to connect to Redis Cloud...")
@@ -38,12 +44,14 @@ class RedisClient:
             # The redis client exposes an async ping; await it to avoid runtime warnings
             await self.client.ping()
             logger.info("✅ Successfully connected to Redis Cloud!")
+            self.available = True
             return True
             
         except Exception as e:
             logger.error(f"❌ Failed to connect to Redis: {e}")
             # Clean up failed connection
             self.client = None
+            self.available = False
             return False
     
     async def disconnect(self):

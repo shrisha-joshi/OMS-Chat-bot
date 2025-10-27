@@ -28,6 +28,26 @@ class LLMHandler:
         self.timeout = 120.0
         self.provider_health = {}
         
+        # Initialize tokenizer immediately
+        try:
+            self.tokenizer = tiktoken.get_encoding("cl100k_base")
+            logger.debug("Tokenizer initialized in __init__")
+        except Exception as e:
+            logger.warning(f"Failed to initialize tokenizer: {e}")
+            self.tokenizer = None
+        
+        # Initialize HTTP client immediately
+        try:
+            self.http_client = httpx.AsyncClient(timeout=self.timeout)
+            logger.debug("HTTP client initialized in __init__")
+        except Exception as e:
+            logger.warning(f"Failed to initialize HTTP client: {e}")
+            self.http_client = None
+        
+        # Setup providers immediately  
+        self._setup_providers()
+        logger.debug(f"Providers initialized in __init__: {[p['name'] for p in self.providers]}")
+        
     async def initialize(self):
         """Initialize LLM handler with available providers."""
         try:
@@ -139,14 +159,20 @@ class LLMHandler:
         """
         try:
             # Prepare messages
+            # Note: Some models don't support 'system' role, so we prepend system prompt to user message
             messages = []
+            
             if system_prompt:
-                messages.append({"role": "system", "content": system_prompt})
-            messages.append({"role": "user", "content": prompt})
+                # Combine system prompt with user prompt
+                combined_prompt = f"{system_prompt}\n\n{prompt}"
+            else:
+                combined_prompt = prompt
+            
+            messages.append({"role": "user", "content": combined_prompt})
             
             # Count tokens
-            prompt_tokens = self.count_tokens(prompt)
-            system_tokens = self.count_tokens(system_prompt) if system_prompt else 0
+            prompt_tokens = self.count_tokens(combined_prompt)
+            system_tokens = 0  # Already included in combined_prompt
             
             # Set max tokens if not provided
             if not max_tokens:
@@ -205,8 +231,8 @@ class LLMHandler:
         top_p: float,
         max_tokens: int,
         prompt_tokens: int
-    ) -> Dict[str, Any]:
-        """Get non-streaming response from provider."""
+    ) -> str:
+        """Get non-streaming response from provider. Returns response text directly."""
         try:
             url = f"{provider['url']}/chat/completions"
             logger.debug(f"Making request to {url} with model {provider['model']}")
@@ -242,18 +268,11 @@ class LLMHandler:
             response_content = data["choices"][0]["message"]["content"]
             logger.info(f"✅ Successfully generated response ({len(response_content)} chars, {completion_tokens} completion tokens)")
             
-            return {
-                "response": response_content,
-                "provider": provider["name"],
-                "model": provider["model"],
-                "usage": {
-                    "prompt_tokens": prompt_tokens,
-                    "completion_tokens": completion_tokens,
-                    "total_tokens": total_tokens
-                },
-                "latency_ms": latency * 1000,
-                "stream": False
-            }
+            # Log token usage
+            logger.debug(f"Token usage - Prompt: {prompt_tokens}, Completion: {completion_tokens}, Total: {total_tokens}")
+            
+            return response_content  # Return just the string, not dict
+            
             
         except Exception as e:
             logger.error(f"Error with provider '{provider['name']}': {e}", exc_info=True)

@@ -20,6 +20,7 @@ from ..core.db_arango import get_arango_client, ArangoDBClient
 from ..core.cache_redis import get_redis_client, RedisClient
 from ..services.chat_service import ChatService
 from ..config import settings
+from ..config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +47,8 @@ class ChatResponse(BaseModel):
     session_id: str
     processing_time: float
     tokens_generated: int
+    # Phase 3: Advanced RAG metrics
+    phase3_metrics: Optional[Dict[str, Any]] = None
 
 class StreamingChatResponse(BaseModel):
     type: str  # "token", "sources", "complete"
@@ -439,3 +442,129 @@ def _extract_attachments(sources: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 })
     
     return attachments
+
+
+@router.get("/history/{session_id}")
+async def get_session_history(
+    session_id: str,
+    mongo_client: MongoDBClient = Depends(get_mongodb_client),
+    redis_client: RedisClient = Depends(get_redis_client)
+) -> Dict[str, Any]:
+    """
+    Retrieve chat history for a session.
+    
+    **Path Parameters:**
+    - session_id: Unique session identifier
+    
+    **Returns:**
+    - session_id: The session identifier
+    - messages: List of messages in the conversation
+    - source: Where data came from (cache, database, or new)
+    - total: Total number of messages
+    """
+    try:
+        logger.info(f"Fetching history for session: {session_id}")
+        
+        # Try Redis cache first (fastest)
+        if redis_client.is_connected():
+            try:
+                session_data = await redis_client.get_session_data(session_id)
+                if session_data and "messages" in session_data:
+                    logger.info(f"✅ Session history found in Redis: {len(session_data['messages'])} messages")
+                    return {
+                        "session_id": session_id,
+                        "messages": session_data["messages"],
+                        "source": "cache",
+                        "total": len(session_data["messages"])
+                    }
+            except Exception as e:
+                logger.warning(f"Redis lookup failed, trying MongoDB: {e}")
+        
+        # Fall back to MongoDB (persistent storage)
+        if mongo_client.is_connected():
+            try:
+                history_doc = await mongo_client.database.chat_sessions.find_one(
+                    {"session_id": session_id}
+                )
+                
+                if history_doc:
+                    messages = history_doc.get("messages", [])
+                    logger.info(f"✅ Session history found in MongoDB: {len(messages)} messages")
+                    return {
+                        "session_id": session_id,
+                        "messages": messages,
+                        "source": "database",
+                        "total": len(messages)
+                    }
+            except Exception as e:
+                logger.warning(f"MongoDB lookup failed: {e}")
+        
+        # No history found - return empty
+        logger.info(f"No history found for session: {session_id}")
+        return {
+            "session_id": session_id,
+            "messages": [],
+            "source": "new",
+            "total": 0
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to retrieve session history: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve history: {str(e)}")
+
+
+@router.get("/sessions/list")
+async def list_sessions(
+    mongo_client: MongoDBClient = Depends(get_mongodb_client),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(10, ge=1, le=50)
+) -> Dict[str, Any]:
+    """
+    List all chat sessions.
+    
+    **Query Parameters:**
+    - skip: Number of sessions to skip (pagination)
+    - limit: Maximum sessions to return (1-50)
+    
+    **Returns:**
+    - sessions: List of session summaries
+    - total: Total number of sessions
+    """
+    try:
+        if not mongo_client.is_connected():
+            raise HTTPException(status_code=503, detail="MongoDB not connected")
+        
+        # Get total sessions
+        total = await mongo_client.database.chat_sessions.count_documents({})
+        
+        # Fetch sessions
+        cursor = mongo_client.database.chat_sessions.find({})\
+            .sort("created_at", -1)\
+            .skip(skip)\
+            .limit(limit)
+        
+        sessions = await cursor.to_list(length=limit)
+        
+        formatted_sessions = [
+            {
+                "session_id": session.get("session_id", ""),
+                "created_at": session.get("created_at", ""),
+                "message_count": len(session.get("messages", [])),
+                "last_message_at": session.get("last_message_at", "")
+            }
+            for session in sessions
+        ]
+        
+        logger.info(f"Listed {len(formatted_sessions)} sessions (total: {total})")
+        
+        return {
+            "sessions": formatted_sessions,
+            "total": total,
+            "page": (skip // limit) + 1 if limit > 0 else 1
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to list sessions: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to list sessions: {str(e)}")

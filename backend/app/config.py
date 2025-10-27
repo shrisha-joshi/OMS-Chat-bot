@@ -51,17 +51,17 @@ class Settings(BaseSettings):
     embedding_model_name: str = Field(default="all-MiniLM-L6-v2", alias="EMBEDDING_MODEL_NAME")
     embedding_dimension: int = Field(default=384, alias="EMBEDDING_DIMENSION")
     reranker_model_name: str = Field(default="cross-encoder/ms-marco-MiniLM-L-6-v2", alias="RERANKER_MODEL_NAME")
-    chunk_size: int = Field(default=750, alias="CHUNK_SIZE")
-    chunk_overlap: int = Field(default=150, alias="CHUNK_OVERLAP")
-    top_k_retrieval: int = Field(default=10, alias="TOP_K_RETRIEVAL")
+    chunk_size: int = Field(default=500, alias="CHUNK_SIZE")
+    chunk_overlap: int = Field(default=100, alias="CHUNK_OVERLAP")
+    top_k_retrieval: int = Field(default=5, alias="TOP_K_RETRIEVAL")
     
     # Feature Flags
     use_reranker: bool = Field(default=True, alias="USE_RERANKER")
     use_graph_search: bool = Field(default=True, alias="USE_GRAPH_SEARCH")
     
     # Context Management
-    max_context_tokens: int = Field(default=2000, alias="MAX_CONTEXT_TOKENS")
-    max_llm_output_tokens: int = Field(default=2048, alias="MAX_LLM_OUTPUT_TOKENS")
+    max_context_tokens: int = Field(default=1500, alias="MAX_CONTEXT_TOKENS")
+    max_llm_output_tokens: int = Field(default=1024, alias="MAX_LLM_OUTPUT_TOKENS")
     
     # File Upload Settings
     max_file_size_mb: int = Field(default=50, alias="MAX_FILE_SIZE_MB")

@@ -1,0 +1,36 @@
+from fastapi import APIRouter, File, HTTPException, UploadFile
+from pydantic import BaseModel
+import base64
+import logging
+
+logger = logging.getLogger(__name__)
+router = APIRouter()
+
+
+class UploadJSONRequest(BaseModel):
+    filename: str
+    content_base64: str
+    content_type: str | None = "application/octet-stream"
+
+
+@router.post("/documents/upload")
+async def upload_document_multipart(file: UploadFile = File(...)):
+    """Accept a multipart/form-data file and return size metadata."""
+    if not file or not file.filename:
+        raise HTTPException(status_code=400, detail="No file provided")
+    content = await file.read()
+    size = len(content)
+    logger.info("Received multipart upload: %s (%d bytes)", file.filename, size)
+    return {"success": True, "filename": file.filename, "size": size}
+
+
+@router.post("/documents/upload-json")
+async def upload_document_json(payload: UploadJSONRequest):
+    """Accept JSON payload with base64-encoded content."""
+    try:
+        content = base64.b64decode(payload.content_base64)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid base64 content")
+    size = len(content)
+    logger.info("Received JSON upload: %s (%d bytes)", payload.filename, size)
+    return {"success": True, "filename": payload.filename, "size": size}
