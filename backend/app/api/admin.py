@@ -28,7 +28,8 @@ class UploadJSONRequest(BaseModel):
 async def upload_document_multipart(
     file: UploadFile = File(...),
     background_tasks: BackgroundTasks = BackgroundTasks(),
-    mongo_client: MongoDBClient = Depends(get_mongodb_client)
+    mongo_client: MongoDBClient = Depends(get_mongodb_client),
+    redis_client = Depends(lambda: None)  # Optional Redis dependency
 ):
     """Accept a multipart/form-data file, save to MongoDB, and queue for processing."""
     if not file or not file.filename:
@@ -53,6 +54,17 @@ async def upload_document_multipart(
         )
         
         logger.info(f"✅ Document saved to MongoDB: {file.filename} ({size} bytes) - ID: {doc_id}")
+        
+        # Invalidate document list cache (documents may have changed)
+        try:
+            from ..core.cache_redis import get_redis_client
+            redis_client = await get_redis_client()
+            if redis_client.is_connected():
+                # Clear the document list cache patterns
+                await redis_client.clear_pattern("docs:list:*")
+                logger.info(f"🔄 Cleared document list cache")
+        except Exception as e:
+            logger.warning(f"Failed to clear cache: {e}")
         
         # Queue for background processing
         background_tasks.add_task(
@@ -228,3 +240,124 @@ async def list_documents(
     except Exception as e:
         logger.error(f"Failed to list documents: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to list documents: {str(e)}")
+
+
+@router.get("/documents/status/{doc_id}")
+async def get_document_status(
+    doc_id: str,
+    mongo_client: MongoDBClient = Depends(get_mongodb_client)
+) -> Dict[str, Any]:
+    """
+    Get detailed processing status for a document.
+    
+    **Path Parameters:**
+    - doc_id: Document ID to get status for
+    
+    **Returns:**
+    - current_stage: Current processing stage (EXTRACT, CHUNK, EMBED, STORE_CHUNKS, INDEX_VECTORS, EXTRACT_ENTITIES, COMPLETE, FAILED)
+    - stages: List of all stages with their status
+    - overall_progress: Percentage complete (0-100)
+    - error_message: Error message if stage failed
+    - last_updated: Timestamp of last status update
+    """
+    try:
+        if not mongo_client.is_connected():
+            raise HTTPException(status_code=503, detail="MongoDB not connected")
+        
+        from bson import ObjectId
+        
+        try:
+            obj_id = ObjectId(doc_id)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid document ID format")
+        
+        # Get document metadata
+        doc = await mongo_client.database.documents.find_one({"_id": obj_id})
+        if not doc:
+            raise HTTPException(status_code=404, detail=f"Document {doc_id} not found")
+        
+        # Get ingestion logs
+        logs = []
+        try:
+            cursor = mongo_client.database.ingestion_logs.find({"doc_id": str(obj_id)}).sort("timestamp", 1)
+            logs = await cursor.to_list(length=None)
+        except Exception as e:
+            logger.warning(f"Could not retrieve ingestion logs: {e}")
+        
+        # Define processing stages in order
+        expected_stages = ["EXTRACT", "CHUNK", "EMBED", "STORE_CHUNKS", "INDEX_VECTORS", "EXTRACT_ENTITIES"]
+        
+        # Build status for each stage
+        stages_status = []
+        current_stage_idx = -1
+        current_stage = "PENDING"
+        
+        for i, stage_name in enumerate(expected_stages):
+            stage_log = next((log for log in logs if log.get("stage") == stage_name), None)
+            
+            if stage_log:
+                status = stage_log.get("status", "UNKNOWN")
+                stages_status.append({
+                    "name": stage_name,
+                    "status": status,
+                    "message": stage_log.get("message", ""),
+                    "metadata": stage_log.get("metadata", {}),
+                    "timestamp": stage_log.get("timestamp", "")
+                })
+                
+                if status == "SUCCESS":
+                    current_stage_idx = i
+                    current_stage = stage_name
+                elif status == "PROCESSING":
+                    current_stage = stage_name
+                    break
+                elif status == "FAILED":
+                    current_stage = stage_name
+                    break
+            else:
+                stages_status.append({
+                    "name": stage_name,
+                    "status": "PENDING",
+                    "message": "Awaiting processing",
+                    "metadata": {},
+                    "timestamp": ""
+                })
+        
+        # Calculate overall progress (number of successful stages / total stages)
+        successful_stages = sum(1 for s in stages_status if s["status"] == "SUCCESS")
+        overall_progress = int((successful_stages / len(expected_stages)) * 100)
+        
+        # Check if all stages completed
+        ingest_status = doc.get("ingest_status", "pending")
+        if ingest_status == "complete":
+            current_stage = "COMPLETE"
+            overall_progress = 100
+        elif ingest_status == "failed":
+            current_stage = "FAILED"
+        
+        # Get error message if failed
+        error_message = doc.get("error_message", "")
+        failed_log = next((log for log in logs if log.get("status") == "FAILED"), None)
+        if failed_log and not error_message:
+            error_message = failed_log.get("message", "")
+        
+        logger.info(f"Status for document {doc_id}: {current_stage} ({overall_progress}%)")
+        
+        return {
+            "doc_id": str(obj_id),
+            "filename": doc.get("filename", "unknown"),
+            "current_stage": current_stage,
+            "stages": stages_status,
+            "overall_progress": overall_progress,
+            "ingest_status": ingest_status,
+            "chunks_count": doc.get("chunks_count", 0),
+            "error_message": error_message,
+            "last_updated": doc.get("updated_at", ""),
+            "uploaded_at": doc.get("uploaded_at", "")
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to get document status: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to get document status: {str(e)}")

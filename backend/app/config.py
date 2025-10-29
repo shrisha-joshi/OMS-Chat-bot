@@ -63,6 +63,21 @@ class Settings(BaseSettings):
     max_context_tokens: int = Field(default=1500, alias="MAX_CONTEXT_TOKENS")
     max_llm_output_tokens: int = Field(default=1024, alias="MAX_LLM_OUTPUT_TOKENS")
     
+    # Document Training & RAG Quality
+    force_document_usage: bool = Field(default=True, alias="FORCE_DOCUMENT_USAGE")
+    min_similarity_threshold: float = Field(default=0.3, alias="MIN_SIMILARITY_THRESHOLD")
+    validate_document_usage: bool = Field(default=True, alias="VALIDATE_DOCUMENT_USAGE")
+    fallback_on_no_documents: bool = Field(default=True, alias="FALLBACK_ON_NO_DOCUMENTS")
+    require_citations: bool = Field(default=True, alias="REQUIRE_CITATIONS")
+    reject_generic_responses: bool = Field(default=True, alias="REJECT_GENERIC_RESPONSES")
+    min_citation_count: int = Field(default=1, alias="MIN_CITATION_COUNT")
+    
+    # Media Extraction & Enrichment
+    extract_images_from_pdf: bool = Field(default=True, alias="EXTRACT_IMAGES_FROM_PDF")
+    extract_video_links: bool = Field(default=True, alias="EXTRACT_VIDEO_LINKS")
+    suggest_related_media: bool = Field(default=True, alias="SUGGEST_RELATED_MEDIA")
+    max_suggested_media: int = Field(default=5, alias="MAX_SUGGESTED_MEDIA")
+    
     # File Upload Settings
     max_file_size_mb: int = Field(default=50, alias="MAX_FILE_SIZE_MB")
     allowed_file_types: str = Field(default="pdf,docx,txt,html,json", alias="ALLOWED_FILE_TYPES")

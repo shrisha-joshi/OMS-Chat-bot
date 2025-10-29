@@ -34,6 +34,8 @@ from .phase3_rag_enhancements import (
     get_query_rewriting_service,
     get_embedding_cache_service
 )
+from .media_suggestion_service import media_suggestion_service
+from .response_validation_service import response_validation_service
 from ..config import settings
 
 logger = logging.getLogger(__name__)
@@ -111,6 +113,10 @@ class ChatService:
             # Initialize response formatter
             self.response_formatter = await get_response_formatter()
             
+            # Initialize media services (Phase 2)
+            await media_suggestion_service.initialize()
+            logger.info("✅ Media suggestion service initialized")
+            
             # Initialize BM25 index for keyword search
             await self._initialize_bm25_index()
             
@@ -159,6 +165,9 @@ class ChatService:
         """
         try:
             start_time = time.time()
+            logger.info(f"🔍 ===== RAG PIPELINE START =====")
+            logger.info(f"📌 Session: {session_id}")
+            logger.info(f"❓ Query: {query[:200]}")
             
             # Retrieve conversation context if not provided
             if context is None:
@@ -167,13 +176,15 @@ class ChatService:
             # Check cache for similar queries first
             cached_response = await self._check_query_cache(query)
             if cached_response:
-                logger.info("Returning cached response")
+                logger.info("✅ RAG PIPELINE: Returning cached response")
                 return cached_response
             
             # Step 1: Advanced query understanding and enhancement
+            logger.info(f"🔄 Step 1: Query Enhancement & Understanding")
             query_enhancement = await query_intelligence_service.enhance_query(query)
             processed_query = query_enhancement["rewritten_queries"][0]  # Use best rewrite
-            logger.info(f"Processing query: {processed_query[:100]}... (Type: {query_enhancement['query_type']})")
+            logger.info(f"  📝 Enhanced Query: {processed_query[:150]}...")
+            logger.info(f"  🏷️  Query Type: {query_enhancement['query_type']}")
             
             # Phase 3: Enhanced query rewriting with multiple variants
             try:
@@ -185,13 +196,14 @@ class ChatService:
                         context=query_enhancement
                     )
                     self._queries_tried = [v["rewritten_query"] for v in query_variants["variants"]]
-                    logger.info(f"Phase 3 Query Rewriting: Generated {len(self._queries_tried)} variants")
+                    logger.info(f"  📚 Phase 3: Generated {len(self._queries_tried)} query variants")
             except Exception as e:
                 logger.warning(f"Phase 3 Query Rewriting failed (graceful degradation): {e}")
                 self._queries_tried = [processed_query]
             
             # Step 2: Generate multiple query embeddings for hybrid approach
             # Phase 3: Check embedding cache first
+            logger.info(f"🔄 Step 2: Embedding Generation (with cache)")
             query_embedding = None
             cache_hit = False
             try:
@@ -203,26 +215,28 @@ class ChatService:
                         query_embedding = cached_embedding
                         cache_hit = True
                         self._cache_hits += 1
-                        logger.info(f"Phase 3 Embedding Cache HIT: Reused embedding for query_hash={query_hash}")
+                        logger.info(f"  💾 Embedding Cache HIT: hash={query_hash[:8]}...")
             except Exception as e:
                 logger.warning(f"Phase 3 Embedding Cache retrieval failed: {e}")
             
             # Generate embedding if not cached
             if not query_embedding:
                 query_embedding = await self._generate_query_embedding(processed_query)
+                logger.info(f"  🔢 Generated embedding: {len(query_embedding)} dimensions")
                 # Cache the newly generated embedding
                 try:
                     embedding_cache_service = await self._get_embedding_cache_service()
                     if embedding_cache_service:
                         query_hash = hashlib.md5(processed_query.encode()).hexdigest()
                         await embedding_cache_service.cache_embedding(query_hash, query_embedding, ttl=86400)  # 24h TTL
-                        logger.info(f"Phase 3 Embedding Cache MISS: Cached new embedding for query_hash={query_hash}")
+                        logger.info(f"  💾 Cached new embedding: hash={query_hash[:8]}...")
                 except Exception as e:
                     logger.warning(f"Phase 3 Embedding Cache storage failed: {e}")
             
             hyde_embedding = query_enhancement.get("hyde_embedding")
             
             # Step 3: Hybrid retrieval - Vector + Keyword + HyDE + Phase 3 Hybrid Search
+            logger.info(f"🔄 Step 3: Hybrid Retrieval (Vector + Keyword + Graph)")
             
             # Phase 3: Use Hybrid Search Service for combined approach
             merged_results = None
@@ -239,15 +253,17 @@ class ChatService:
                         hyde_weight=0.1
                     )
                     merged_results = hybrid_results.get("merged_results", [])
-                    logger.info(f"Phase 3 Hybrid Search: Retrieved {len(merged_results)} results "
-                              f"(BM25: {hybrid_results.get('bm25_count', 0)}, "
-                              f"Vector: {hybrid_results.get('vector_count', 0)}, "
-                              f"HyDE: {hybrid_results.get('hyde_count', 0)})")
+                    logger.info(f"  📊 Phase 3 Hybrid Search Results:")
+                    logger.info(f"    🔵 Vector: {hybrid_results.get('vector_count', 0)} hits")
+                    logger.info(f"    🟢 Keyword: {hybrid_results.get('bm25_count', 0)} hits")
+                    logger.info(f"    🟡 HyDE: {hybrid_results.get('hyde_count', 0)} hits")
+                    logger.info(f"    📈 Total Merged: {len(merged_results)} results")
             except Exception as e:
                 logger.warning(f"Phase 3 Hybrid Search failed (graceful degradation): {e}")
             
             # Fallback to original retrieval if Phase 3 hybrid search unavailable
             if not merged_results:
+                logger.info(f"  ⚠️  Fallback: Using traditional retrieval pipeline")
                 # Check for cached retrieval results
                 vector_results = await self._get_cached_retrieval_results(query_embedding)
                 
@@ -256,10 +272,11 @@ class ChatService:
                         query_vector=query_embedding,
                         top_k=settings.top_k_retrieval * 2  # Get more for reranking
                     )
+                    logger.info(f"    🎯 Qdrant search: {len(vector_results)} results")
                     # Cache the results
                     await self._cache_retrieval_results(query_embedding, vector_results)
                 else:
-                    logger.info("Using cached vector search results")
+                    logger.info(f"    💾 Using cached vector results: {len(vector_results)} results")
                 
                 # Additional HyDE search if available
                 hyde_results = []
@@ -268,9 +285,11 @@ class ChatService:
                         query_vector=query_enhancement.get("hyde_embedding"),
                         top_k=settings.top_k_retrieval
                     )
+                    logger.info(f"    🎯 HyDE search: {len(hyde_results)} results")
                 
                 # BM25 keyword search
                 keyword_results = await self._bm25_search(processed_query)
+                logger.info(f"    🎯 BM25 search: {len(keyword_results)} results")
                 
                 vector_results = vector_results or []
                 hyde_results = hyde_results or []
@@ -278,15 +297,23 @@ class ChatService:
                 merged_results = vector_results
             
             # Step 4: Extract entities from query for graph search
+            logger.info(f"🔄 Step 4: Entity Extraction & Graph Search")
             graph_results = []
             if settings.use_graph_search and self.nlp_model:
                 entities = self._extract_entities_from_query(processed_query)
                 if entities:
+                    logger.info(f"  🏷️  Extracted entities: {entities[:3]}...")
                     graph_results = await self.arango_client.find_related_entities(
                         entities, max_depth=2, limit=5
                     )
+                    logger.info(f"  📈 Graph results: {len(graph_results)} related entities")
+                else:
+                    logger.info(f"  ℹ️  No entities extracted from query")
+            else:
+                logger.info(f"  ⚠️  Graph search disabled or NLP unavailable")
             
             # Phase 3: Enhance retrieval results with contextual information
+            logger.info(f"🔄 Step 5: Context Optimization & Reranking")
             enhanced_results = merged_results
             try:
                 contextual_retrieval_service = await self._get_contextual_retrieval_service()
@@ -299,8 +326,9 @@ class ChatService:
                     )
                     enhanced_results = enhancement_result.get("enhanced_chunks", merged_results)
                     context_additions = enhancement_result.get("context_statistics", {})
-                    logger.info(f"Phase 3 Contextual Retrieval: Enhanced {context_additions.get('chunks_enhanced', 0)} chunks "
-                              f"(avg context: {context_additions.get('avg_context_added', 0):.0f} chars)")
+                    logger.info(f"  ✨ Phase 3 Contextual Retrieval:")
+                    logger.info(f"    📚 Enhanced {context_additions.get('chunks_enhanced', 0)} chunks")
+                    logger.info(f"    📏 Avg context added: {context_additions.get('avg_context_added', 0):.0f} chars")
             except Exception as e:
                 logger.warning(f"Phase 3 Contextual Retrieval failed (graceful degradation): {e}")
             
@@ -309,8 +337,10 @@ class ChatService:
                 enhanced_results, [], [], graph_results, 
                 processed_query, query_enhancement["processing_strategy"]
             )
+            logger.info(f"  📊 Final reranked results: {len(merged_results_final)} chunks")
             
             # Step 6: Optimize context using advanced compression and CoT
+            logger.info(f"🔄 Step 6: Context Compression & Reasoning Template")
             optimization_result = await context_optimization_service.optimize_context(
                 merged_results_final, processed_query, 
                 max_tokens=settings.max_context_tokens,
@@ -321,26 +351,83 @@ class ChatService:
             reasoning_template = optimization_result["reasoning_template"]
             sources = optimization_result["sources_used"]
             
+            logger.info(f"  📝 Context prepared:")
+            logger.info(f"    📊 Context length: {len(context_text)} chars")
+            logger.info(f"    📚 Sources: {len(sources)} documents")
+            logger.info(f"    🔤 Top source: {sources[0]['filename'] if sources else 'None'}")
+            
             # Step 7: Generate response using LMStudio with CoT reasoning
+            logger.info(f"🔄 Step 7: LLM Response Generation (Chain-of-Thought)")
             response = await self._generate_llm_response_with_cot(
                 processed_query, context_text, reasoning_template, context
             )
+            logger.info(f"  ✅ LLM Response generated: {len(response)} chars")
+            
+            # Step 7b: Validate response uses documents (Phase 2)
+            logger.info(f"🔄 Step 7b: Response Validation (Document Usage Check)")
+            is_valid, validation_details = await response_validation_service.validate_response(
+                response=response,
+                sources=sources,
+                query=query
+            )
+            
+            if is_valid:
+                logger.info(f"✅ Response validation passed - Score: {validation_details.get('validation_score', 0):.2f}")
+            else:
+                logger.warning(f"⚠️  Response validation found issues: {validation_details.get('issues', [])}")
+            
+            # Store validation log in MongoDB
+            try:
+                await self.mongo_client.database.document_validation_logs.insert_one({
+                    "query_id": hashlib.md5(query.encode()).hexdigest(),
+                    "session_id": session_id,
+                    "response": response[:500],  # Store first 500 chars
+                    "is_valid": is_valid,
+                    "validation_score": validation_details.get('validation_score', 0),
+                    "has_citations": validation_details.get('has_citations', False),
+                    "citation_count": validation_details.get('citation_count', 0),
+                    "has_generic_phrases": validation_details.get('has_generic_phrases', False),
+                    "generic_phrase_count": validation_details.get('generic_phrase_count', 0),
+                    "validation_details": validation_details,
+                    "created_at": datetime.now()
+                })
+                logger.debug("✅ Validation log stored in MongoDB")
+            except Exception as e:
+                logger.warning(f"Failed to store validation log: {e}")
+            
+            # Step 7c: Get media suggestions (Phase 2)
+            logger.info(f"🔄 Step 7c: Media Enrichment (Suggest Images & Videos)")
+            media_suggestions = await media_suggestion_service.suggest_media_for_response(
+                query=query,
+                response=response,
+                sources=sources
+            )
+            logger.info(f"  🎬 Media suggestions: {len(media_suggestions)} items")
+            if media_suggestions:
+                logger.info(f"    Media types: {', '.join(set(m.get('type', 'unknown') for m in media_suggestions))}")
             
             # Step 8: Extract attachments from sources
             attachments = self._extract_attachments(sources)
+            logger.info(f"  🎬 Extracted {len(attachments)} attachments")
             
             # Step 9: Store conversation in session
             await self._store_conversation_turn(session_id, query, response, sources)
             
             processing_time = time.time() - start_time
-            logger.info(f"Query processed in {processing_time:.2f}s")
+            logger.info(f"✅ ===== RAG PIPELINE COMPLETE =====")
+            logger.info(f"⏱️  Total processing time: {processing_time:.2f}s")
+            logger.info(f"📊 Pipeline summary:")
+            logger.info(f"  - Query: {query[:60]}...")
+            logger.info(f"  - Sources used: {len(sources)}")
+            logger.info(f"  - Response length: {len(response)} chars")
+            logger.info(f"  - Processing time: {processing_time:.2f}s")
             
             # Step 9: Evaluate response quality
             try:
                 evaluation_metrics = await evaluation_service.evaluate_query_response(
                     query, response, sources, processing_time, context_text, session_id
                 )
-                logger.info(f"Query evaluation - Accuracy: {evaluation_metrics.answer_accuracy:.2f}, "
+                logger.info(f"📈 Query evaluation - Accuracy: {evaluation_metrics.answer_accuracy:.2f}, "
                           f"Relevance: {evaluation_metrics.response_relevance:.2f}")
             except Exception as e:
                 logger.warning(f"Evaluation failed: {e}")
@@ -361,6 +448,8 @@ class ChatService:
                 "response": response,
                 "sources": sources,
                 "attachments": attachments,
+                "media_suggestions": media_suggestions,  # Phase 2: Media enrichment
+                "validation_details": validation_details,  # Phase 2: Response validation
                 "processing_time": processing_time,
                 "tokens_generated": len(response.split()),  # Rough token estimate
                 "evaluation_metrics": evaluation_metrics.__dict__ if evaluation_metrics else None,
@@ -374,7 +463,7 @@ class ChatService:
             return result
             
         except Exception as e:
-            logger.error(f"Query processing failed: {e}")
+            logger.error(f"❌ Query processing failed: {e}", exc_info=True)
             return {
                 "response": "I apologize, but I encountered an error while processing your query. Please try again.",
                 "sources": [],
@@ -719,6 +808,21 @@ class ChatService:
         try:
             # Get analyze task prompt for CoT reasoning (synchronous)
             system_prompt = prompt_service.get_system_prompt("analyze")
+            
+            # Phase 2: Enforce document usage if configured
+            if settings.force_document_usage and context:
+                logger.info("🔒 Document usage enforcement ENABLED for CoT - Forcing LLM to use provided documents")
+                force_doc_clause = """
+IMPORTANT - DOCUMENT-BASED RESPONSE REQUIREMENT:
+You MUST base your answer primarily on the provided documents/context. Always:
+1. Use information from the context to support your reasoning
+2. Cite specific parts of the documents when making claims  
+3. Do NOT generate generic responses or rely on general knowledge
+4. Prefix key claims with citations like [1], [2], etc.
+5. If context doesn't answer the question, state this explicitly
+Example: [1] According to the document, the key fact is..."""
+                system_prompt = system_prompt + "\n" + force_doc_clause
+                logger.debug("✅ Added document usage enforcement to CoT system prompt")
             
             # Build CoT-enhanced user prompt
             user_prompt = f"""{reasoning_template}

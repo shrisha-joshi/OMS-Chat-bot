@@ -19,7 +19,7 @@ from .core.db_mongo import mongodb_client
 from .core.db_qdrant import qdrant_client
 from .core.db_arango import arango_client
 from .core.cache_redis import redis_client
-from .api import chat, admin, auth, feedback
+from .api import chat, admin, auth, feedback, monitoring
 from .workers.ingest_worker import start_ingest_worker
 
 # Configure logging
@@ -93,6 +93,27 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
             logger.warning("⚠️ ArangoDB connection failed - continuing without ArangoDB")
         if not redis_success:
             logger.warning("⚠️ Redis connection failed - continuing without Redis")
+        
+        # Phase 2: Run database migrations for media features
+        logger.info("LIFESPAN: Running database migrations for media features (Phase 2)...")
+        if mongo_success:
+            try:
+                from .migrations.media_schema_migrations import run_all_migrations
+                await run_all_migrations(mongodb_client.database)
+                logger.info("✅ Database migrations completed successfully")
+            except Exception as e:
+                logger.warning(f"⚠️ Database migrations failed: {e}")
+        else:
+            logger.warning("⚠️ Skipping migrations - MongoDB not connected")
+        
+        # Phase 2: Initialize media services
+        logger.info("LIFESPAN: Initializing media services (Phase 2)...")
+        try:
+            from .services.media_suggestion_service import media_suggestion_service
+            await media_suggestion_service.initialize()
+            logger.info("✅ Media suggestion service initialized")
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to initialize media suggestion service: {e}")
         
         # Start background workers (lazy initialization on first use)
         logger.info("LIFESPAN: Background workers configured for lazy initialization")
@@ -211,6 +232,12 @@ app.include_router(
     feedback.router,
     prefix="/feedback",
     tags=["Feedback"]
+)
+
+app.include_router(
+    monitoring.router,
+    prefix="/monitoring",
+    tags=["Monitoring"]
 )
 
 # Health check endpoint

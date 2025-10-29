@@ -265,12 +265,23 @@ class RedisClient:
                                expiry_hours: int = 8) -> bool:
         """Store session-specific data."""
         key = f"session:{session_id}"
-        return await self.set_cache(key, data, expiry_hours * 3600)
+        success = await self.set_cache(key, data, expiry_hours * 3600)
+        if success:
+            logger.info(f"✅ Cached session data: {session_id} (TTL: {expiry_hours}h)")
+        return success
     
     async def get_session_data(self, session_id: str) -> Optional[Dict[str, Any]]:
         """Get session-specific data."""
         key = f"session:{session_id}"
-        return await self.get_cache(key)
+        data = await self.get_cache(key)
+        if data:
+            logger.info(f"✅ Retrieved cached session data: {session_id}")
+        return data
+    
+    async def set_session_data(self, session_id: str, data: Dict[str, Any], 
+                              expiry_minutes: int = 1440) -> bool:
+        """Alias for store_session_data with different naming."""
+        return await self.store_session_data(session_id, data, expiry_minutes // 60)
     
     async def increment_counter(self, key: str, expiry_seconds: int = 86400) -> int:
         """Increment a counter and return the new value."""

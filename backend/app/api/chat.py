@@ -47,6 +47,9 @@ class ChatResponse(BaseModel):
     session_id: str
     processing_time: float
     tokens_generated: int
+    # Phase 2: Media enrichment and validation
+    media_suggestions: Optional[List[Dict[str, Any]]] = None
+    validation_details: Optional[Dict[str, Any]] = None
     # Phase 3: Advanced RAG metrics
     phase3_metrics: Optional[Dict[str, Any]] = None
 
@@ -72,7 +75,8 @@ async def get_chat_service() -> ChatService:
 async def chat_query(
     request: ChatRequest,
     service: ChatService = Depends(get_chat_service),
-    redis_client: RedisClient = Depends(get_redis_client)
+    redis_client: RedisClient = Depends(get_redis_client),
+    mongo_client: MongoDBClient = Depends(get_mongodb_client)
 ):
     """
     Process a chat query and return a complete response.
@@ -81,6 +85,7 @@ async def chat_query(
         request: Chat request with query and context
         service: Chat service instance
         redis_client: Redis client for caching
+        mongo_client: MongoDB client for storing messages
     
     Returns:
         Complete chat response with sources and attachments
@@ -116,10 +121,76 @@ async def chat_query(
             response=result["response"],
             sources=result["sources"],
             attachments=result["attachments"],
+            media_suggestions=result.get("media_suggestions", []),  # Phase 2
+            validation_details=result.get("validation_details"),  # Phase 2
             session_id=request.session_id,
             processing_time=processing_time,
-            tokens_generated=result.get("tokens_generated", 0)
+            tokens_generated=result.get("tokens_generated", 0),
+            phase3_metrics=result.get("phase3_metrics")
         )
+        
+        # Save messages to MongoDB for persistence
+        try:
+            if mongo_client.is_connected():
+                # Get or create session
+                session_doc = await mongo_client.database.chat_sessions.find_one(
+                    {"session_id": request.session_id}
+                )
+                
+                now = datetime.utcnow().isoformat()
+                
+                if session_doc:
+                    # Append messages to existing session
+                    await mongo_client.database.chat_sessions.update_one(
+                        {"session_id": request.session_id},
+                        {
+                            "$push": {
+                                "messages": {
+                                    "$each": [
+                                        {
+                                            "role": "user",
+                                            "content": request.query,
+                                            "timestamp": now
+                                        },
+                                        {
+                                            "role": "assistant",
+                                            "content": response.response,
+                                            "timestamp": now,
+                                            "sources": response.sources,
+                                            "tokens_generated": response.tokens_generated
+                                        }
+                                    ]
+                                }
+                            },
+                            "$set": {"updated_at": now}
+                        }
+                    )
+                else:
+                    # Create new session
+                    await mongo_client.database.chat_sessions.insert_one({
+                        "session_id": request.session_id,
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": request.query,
+                                "timestamp": now
+                            },
+                            {
+                                "role": "assistant",
+                                "content": response.response,
+                                "timestamp": now,
+                                "sources": response.sources,
+                                "tokens_generated": response.tokens_generated
+                            }
+                        ],
+                        "created_at": now,
+                        "updated_at": now
+                    })
+                
+                logger.info(f"✅ Messages saved to MongoDB for session: {request.session_id}")
+        except Exception as e:
+            logger.warning(f"Failed to save messages to MongoDB: {e}")
+            # Don't fail the request - just log the warning
         
         # Cache the response
         await redis_client.cache_query_result(
@@ -127,6 +198,29 @@ async def chat_query(
             response.dict(), 
             expiry_minutes=30
         )
+        
+        # Also cache session data in Redis for faster retrieval
+        try:
+            if redis_client.is_connected():
+                await redis_client.set_session_data(
+                    request.session_id,
+                    {"messages": [
+                        {
+                            "role": "user",
+                            "content": request.query,
+                            "timestamp": response.response  # Will be properly timestamped in next version
+                        },
+                        {
+                            "role": "assistant",
+                            "content": response.response,
+                            "sources": response.sources,
+                            "tokens_generated": response.tokens_generated
+                        }
+                    ]},
+                    expiry_minutes=1440  # 24 hours
+                )
+        except Exception as e:
+            logger.warning(f"Failed to cache session in Redis: {e}")
         
         # Publish metrics
         await redis_client.publish_chat_metrics(

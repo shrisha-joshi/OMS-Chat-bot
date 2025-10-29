@@ -131,6 +131,21 @@ class IngestService:
                 {"text_length": len(text_content)}
             )
             
+            # Step 1b: Extract images from PDF (if enabled)
+            extracted_images = []
+            if file_ext == ".pdf":
+                await self.mongo_client.log_ingestion_step(
+                    doc_id, "EXTRACT_IMAGES", "PROCESSING", "Extracting images from PDF"
+                )
+                extracted_images = await self._extract_images_from_pdf(doc_id, file_content)
+                if extracted_images:
+                    await self.mongo_client.log_ingestion_step(
+                        doc_id, "EXTRACT_IMAGES", "SUCCESS", 
+                        f"Extracted {len(extracted_images)} images from PDF",
+                        {"image_count": len(extracted_images)}
+                    )
+                    logger.info(f"✅ Extracted {len(extracted_images)} images from PDF")
+            
             # Step 2: Create hierarchical chunks with enhanced metadata
             await self.mongo_client.log_ingestion_step(
                 doc_id, "CHUNK", "PROCESSING", "Creating hierarchical chunks with metadata enrichment"
@@ -388,6 +403,79 @@ class IngestService:
         except Exception as e:
             logger.error(f"PDF text extraction failed: {e}")
             return ""
+    
+    async def _extract_images_from_pdf(self, doc_id: str, file_content: bytes) -> List[Dict[str, Any]]:
+        """
+        Extract images from PDF file and store in MongoDB.
+        
+        Args:
+            doc_id: Document ID for linking
+            file_content: PDF file bytes
+        
+        Returns:
+            List of extracted image metadata
+        """
+        try:
+            if not settings.extract_images_from_pdf:
+                logger.debug("Image extraction disabled in config")
+                return []
+            
+            # Try to use pdf2image if available, otherwise use PyPDF2
+            try:
+                from pdf2image import convert_from_bytes
+                logger.info("Using pdf2image for image extraction")
+                images = convert_from_bytes(file_content, dpi=100)
+                
+                stored_images = []
+                for page_num, image in enumerate(images):
+                    try:
+                        import io
+                        import base64
+                        from PIL import Image
+                        
+                        # Convert to RGB if necessary
+                        if image.mode in ('RGBA', 'LA', 'P'):
+                            image = image.convert('RGB')
+                        
+                        # Save to bytes
+                        img_byte_arr = io.BytesIO()
+                        image.save(img_byte_arr, format='JPEG', quality=85)
+                        img_base64 = base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
+                        
+                        # Store in MongoDB
+                        image_doc = {
+                            "doc_id": doc_id,
+                            "page": page_num + 1,
+                            "data": img_base64,  # Base64 encoded
+                            "width": image.width,
+                            "height": image.height,
+                            "format": "jpeg",
+                            "size": len(img_byte_arr.getvalue()),
+                            "description": f"Image from page {page_num + 1}",
+                            "alt_text": f"Page {page_num + 1} image",
+                            "created_at": datetime.now()
+                        }
+                        
+                        await self.mongo_client.database.document_images.insert_one(image_doc)
+                        stored_images.append({
+                            "page": page_num + 1,
+                            "size": image_doc["size"],
+                            "dimensions": f"{image.width}x{image.height}"
+                        })
+                        logger.debug(f"Extracted image from page {page_num + 1}")
+                    except Exception as e:
+                        logger.warning(f"Failed to process image from page {page_num + 1}: {e}")
+                        continue
+                
+                logger.info(f"Extracted {len(stored_images)} images from PDF")
+                return stored_images
+                
+            except ImportError:
+                logger.debug("pdf2image not available, skipping image extraction")
+                return []
+        except Exception as e:
+            logger.warning(f"PDF image extraction failed: {e}")
+            return []
     
     def _extract_text_from_docx(self, file_content: bytes) -> str:
         """Extract text from DOCX file."""

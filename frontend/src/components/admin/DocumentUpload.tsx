@@ -1,7 +1,8 @@
 'use client'
 
-import React, { useState, useRef } from 'react'
-import { Upload, FileText, CheckCircle, AlertCircle, Loader } from 'lucide-react'
+import React, { useState, useRef, useEffect } from 'react'
+import { Upload, FileText, CheckCircle, AlertCircle, Loader, RefreshCw, Trash2 } from 'lucide-react'
+import IngestionStatus from '../IngestionStatus'
 
 interface UploadedFile {
   id: string
@@ -11,13 +12,82 @@ interface UploadedFile {
   status: 'uploading' | 'success' | 'error'
   progress: number
   error?: string
+  documentId?: string
+}
+
+interface DocumentRecord {
+  id: string
+  filename: string
+  size: number
+  uploaded_at: string
+  ingest_status: 'pending' | 'processing' | 'complete' | 'failed'
+  chunks_count: number
+  file_type: string
+  error_message?: string
 }
 
 export function DocumentUpload() {
   const [files, setFiles] = useState<UploadedFile[]>([])
+  const [previousDocs, setPreviousDocs] = useState<DocumentRecord[]>([])
   const [isUploading, setIsUploading] = useState(false)
+  const [isLoadingDocs, setIsLoadingDocs] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const API_BASE = process.env.NEXT_PUBLIC_API_BASE || 'http://localhost:8000'
+
+  // Load previously uploaded documents on mount
+  useEffect(() => {
+    loadPreviousDocuments()
+  }, [])
+
+  const loadPreviousDocuments = async () => {
+    setIsLoadingDocs(true)
+    try {
+      const response = await fetch(`${API_BASE}/admin/documents/list`)
+      if (response.ok) {
+        const data = await response.json()
+        setPreviousDocs(data.documents || [])
+        console.log(`✅ Loaded ${data.documents?.length || 0} previous documents`)
+      } else {
+        console.warn('Failed to load documents:', response.status)
+      }
+    } catch (error) {
+      console.warn('Could not load documents:', error)
+    } finally {
+      setIsLoadingDocs(false)
+    }
+  }
+
+  const getStatusBadge = (status: string) => {
+    switch (status) {
+      case 'complete':
+        return <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-green-100 text-green-800">✓ Complete</span>
+      case 'processing':
+        return <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-blue-100 text-blue-800">⟳ Processing</span>
+      case 'pending':
+        return <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-yellow-100 text-yellow-800">⏳ Pending</span>
+      case 'failed':
+        return <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-red-100 text-red-800">✗ Failed</span>
+      default:
+        return <span className="text-xs text-gray-600">{status}</span>
+    }
+  }
+
+  const formatDate = (dateStr: string) => {
+    try {
+      const date = new Date(dateStr)
+      return date.toLocaleDateString() + ' ' + date.toLocaleTimeString()
+    } catch {
+      return dateStr
+    }
+  }
+
+  const formatFileSize = (bytes: number) => {
+    if (bytes === 0) return '0 Bytes'
+    const k = 1024
+    const sizes = ['Bytes', 'KB', 'MB', 'GB']
+    const i = Math.floor(Math.log(bytes) / Math.log(k))
+    return Math.round((bytes / Math.pow(k, i)) * 100) / 100 + ' ' + sizes[i]
+  }
 
   const handleFileSelect = (event: React.ChangeEvent<HTMLInputElement>) => {
     const selectedFiles = event.target.files
@@ -63,16 +133,18 @@ export function DocumentUpload() {
 
       const data = await response.json()
 
-      // Update file status to success
+      // Update file status to success with document ID
       setFiles(prev =>
         prev.map(f =>
           f.id === fileId
-            ? { ...f, status: 'success', progress: 100 }
+            ? { ...f, status: 'success', progress: 100, documentId: data.document_id }
             : f
         )
       )
 
       console.log('File uploaded successfully:', data)
+      // Refresh document list after successful upload
+      setTimeout(() => loadPreviousDocuments(), 1000)
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error'
       
@@ -110,14 +182,6 @@ export function DocumentUpload() {
         handleFileUpload(file)
       })
     }
-  }
-
-  const formatFileSize = (bytes: number) => {
-    if (bytes === 0) return '0 Bytes'
-    const k = 1024
-    const sizes = ['Bytes', 'KB', 'MB', 'GB']
-    const i = Math.floor(Math.log(bytes) / Math.log(k))
-    return Math.round((bytes / Math.pow(k, i)) * 100) / 100 + ' ' + sizes[i]
   }
 
   return (
@@ -172,39 +236,50 @@ export function DocumentUpload() {
         <div className="space-y-3">
           <h3 className="font-medium text-gray-900">Upload Status</h3>
           {files.map(file => (
-            <div
-              key={file.id}
-              className="bg-white border border-gray-200 rounded-lg p-4 flex items-center gap-4"
-            >
-              <FileText className="w-8 h-8 text-gray-400 flex-shrink-0" />
-              
-              <div className="flex-1 min-w-0">
-                <p className="text-sm font-medium text-gray-900 truncate">
-                  {file.name}
-                </p>
-                <p className="text-xs text-gray-500">
-                  {formatFileSize(file.size)}
-                </p>
+            <div key={file.id} className="space-y-3">
+              <div
+                className="bg-white border border-gray-200 rounded-lg p-4 flex items-center gap-4"
+              >
+                <FileText className="w-8 h-8 text-gray-400 flex-shrink-0" />
+                
+                <div className="flex-1 min-w-0">
+                  <p className="text-sm font-medium text-gray-900 truncate">
+                    {file.name}
+                  </p>
+                  <p className="text-xs text-gray-500">
+                    {formatFileSize(file.size)}
+                  </p>
+                </div>
+
+                {file.status === 'uploading' && (
+                  <div className="flex items-center gap-2">
+                    <Loader className="w-4 h-4 text-blue-600 animate-spin" />
+                    <span className="text-sm text-gray-600">{file.progress}%</span>
+                  </div>
+                )}
+
+                {file.status === 'success' && (
+                  <CheckCircle className="w-5 h-5 text-green-600 flex-shrink-0" />
+                )}
+
+                {file.status === 'error' && (
+                  <div className="flex items-center gap-2">
+                    <AlertCircle className="w-5 h-5 text-red-600 flex-shrink-0" />
+                    <div className="text-xs text-red-600 max-w-xs">
+                      {file.error}
+                    </div>
+                  </div>
+                )}
               </div>
 
-              {file.status === 'uploading' && (
-                <div className="flex items-center gap-2">
-                  <Loader className="w-4 h-4 text-blue-600 animate-spin" />
-                  <span className="text-sm text-gray-600">{file.progress}%</span>
-                </div>
-              )}
-
-              {file.status === 'success' && (
-                <CheckCircle className="w-5 h-5 text-green-600 flex-shrink-0" />
-              )}
-
-              {file.status === 'error' && (
-                <div className="flex items-center gap-2">
-                  <AlertCircle className="w-5 h-5 text-red-600 flex-shrink-0" />
-                  <div className="text-xs text-red-600 max-w-xs">
-                    {file.error}
-                  </div>
-                </div>
+              {/* Show ingestion progress for successful uploads */}
+              {file.status === 'success' && file.documentId && (
+                <IngestionStatus 
+                  docId={file.documentId}
+                  onComplete={() => {
+                    console.log(`Document ${file.documentId} processing completed`);
+                  }}
+                />
               )}
             </div>
           ))}
@@ -223,6 +298,79 @@ export function DocumentUpload() {
           <li>Documents become searchable in chat within seconds</li>
         </ol>
       </div>
+
+      {/* Previously Uploaded Documents */}
+      <div className="space-y-3">
+        <div className="flex items-center justify-between">
+          <h3 className="font-medium text-gray-900">📂 Previously Uploaded Documents</h3>
+          <button
+            onClick={loadPreviousDocuments}
+            disabled={isLoadingDocs}
+            className="inline-flex items-center gap-2 px-3 py-1 text-sm bg-gray-100 text-gray-700 rounded-md hover:bg-gray-200 disabled:opacity-50"
+          >
+            <RefreshCw className={`w-4 h-4 ${isLoadingDocs ? 'animate-spin' : ''}`} />
+            {isLoadingDocs ? 'Refreshing...' : 'Refresh'}
+          </button>
+        </div>
+
+        {previousDocs.length === 0 ? (
+          <div className="bg-gray-50 border border-gray-200 rounded-lg p-8 text-center">
+            <FileText className="w-12 h-12 mx-auto mb-3 text-gray-400" />
+            <p className="text-gray-600">No documents uploaded yet</p>
+            <p className="text-sm text-gray-500 mt-1">Upload documents above to get started</p>
+          </div>
+        ) : (
+          <div className="bg-white border border-gray-200 rounded-lg overflow-hidden">
+            <div className="overflow-x-auto">
+              <table className="w-full">
+                <thead className="bg-gray-50 border-b border-gray-200">
+                  <tr>
+                    <th className="px-4 py-3 text-left text-xs font-medium text-gray-600 uppercase">Filename</th>
+                    <th className="px-4 py-3 text-left text-xs font-medium text-gray-600 uppercase">Size</th>
+                    <th className="px-4 py-3 text-left text-xs font-medium text-gray-600 uppercase">Status</th>
+                    <th className="px-4 py-3 text-left text-xs font-medium text-gray-600 uppercase">Chunks</th>
+                    <th className="px-4 py-3 text-left text-xs font-medium text-gray-600 uppercase">Uploaded</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-gray-200">
+                  {previousDocs.map(doc => (
+                    <tr key={doc.id} className="hover:bg-gray-50">
+                      <td className="px-4 py-3 text-sm text-gray-900 font-medium">
+                        <div className="flex items-center gap-2">
+                          <FileText className="w-4 h-4 text-gray-400 flex-shrink-0" />
+                          <span className="truncate">{doc.filename}</span>
+                        </div>
+                      </td>
+                      <td className="px-4 py-3 text-sm text-gray-600">
+                        {formatFileSize(doc.size)}
+                      </td>
+                      <td className="px-4 py-3 text-sm">
+                        {getStatusBadge(doc.ingest_status)}
+                        {doc.error_message && (
+                          <div title={doc.error_message} className="text-xs text-red-600 truncate">
+                            {doc.error_message}
+                          </div>
+                        )}
+                      </td>
+                      <td className="px-4 py-3 text-sm text-gray-600">
+                        {doc.ingest_status === 'complete' ? (
+                          <span className="text-green-700 font-medium">{doc.chunks_count}</span>
+                        ) : (
+                          <span className="text-gray-500">{doc.chunks_count || '-'}</span>
+                        )}
+                      </td>
+                      <td className="px-4 py-3 text-sm text-gray-600">
+                        {formatDate(doc.uploaded_at)}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+      </div>
     </div>
   )
 }
+
