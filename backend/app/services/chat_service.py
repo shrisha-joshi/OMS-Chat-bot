@@ -20,7 +20,6 @@ from rank_bm25 import BM25Okapi
 
 from ..core.db_mongo import get_mongodb_client, MongoDBClient
 from ..core.db_qdrant import get_qdrant_client, QdrantDBClient
-from ..core.db_arango import get_arango_client, ArangoDBClient
 from ..core.cache_redis import get_redis_client, RedisClient
 from .query_intelligence_service import query_intelligence_service
 from .context_optimization_service import context_optimization_service
@@ -28,6 +27,7 @@ from .evaluation_service import evaluation_service
 from .llm_handler import llm_handler
 from .prompt_service import prompt_service
 from .response_formatter_service import get_response_formatter
+from .hybrid_retrieval_service import hybrid_retrieval_service
 from .phase3_rag_enhancements import (
     get_contextual_retrieval_service,
     get_hybrid_search_service,
@@ -49,7 +49,6 @@ class ChatService:
         self.nlp_model = None
         self.mongo_client = None
         self.qdrant_client = None
-        self.arango_client = None
         self.redis_client = None
         self.http_client = None
         self.bm25_index = None
@@ -73,7 +72,6 @@ class ChatService:
             # Get database clients
             self.mongo_client = await get_mongodb_client()
             self.qdrant_client = await get_qdrant_client()
-            self.arango_client = await get_arango_client()
             self.redis_client = await get_redis_client()
             
             # Initialize HTTP client for LMStudio
@@ -235,31 +233,49 @@ class ChatService:
             
             hyde_embedding = query_enhancement.get("hyde_embedding")
             
-            # Step 3: Hybrid retrieval - Vector + Keyword + HyDE + Phase 3 Hybrid Search
+            # Step 3: Hybrid retrieval - Vector + Keyword + HyDE + Graph + Phase 3 Hybrid Search
             logger.info(f"🔄 Step 3: Hybrid Retrieval (Vector + Keyword + Graph)")
             
-            # Phase 3: Use Hybrid Search Service for combined approach
-            merged_results = None
+            # NEW: Try Graph RAG hybrid retrieval first (if Neo4j available)
+            graph_rag_results = None
             try:
-                hybrid_search_service = await self._get_hybrid_search_service()
-                if hybrid_search_service:
-                    hybrid_results = await hybrid_search_service.hybrid_search(
-                        query_text=processed_query,
-                        vector_query=query_embedding,
-                        hyde_vector=query_enhancement.get("hyde_embedding"),
-                        top_k=settings.top_k_retrieval * 2,
-                        bm25_weight=0.3,
-                        vector_weight=0.6,
-                        hyde_weight=0.1
+                if settings.use_graph_search:
+                    logger.info(f"  🕸️  Attempting Graph RAG Hybrid Retrieval...")
+                    graph_rag_results = await hybrid_retrieval_service.retrieve(
+                        query=processed_query,
+                        top_k=settings.top_k_retrieval,
+                        vector_k=settings.top_k_retrieval * 2,
+                        graph_hops=2,
+                        use_reranking=True
                     )
-                    merged_results = hybrid_results.get("merged_results", [])
-                    logger.info(f"  📊 Phase 3 Hybrid Search Results:")
-                    logger.info(f"    🔵 Vector: {hybrid_results.get('vector_count', 0)} hits")
-                    logger.info(f"    🟢 Keyword: {hybrid_results.get('bm25_count', 0)} hits")
-                    logger.info(f"    🟡 HyDE: {hybrid_results.get('hyde_count', 0)} hits")
-                    logger.info(f"    📈 Total Merged: {len(merged_results)} results")
+                    if graph_rag_results:
+                        merged_results = graph_rag_results
+                        logger.info(f"  ✅ Graph RAG retrieval: {len(merged_results)} results with graph context")
             except Exception as e:
-                logger.warning(f"Phase 3 Hybrid Search failed (graceful degradation): {e}")
+                logger.warning(f"Graph RAG retrieval failed (graceful degradation): {e}")
+            
+            # Phase 3: Use Hybrid Search Service for combined approach (if Graph RAG didn't work)
+            if not graph_rag_results:
+                merged_results = None
+                try:
+                    hybrid_search_service = await self._get_hybrid_search_service()
+                    if hybrid_search_service:
+                        # Use RRF hybrid search for better fusion
+                        hybrid_results = await hybrid_search_service.hybrid_search_with_rrf(
+                            query_text=processed_query,
+                            query_embedding=query_embedding,
+                            top_k=settings.top_k_retrieval,
+                            rrf_k=60  # Tuned RRF parameter
+                        )
+                        merged_results = hybrid_results.get("merged_results", [])
+                        logger.info(f"  📊 Phase 1 (RRF) Hybrid Search Results:")
+                        logger.info(f"    🔵 Vector Search: {hybrid_results.get('vector_count', 0)} candidates")
+                    logger.info(f"    🟢 BM25 Search: {hybrid_results.get('bm25_count', 0)} candidates")
+                    logger.info(f"    🟡 RRF Fused: {hybrid_results.get('rrf_count', 0)} candidates")
+                    logger.info(f"    ✨ Final Results: {len(merged_results)} results (algorithm: {hybrid_results.get('algorithm', 'unknown')})")
+                    logger.info(f"    ⏱️  Search time: {hybrid_results.get('total_time_ms', 0)}ms")
+                except Exception as e:
+                    logger.warning(f"Phase 1 RRF Hybrid Search failed (graceful degradation): {e}")
             
             # Fallback to original retrieval if Phase 3 hybrid search unavailable
             if not merged_results:
@@ -296,17 +312,23 @@ class ChatService:
                 keyword_results = keyword_results or []
                 merged_results = vector_results
             
-            # Step 4: Extract entities from query for graph search
-            logger.info(f"🔄 Step 4: Entity Extraction & Graph Search")
+            # Step 4: Extract entities from query for semantic search
+            logger.info(f"🔄 Step 4: Entity Extraction & Semantic Search")
             graph_results = []
             if settings.use_graph_search and self.nlp_model:
                 entities = self._extract_entities_from_query(processed_query)
                 if entities:
                     logger.info(f"  🏷️  Extracted entities: {entities[:3]}...")
-                    graph_results = await self.arango_client.find_related_entities(
-                        entities, max_depth=2, limit=5
-                    )
-                    logger.info(f"  📈 Graph results: {len(graph_results)} related entities")
+                    # Query MongoDB for related entities instead of ArangoDB
+                    try:
+                        related_entity_docs = await self.mongo_client.database.entities.find(
+                            {"name": {"$in": entities}}
+                        ).to_list(5)
+                        graph_results = related_entity_docs if related_entity_docs else []
+                        logger.info(f"  📈 Found {len(graph_results)} related entities in MongoDB")
+                    except Exception as e:
+                        logger.warning(f"  ⚠️  Failed to query entities: {e}")
+                        graph_results = []
                 else:
                     logger.info(f"  ℹ️  No entities extracted from query")
             else:
@@ -502,7 +524,15 @@ class ChatService:
                 yield {"type": "status", "content": "Analyzing relationships..."}
                 entities = self._extract_entities_from_query(processed_query)
                 if entities:
-                    graph_results = await self.arango_client.find_related_entities(entities)
+                    # Query MongoDB for related entities
+                    try:
+                        related_docs = await self.mongo_client.database.entities.find(
+                            {"name": {"$in": entities}}
+                        ).to_list(5)
+                        graph_results = related_docs if related_docs else []
+                    except Exception as e:
+                        logger.warning(f"Failed to query entities: {e}")
+                        graph_results = []
             
             # Step 4: Context building
             yield {"type": "status", "content": "Building context..."}
@@ -888,30 +918,34 @@ Final answer:"""
     
     def _build_cot_system_prompt(self, reasoning_template: str) -> str:
         """Build the system prompt for Chain-of-Thought reasoning."""
-        return f"""You are a helpful AI assistant that answers questions using structured reasoning. 
+        return f"""You are a friendly, conversational AI assistant like ChatGPT, Gemini, or Claude. Your goal is to help users while showing your reasoning in a natural, understandable way.
 
-REASONING PROCESS:
+CONVERSATIONAL TONE:
+- Write naturally, as if explaining to a friend
+- Use "I" and "you" to make it personal
+- Break down your thinking in simple terms
+- No formal headings or rigid structure
+- Flow naturally from thought to conclusion
+
+YOUR THINKING PROCESS:
 {reasoning_template}
 
-RESPONSE FORMAT:
-Always structure your response as follows:
+HOW TO RESPOND:
+1. Start by briefly acknowledging the question
+2. Share your thinking process conversationally (e.g., "Let me think about this...", "From what I can see...", "Here's how I'm approaching this...")
+3. Walk through relevant points from the documents naturally
+4. Arrive at your answer smoothly
+5. Offer to clarify or expand if helpful
 
-## Analysis
-[Your step-by-step reasoning process]
+IMPORTANT:
+- Base everything on the provided context
+- Be honest about limitations: "I don't have enough information about..."
+- Reference sources naturally: "According to [document]..." or "I found that..."
+- Keep it conversational, not academic
+- No formal citations like [1] or [Source: filename]
+- If uncertain, say so: "I'm not entirely sure, but it seems..."
 
-## Answer
-[Your clear, concise final answer to the question]
-
-IMPORTANT GUIDELINES:
-1. Always follow the reasoning process outlined above
-2. Base all analysis on the provided context only
-3. Be explicit about your reasoning steps
-4. Clearly separate your analysis from your final answer
-5. If information is insufficient, state this in your analysis
-6. Reference specific sources when making claims
-7. Keep your final answer focused and actionable
-
-Remember: Show your thinking process, then provide a clear answer."""
+Remember: You're having a helpful conversation, not writing a report."""
     
     def _build_cot_user_prompt(self, query: str, context: str, conversation_context: List[Dict] = None) -> str:
         """Build the user prompt for Chain-of-Thought reasoning."""
@@ -1003,8 +1037,145 @@ Remember: Show your thinking process, then provide a clear answer."""
             logger.error(f"Streaming response failed: {e}")
             yield "I apologize, but I'm having trouble generating a response right now."
     
-    def _build_system_prompt(self) -> str:
-        """Build the system prompt for the LLM."""
+    def _build_system_prompt(self, query_intent: Optional[str] = None) -> str:
+        """Build intent-specific system prompt for the LLM.
+        
+        Args:
+            query_intent: Detected intent type (e.g., 'factual', 'procedural', 'comparative')
+                         If None, uses generic helpful assistant prompt.
+        
+        Returns:
+            System prompt tailored to the query intent
+        """
+        # Intent-specific system prompts
+        intent_prompts = {
+            "factual": """You are an expert assistant specializing in factual, accurate information retrieval.
+
+INSTRUCTIONS FOR FACTUAL QUERIES:
+1. Provide precise, verifiable facts from the context
+2. Include specific details, numbers, dates, and sources when available
+3. Clearly distinguish between facts and interpretations
+4. If information is incomplete or ambiguous, explicitly state what is missing
+5. Always cite sources when referencing specific information
+6. Correct any misconceptions with supporting evidence from context
+
+RESPONSE FORMAT:
+- Lead with the most important fact
+- Provide supporting details and evidence
+- Include source citations
+- Be specific and avoid vague language""",
+
+            "procedural": """You are a step-by-step procedural guide expert.
+
+INSTRUCTIONS FOR HOW-TO QUERIES:
+1. Organize your answer as clear, numbered steps
+2. Include prerequisites and required materials/information
+3. Explain the "why" behind each step when relevant
+4. Provide context for each step (what to expect, common issues)
+5. Include tips and best practices
+6. Warn about potential pitfalls or mistakes
+
+RESPONSE FORMAT:
+- Start with prerequisites (if any)
+- Numbered steps with clear, concise instructions
+- Expected outcomes for each step
+- Tips/warnings in separate sections
+- Verification step at the end""",
+
+            "comparative": """You are an expert at providing balanced comparative analysis.
+
+INSTRUCTIONS FOR COMPARISON QUERIES:
+1. Present multiple perspectives fairly
+2. Use structured comparison (e.g., pros/cons, advantages/disadvantages)
+3. Highlight key differences and similarities
+4. Include specific examples for each comparison point
+5. Be neutral and avoid bias toward one option
+6. Help users make informed decisions
+
+RESPONSE FORMAT:
+- Brief introduction of items being compared
+- Organized comparison table or structured list
+- Strengths and weaknesses of each option
+- Use case recommendations
+- Conclusion without prescribing "the best" choice""",
+
+            "analytical": """You are a deep-dive analytical expert.
+
+INSTRUCTIONS FOR ANALYTICAL QUERIES:
+1. Break down complex topics into understandable components
+2. Explain cause-effect relationships
+3. Provide supporting evidence and reasoning
+4. Identify patterns and trends in the information
+5. Consider multiple perspectives and implications
+6. Connect related concepts
+
+RESPONSE FORMAT:
+- Clear problem/topic statement
+- Key factors or components
+- Analysis of relationships and impacts
+- Patterns and trends
+- Implications and conclusions""",
+
+            "troubleshooting": """You are a systematic troubleshooting expert.
+
+INSTRUCTIONS FOR PROBLEM-SOLVING QUERIES:
+1. Start by clarifying the problem scope
+2. Suggest diagnostic steps to identify root causes
+3. Provide solutions in order of likelihood
+4. Include step-by-step fix instructions
+5. Explain what each solution addresses
+6. Suggest preventive measures
+
+RESPONSE FORMAT:
+- Problem diagnosis checklist
+- Ordered solutions (most likely first)
+- Step-by-step fix for each solution
+- Verification steps
+- Prevention tips""",
+
+            "definition": """You are a definition and explanation expert.
+
+INSTRUCTIONS FOR DEFINITION QUERIES:
+1. Start with a clear, concise definition
+2. Provide context and background
+3. Include examples or use cases
+4. Explain related concepts and connections
+5. Distinguish from similar terms
+6. Include practical applications
+
+RESPONSE FORMAT:
+- Definition (1-2 sentences)
+- Etymology or origin (if relevant)
+- Key characteristics or components
+- Examples and use cases
+- Related concepts
+- Practical applications""",
+
+            "creative": """You are a creative thinking facilitator.
+
+INSTRUCTIONS FOR CREATIVE QUERIES:
+1. Generate diverse ideas and perspectives
+2. Use the context as inspiration, not limitation
+3. Provide multiple options or approaches
+4. Include practical and unconventional ideas
+5. Explain the rationale behind suggestions
+6. Encourage exploration
+
+RESPONSE FORMAT:
+- Diverse suggestion options (at least 3)
+- Rationale for each suggestion
+- How to implement or explore each idea
+- Potential challenges and benefits
+- Encouragement for further exploration"""
+        }
+        
+        # Get appropriate prompt based on intent, fallback to generic
+        if query_intent and query_intent in intent_prompts:
+            logger.debug(f"Using intent-specific prompt for: {query_intent}")
+            return intent_prompts[query_intent]
+        
+        # Generic fallback prompt
+        logger.debug("Using generic system prompt (no specific intent detected)")
         return """You are a helpful AI assistant that answers questions based on the provided context. 
 
 IMPORTANT INSTRUCTIONS:
@@ -1472,6 +1643,209 @@ Remember: Your knowledge is limited to the context provided. Do not make up info
         except Exception as e:
             logger.warning(f"Failed to get cached retrieval results: {e}")
             return None
+    
+    # ============================================================================
+    # Phase 3: ADVANCED GRAPH RAG INTEGRATION
+    # ============================================================================
+    
+    async def retrieve_with_graph(
+        self,
+        query: str,
+        entities: List[str],
+        vector_results: List[Dict],
+        top_k: int = 10
+    ) -> Dict[str, Any]:
+        """
+        Advanced graph-enhanced retrieval combining vector search with graph traversal.
+        
+        Args:
+            query: User query
+            entities: Extracted entities from query
+            vector_results: Initial vector search results
+            top_k: Number of results to return
+            
+        Returns:
+            Dictionary with combined results and graph insights
+        """
+        try:
+            start_time = time.time()
+            
+            graph_enrichment = {
+                "vector_base": len(vector_results),
+                "graph_additions": 0,
+                "graph_insights": [],
+                "relationships_found": 0,
+                "total_with_graph": len(vector_results)
+            }
+            
+            # Step 1: Extract document entities from results
+            document_entities = []
+            document_ids = set()
+            
+            for result in vector_results:
+                doc_id = result.get("document_id") or result.get("_id")
+                if doc_id:
+                    document_ids.add(doc_id)
+            
+            # Step 2: Query MongoDB for related entities and documents
+            if entities:
+                try:
+                    # Find entities related to extracted entities from query
+                    related_entity_docs = await self.mongo_client.database.entities.find(
+                        {"name": {"$in": entities}}
+                    ).to_list(5)
+                    
+                    graph_enrichment["relationships_found"] = len(related_entity_docs)
+                    
+                    for entity_doc in related_entity_docs:
+                        # Extract document IDs from entity
+                        doc_id = entity_doc.get("doc_id")
+                        if doc_id and doc_id not in document_ids:
+                            # Add entity-linked document to results
+                            vector_results.append({
+                                "_id": doc_id,
+                                "source": "entity_link",
+                                "entity_name": entity_doc.get("name"),
+                                "entity_type": entity_doc.get("type"),
+                                "score": 0.6,  # Entity results get lower default score
+                                "confidence": entity_doc.get("confidence", 0.7)
+                            })
+                            graph_enrichment["graph_additions"] += 1
+                            document_ids.add(doc_id)
+                        
+                        graph_enrichment["graph_insights"].append({
+                            "entity": entity_doc.get("name"),
+                            "entity_type": entity_doc.get("type"),
+                            "relation_type": "linked"
+                        })
+                
+                except Exception as e:
+                    logger.warning(f"Entity search failed: {e}")
+            
+            # Step 3: Rerank combined results
+            reranked_results = vector_results
+            if self.reranker_model and settings.use_reranker:
+                reranked_results = await self._rerank_results(vector_results, query)
+            
+            # Sort by score and get top-k
+            reranked_results.sort(key=lambda x: x.get("score", 0), reverse=True)
+            final_results = reranked_results[:top_k]
+            
+            graph_enrichment["total_with_graph"] = len(final_results)
+            graph_enrichment["processing_time_ms"] = int((time.time() - start_time) * 1000)
+            graph_enrichment["enhancement_ratio"] = (
+                graph_enrichment["graph_additions"] / max(1, graph_enrichment["vector_base"])
+            )
+            
+            logger.info(f"  📊 Phase 3 Graph RAG Results:")
+            logger.info(f"    🔵 Vector base: {graph_enrichment['vector_base']} results")
+            logger.info(f"    🟣 Graph additions: {graph_enrichment['graph_additions']} new docs")
+            logger.info(f"    🔗 Relationships: {graph_enrichment['relationships_found']} found")
+            logger.info(f"    📈 Total final: {graph_enrichment['total_with_graph']} results")
+            logger.info(f"    ⏱️  Graph processing: {graph_enrichment['processing_time_ms']}ms")
+            
+            return {
+                "results": final_results,
+                "enrichment_metrics": graph_enrichment
+            }
+            
+        except Exception as e:
+            logger.warning(f"Graph-enhanced retrieval failed: {e}")
+            return {
+                "results": vector_results,
+                "enrichment_metrics": {"error": str(e)}
+            }
+    
+    async def extract_and_store_relationships(
+        self,
+        document_id: str,
+        content: str,
+        chunk_texts: Optional[List[str]] = None
+    ) -> Dict[str, Any]:
+        """
+        Extract relationships from document content and store in MongoDB.
+        
+        Args:
+            document_id: Document ID
+            content: Document content
+            chunk_texts: Optional list of chunk texts for relationship extraction
+            
+        Returns:
+            Extraction and storage results
+        """
+        try:
+            if not self.nlp_model:
+                return {"status": "skipped", "reason": "NLP model unavailable"}
+            
+            extraction_results = {
+                "entities_found": 0,
+                "relationships_stored": 0,
+                "chunks_processed": 0
+            }
+            
+            # Step 1: Extract entities from content
+            doc = self.nlp_model(content[:5000])  # Limit to first 5000 chars for performance
+            entities = []
+            
+            for ent in doc.ents:
+                if ent.label_ in ["PERSON", "ORG", "GPE", "PRODUCT", "EVENT", "DATE"]:
+                    entities.append({
+                        "text": ent.text,
+                        "label": ent.label_,
+                        "start": ent.start_char,
+                        "end": ent.end_char
+                    })
+            
+            extraction_results["entities_found"] = len(entities)
+            
+            # Step 2: Extract relationships between entities
+            relationships = []
+            
+            for i, ent1 in enumerate(entities):
+                for ent2 in entities[i+1:]:
+                    # Simple relationship: co-occurrence in content
+                    # More sophisticated: extract verb phrases connecting them
+                    relationships.append({
+                        "from_entity": ent1["text"],
+                        "from_type": ent1["label"],
+                        "to_entity": ent2["text"],
+                        "to_type": ent2["label"],
+                        "relation_type": "co_occurrence",
+                        "confidence": 0.7
+                    })
+            
+            # Step 3: Store in MongoDB
+            if relationships:
+                try:
+                    # Store relationships in MongoDB
+                    for rel in relationships:
+                        rel["document_id"] = document_id
+                        rel["created_at"] = datetime.utcnow()
+                        await self.mongo_client.database.entity_relationships.insert_one(rel)
+                    
+                    extraction_results["relationships_stored"] = len(relationships)
+                    logger.info(f"✅ Stored {len(relationships)} relationships for doc {document_id}")
+                except Exception as e:
+                    logger.warning(f"Failed to store relationships: {e}")
+            
+            # Step 4: Process chunks if provided
+            if chunk_texts:
+                for chunk in chunk_texts[:10]:  # Limit to first 10 chunks
+                    try:
+                        chunk_doc = self.nlp_model(chunk[:1000])
+                        for ent in chunk_doc.ents:
+                            if ent.label_ in ["PERSON", "ORG", "GPE", "PRODUCT"]:
+                                # Link chunk to entities
+                                pass  # Additional relationship tracking
+                        extraction_results["chunks_processed"] += 1
+                    except Exception:
+                        pass
+            
+            return extraction_results
+            
+        except Exception as e:
+            logger.warning(f"Relationship extraction failed: {e}")
+            return {"status": "error", "error": str(e)}
 
     async def health_check(self) -> bool:
         """Perform health check of chat service components."""

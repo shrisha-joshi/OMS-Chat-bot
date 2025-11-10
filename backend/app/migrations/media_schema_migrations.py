@@ -6,6 +6,8 @@ Run these migrations to set up the required collections and indexes.
 import logging
 from datetime import datetime
 from motor.motor_asyncio import AsyncIOMotorDatabase
+from pymongo import ASCENDING, DESCENDING, TEXT
+from pymongo.operations import IndexModel
 
 logger = logging.getLogger(__name__)
 
@@ -28,10 +30,10 @@ async def create_collections_and_indexes(db: AsyncIOMotorDatabase):
         
         # Add indexes for document_images
         await db.document_images.create_indexes([
-            [("doc_id", 1), ("page", 1)],  # Compound index for efficient retrieval
-            [("description", "text"), ("alt_text", "text")],  # Text search for images
-            [("created_at", -1)],  # For sorting by creation date
-            [("doc_id", 1)],  # For document lookups
+            IndexModel([("doc_id", ASCENDING), ("page", ASCENDING)]),  # Compound index for efficient retrieval
+            IndexModel([("description", TEXT), ("alt_text", TEXT)]),  # Text search for images
+            IndexModel([("created_at", DESCENDING)]),  # For sorting by creation date
+            IndexModel([("doc_id", ASCENDING)]),  # For document lookups
         ])
         logger.info("✅ Created indexes for document_images")
         
@@ -41,10 +43,10 @@ async def create_collections_and_indexes(db: AsyncIOMotorDatabase):
             logger.info("✅ Created media_attachments collection")
         
         await db.media_attachments.create_indexes([
-            [("doc_id", 1), ("type", 1)],  # Compound index for queries
-            [("type", 1)],  # For filtering by media type
-            [("created_at", -1)],  # For sorting
-            [("tags", 1)],  # For tag-based filtering
+            IndexModel([("doc_id", ASCENDING), ("type", ASCENDING)]),  # Compound index for queries
+            IndexModel([("type", ASCENDING)]),  # For filtering by media type
+            IndexModel([("created_at", DESCENDING)]),  # For sorting
+            IndexModel([("tags", ASCENDING)]),  # For tag-based filtering
         ])
         logger.info("✅ Created indexes for media_attachments")
         
@@ -54,11 +56,11 @@ async def create_collections_and_indexes(db: AsyncIOMotorDatabase):
             logger.info("✅ Created query_source_mappings collection")
         
         await db.query_source_mappings.create_indexes([
-            [("query_id", 1), ("source_id", 1)],  # Compound index
-            [("query_id", 1)],  # Query lookups
-            [("source_id", 1)],  # Source lookups
-            [("created_at", -1)],  # For sorting
-            [("relevance_score", -1)],  # For sorting by relevance
+            IndexModel([("query_id", ASCENDING), ("source_id", ASCENDING)]),  # Compound index
+            IndexModel([("query_id", ASCENDING)]),  # Query lookups
+            IndexModel([("source_id", ASCENDING)]),  # Source lookups
+            IndexModel([("created_at", DESCENDING)]),  # For sorting
+            IndexModel([("relevance_score", DESCENDING)]),  # For sorting by relevance
         ])
         logger.info("✅ Created indexes for query_source_mappings")
         
@@ -68,20 +70,20 @@ async def create_collections_and_indexes(db: AsyncIOMotorDatabase):
             logger.info("✅ Created document_validation_logs collection")
         
         await db.document_validation_logs.create_indexes([
-            [("query_id", 1)],  # Query lookups
-            [("is_valid", 1), ("created_at", -1)],  # Filter by validity
-            [("created_at", -1)],  # For sorting
-            [("validation_score", -1)],  # For sorting by score
+            IndexModel([("query_id", ASCENDING)]),  # Query lookups
+            IndexModel([("is_valid", ASCENDING), ("created_at", DESCENDING)]),  # Filter by validity
+            IndexModel([("created_at", DESCENDING)]),  # For sorting
+            IndexModel([("validation_score", DESCENDING)]),  # For sorting by score
         ])
         logger.info("✅ Created indexes for document_validation_logs")
         
-        # 5. Extend documents collection with media-related fields
+        # Extend documents collection with media-related fields
         # Note: This just ensures document structure, doesn't recreate collection
         if "documents" in existing_collections:
             await db.documents.create_indexes([
-                [("has_images", 1)],  # Quick filter for image-containing docs
-                [("has_videos", 1)],  # Quick filter for video-containing docs
-                [("media_count", -1)],  # Sort by media count
+                IndexModel([("has_images", ASCENDING)]),  # Quick filter for image-containing docs
+                IndexModel([("has_videos", ASCENDING)]),  # Quick filter for video-containing docs
+                IndexModel([("media_count", DESCENDING)]),  # Sort by media count
             ])
             logger.info("✅ Created media-related indexes for documents")
         

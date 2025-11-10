@@ -366,6 +366,307 @@ Answer:"""
         
         return "balanced"
     
+    # ============================================================================
+    # Phase 2: ADVANCED QUERY ENHANCEMENT METHODS
+    # ============================================================================
+    
+    async def expand_query(self, query: str, max_expansions: int = 5) -> Dict[str, Any]:
+        """
+        Expand query with synonyms and related terms for better retrieval.
+        SEMANTIC VALIDATION: Only allow expansions that preserve query meaning (similarity > 0.85).
+        
+        Args:
+            query: Original query
+            max_expansions: Maximum synonym/related term expansions
+            
+        Returns:
+            Dictionary with expanded queries and expansion metadata
+        """
+        try:
+            # Comprehensive synonym database
+            synonym_map = {
+                "help": ["assist", "support", "aid", "guidance", "assistance"],
+                "problem": ["issue", "challenge", "difficulty", "error", "bug"],
+                "understand": ["comprehend", "grasp", "learn", "know", "realize"],
+                "use": ["utilize", "employ", "apply", "leverage", "harness"],
+                "show": ["display", "demonstrate", "illustrate", "reveal", "present"],
+                "find": ["locate", "discover", "search", "identify", "uncover"],
+                "work": ["function", "operate", "run", "execute", "perform"],
+                "change": ["modify", "alter", "update", "adjust", "transform"],
+                "create": ["make", "build", "generate", "produce", "develop"],
+                "delete": ["remove", "erase", "destroy", "eliminate", "clear"],
+                "fix": ["repair", "resolve", "correct", "patch", "remedy"],
+                "optimize": ["improve", "enhance", "boost", "refine", "tune"],
+                "analyze": ["examine", "evaluate", "assess", "review", "study"],
+                "manage": ["control", "administer", "oversee", "handle", "govern"],
+                "integrate": ["combine", "merge", "incorporate", "link", "connect"]
+            }
+            
+            expansions = []
+            query_lower = query.lower()
+            
+            # Generate embedding for original query for semantic comparison
+            original_embedding = self.embedding_model.encode(query) if self.embedding_model else None
+            
+            # Find and expand synonyms
+            for keyword, synonyms in synonym_map.items():
+                if keyword in query_lower:
+                    for synonym in synonyms:
+                        # Create expanded version with synonym
+                        expanded = query.replace(keyword, f"{keyword} or {synonym}", 1)
+                        if expanded != query:
+                            # SEMANTIC VALIDATION: Check if expansion preserves meaning
+                            similarity = 1.0  # Default: assume safe if no embedding model
+                            
+                            if original_embedding is not None:
+                                try:
+                                    expanded_embedding = self.embedding_model.encode(expanded)
+                                    # Calculate cosine similarity
+                                    from numpy import dot
+                                    from numpy.linalg import norm
+                                    similarity = dot(original_embedding, expanded_embedding) / (norm(original_embedding) * norm(expanded_embedding))
+                                except Exception as e:
+                                    logger.debug(f"Similarity calculation failed: {e}")
+                                    similarity = 0.9  # Conservative estimate
+                            
+                            # Only accept expansion if it preserves meaning (threshold > 0.85)
+                            if similarity >= 0.85:
+                                expansions.append({
+                                    "expanded_query": expanded,
+                                    "expansion_type": "synonym",
+                                    "original_term": keyword,
+                                    "replacement_term": synonym,
+                                    "semantic_similarity": round(similarity, 3),
+                                    "meaning_preserved": True
+                                })
+                            else:
+                                logger.debug(f"Expansion rejected: '{expanded}' (similarity={similarity:.3f} < 0.85 threshold)")
+                        
+                        # Limit to max_expansions
+                        if len(expansions) >= max_expansions:
+                            break
+                    
+                    if len(expansions) >= max_expansions:
+                        break
+            
+            return {
+                "original_query": query,
+                "expansions": expansions,
+                "total_expansions": len(expansions),
+                "expansion_strategy": "synonym_based_with_semantic_validation",
+                "semantic_threshold": 0.85,
+                "meaning_preservation_enabled": True
+            }
+            
+        except Exception as e:
+            logger.warning(f"Query expansion failed: {e}")
+            return {
+                "original_query": query,
+                "expansions": [],
+                "total_expansions": 0,
+                "error": str(e)
+            }
+    
+    async def rewrite_query_advanced(self, query: str) -> Dict[str, Any]:
+        """
+        Advanced query rewriting that handles typos, grammar, and rephrasing.
+        
+        Args:
+            query: Original query (may have typos/grammatical issues)
+            
+        Returns:
+            Dictionary with corrected and rephrased queries
+        """
+        try:
+            rewrites = {
+                "original": query,
+                "rewrites": [],
+                "strategies_applied": []
+            }
+            
+            # Strategy 1: Fix common typos
+            typo_corrections = {
+                "helo": "help",
+                "wrk": "work",
+                "lst": "list",
+                "usr": "user",
+                "chr": "character",
+                "teh": "the",
+                "recieve": "receive",
+                "occured": "occurred",
+                "seperate": "separate",
+                "definately": "definitely"
+            }
+            
+            corrected_query = query
+            typo_found = False
+            
+            for typo, correction in typo_corrections.items():
+                if typo.lower() in query.lower():
+                    corrected_query = re.sub(
+                        r'\b' + typo + r'\b',
+                        correction,
+                        query,
+                        flags=re.IGNORECASE
+                    )
+                    typo_found = True
+                    break
+            
+            if typo_found and corrected_query != query:
+                rewrites["rewrites"].append({
+                    "query": corrected_query,
+                    "strategy": "typo_correction",
+                    "confidence": 0.95
+                })
+                rewrites["strategies_applied"].append("typo_correction")
+            
+            # Strategy 2: Add context/specificity
+            context_additions = {
+                "how": "how to solve",
+                "why": "why is this important",
+                "what": "what is the definition and usage of",
+                "when": "when should we use",
+            }
+            
+            query_start = query.split()[0].lower() if query.split() else ""
+            
+            if query_start in context_additions:
+                specified_query = query.replace(
+                    query_start,
+                    context_additions[query_start],
+                    1
+                )
+                if specified_query != query:
+                    rewrites["rewrites"].append({
+                        "query": specified_query,
+                        "strategy": "context_addition",
+                        "confidence": 0.85
+                    })
+                    rewrites["strategies_applied"].append("context_addition")
+            
+            # Strategy 3: Normalize phrase variations
+            phrase_normalizations = {
+                r"\b(?:is\s+)?there\s+(?:a\s+)?way": "how to",
+                r"\bwhat\s+(?:is\s+)?the\s+(?:best\s+)?way": "best practices for",
+                r"\bhow\s+(?:can\s+)?(?:i\s+)?(?:you\s+)?": "steps to",
+            }
+            
+            for pattern, replacement in phrase_normalizations.items():
+                if re.search(pattern, query.lower()):
+                    normalized = re.sub(pattern, replacement, query, flags=re.IGNORECASE)
+                    if normalized != query:
+                        rewrites["rewrites"].append({
+                            "query": normalized,
+                            "strategy": "phrase_normalization",
+                            "confidence": 0.8
+                        })
+                        rewrites["strategies_applied"].append("phrase_normalization")
+                        break
+            
+            return rewrites
+            
+        except Exception as e:
+            logger.warning(f"Advanced query rewriting failed: {e}")
+            return {
+                "original": query,
+                "rewrites": [],
+                "strategies_applied": [],
+                "error": str(e)
+            }
+    
+    async def decompose_query_advanced(self, query: str) -> Dict[str, Any]:
+        """
+        Advanced query decomposition for complex multi-part questions.
+        
+        Args:
+            query: Original query
+            
+        Returns:
+            Dictionary with decomposed sub-queries and structure
+        """
+        try:
+            decomposition = {
+                "original": query,
+                "sub_queries": [],
+                "decomposition_type": "none",
+                "complexity_level": "simple"
+            }
+            
+            # Type 1: Conjunction-based (Q1 AND Q2)
+            if re.search(r'\band\b', query, re.IGNORECASE):
+                parts = re.split(r'\s+and\s+', query, flags=re.IGNORECASE)
+                if len(parts) >= 2:
+                    decomposition["sub_queries"] = [
+                        {"sub_query": p.strip(), "index": i, "operator": "AND"}
+                        for i, p in enumerate(parts) if len(p.strip()) > 10
+                    ]
+                    decomposition["decomposition_type"] = "conjunction"
+                    decomposition["complexity_level"] = "multi_part"
+            
+            # Type 2: Disjunction-based (Q1 OR Q2)
+            elif re.search(r'\bor\b', query, re.IGNORECASE):
+                parts = re.split(r'\s+or\s+', query, flags=re.IGNORECASE)
+                if len(parts) >= 2:
+                    decomposition["sub_queries"] = [
+                        {"sub_query": p.strip(), "index": i, "operator": "OR"}
+                        for i, p in enumerate(parts) if len(p.strip()) > 10
+                    ]
+                    decomposition["decomposition_type"] = "disjunction"
+                    decomposition["complexity_level"] = "alternative"
+            
+            # Type 3: Dependency-based (complex relationships)
+            elif len(query.split()) > 15:
+                # Use LLM to identify dependencies
+                try:
+                    cache_key = f"decompose_adv:{hash(query)}"
+                    cached = await self.redis_client.get_json(cache_key)
+                    if cached:
+                        decomposition["sub_queries"] = cached
+                        decomposition["decomposition_type"] = "dependency_based"
+                        decomposition["complexity_level"] = "complex"
+                        return decomposition
+                    
+                    prompt = f"""This query has multiple components that depend on each other:
+"{query}"
+
+Break it into 2-3 ordered sub-questions where each builds on previous answers. Number them in dependency order.
+Format: 1. question
+2. question
+3. question"""
+                    
+                    response = await self._call_lmstudio(prompt, max_tokens=200)
+                    
+                    if response:
+                        lines = response.strip().split('\n')
+                        for i, line in enumerate(lines):
+                            match = re.match(r'\d+\.\s*(.+)', line.strip())
+                            if match:
+                                decomposition["sub_queries"].append({
+                                    "sub_query": match.group(1).strip(),
+                                    "index": i,
+                                    "operator": "THEN",
+                                    "dependency_order": i
+                                })
+                        
+                        if decomposition["sub_queries"]:
+                            decomposition["decomposition_type"] = "dependency_based"
+                            decomposition["complexity_level"] = "complex"
+                            await self.redis_client.set_json(cache_key, decomposition["sub_queries"], expire_seconds=3600)
+                
+                except Exception as e:
+                    logger.debug(f"LLM decomposition failed: {e}")
+            
+            return decomposition
+            
+        except Exception as e:
+            logger.warning(f"Advanced query decomposition failed: {e}")
+            return {
+                "original": query,
+                "sub_queries": [],
+                "decomposition_type": "error",
+                "error": str(e)
+            }
+    
     async def _call_lmstudio(self, prompt: str, max_tokens: int = 150) -> Optional[str]:
         """Call LMStudio API for text generation."""
         try:

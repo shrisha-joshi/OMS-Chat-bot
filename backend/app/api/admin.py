@@ -10,9 +10,12 @@ from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 import base64
 import logging
+import json
+import asyncio
 from datetime import datetime
 
 from ..core.db_mongo import get_mongodb_client, MongoDBClient
+from ..utils.json_sanitizer import validate_json_file
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -45,6 +48,25 @@ async def upload_document_multipart(
         if size > 50 * 1024 * 1024:  # 50MB limit
             raise HTTPException(status_code=413, detail="File too large (max 50MB)")
         
+        # AUTO-SANITIZE JSON FILES BEFORE SAVING
+        if file.filename and file.filename.lower().endswith('.json'):
+            logger.info(f"🧹 Auto-sanitizing JSON file: {file.filename}")
+            success, sanitized_data, report = validate_json_file(content)
+            
+            if not success:
+                logger.error(f"❌ JSON sanitization failed: {report.get('error')}")
+                raise HTTPException(
+                    status_code=400, 
+                    detail=f"Invalid JSON file: {report.get('error', 'Unknown error')}"
+                )
+            
+            # Replace content with sanitized version
+            content = json.dumps(sanitized_data, indent=2).encode('utf-8')
+            size = len(content)
+            
+            logger.info(f"✅ JSON sanitized successfully - {len(report.get('cleaning_steps', []))} fixes applied")
+            logger.info(f"   Type: {report.get('type')}, Items: {report.get('statistics', {}).get('total_items', 'N/A')}")
+        
         # Save to MongoDB GridFS
         doc_id = await mongo_client.save_document(
             filename=file.filename,
@@ -66,14 +88,9 @@ async def upload_document_multipart(
         except Exception as e:
             logger.warning(f"Failed to clear cache: {e}")
         
-        # Queue for background processing
-        background_tasks.add_task(
-            _process_document,
-            doc_id,
-            file.filename,
-            content,
-            mongo_client
-        )
+        # PROCESS IMMEDIATELY using asyncio.create_task (more reliable than BackgroundTasks)
+        logger.info(f"🚀 Starting immediate processing: {file.filename}")
+        asyncio.create_task(_process_document_with_retry(doc_id, file.filename))
         
         return {
             "success": True,
@@ -88,6 +105,49 @@ async def upload_document_multipart(
     except Exception as e:
         logger.error(f"❌ Upload failed: {e}")
         raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
+
+
+@router.post("/documents/{doc_id}/reprocess")
+async def reprocess_document(
+    doc_id: str,
+    mongo_client: MongoDBClient = Depends(get_mongodb_client)
+):
+    """Manually trigger document reprocessing (synchronous for testing)."""
+    try:
+        # Get document info
+        doc = await mongo_client.get_document(doc_id)
+        if not doc:
+            raise HTTPException(status_code=404, detail="Document not found")
+        
+        filename = doc.get("filename", "unknown")
+        logger.info(f"🔄 Manual reprocessing triggered: {filename}")
+        
+        # Process synchronously so we can see errors
+        from ..services.ingest_service import IngestService
+        ingest_service = IngestService()
+        await ingest_service.initialize()
+        
+        # Ensure Qdrant is connected
+        if not ingest_service.qdrant_client.is_connected():
+            await ingest_service.qdrant_client.connect()
+        
+        # Update status
+        await mongo_client.update_document_status(doc_id, "PROCESSING")
+        
+        # Process
+        success = await ingest_service.process_document(doc_id)
+        
+        if success:
+            await mongo_client.update_document_status(doc_id, "COMPLETED")
+            return {"success": True, "message": f"Document {filename} processed successfully"}
+        else:
+            await mongo_client.update_document_status(doc_id, "FAILED", "Processing returned False")
+            return {"success": False, "message": "Processing failed"}
+            
+    except Exception as e:
+        logger.error(f"Reprocessing error: {e}", exc_info=True)
+        await mongo_client.update_document_status(doc_id, "FAILED", str(e))
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/documents/upload-json")
@@ -115,11 +175,11 @@ async def upload_document_json(
         logger.info(f"✅ JSON document saved to MongoDB: {payload.filename} ({size} bytes) - ID: {doc_id}")
         
         # Queue for background processing
+        logger.info(f"🚀 Queuing JSON document for immediate processing: {payload.filename}")
         background_tasks.add_task(
-            _process_document,
+            _process_document_immediate,
             doc_id,
             payload.filename,
-            content,
             mongo_client
         )
         
@@ -138,31 +198,139 @@ async def upload_document_json(
         raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
 
 
+async def _process_document_with_retry(doc_id: str, filename: str, max_retries: int = 3):
+    """
+    Process document with automatic retry on failure.
+    This runs in the background using asyncio.create_task.
+    """
+    from ..services.ingest_service import IngestService
+    from ..core.db_mongo import get_mongodb_client
+    
+    mongo_client = await get_mongodb_client()
+    
+    for attempt in range(1, max_retries + 1):
+        try:
+            logger.info(f"🔥 PROCESSING ATTEMPT {attempt}/{max_retries}: {filename} (ID: {doc_id})")
+            
+            # Update status to PROCESSING
+            await mongo_client.update_document_status(doc_id, "PROCESSING")
+            
+            # Initialize ingest service
+            ingest_service = IngestService()
+            await ingest_service.initialize()
+            
+            # Ensure Qdrant is connected
+            if not ingest_service.qdrant_client.is_connected():
+                await ingest_service.qdrant_client.connect()
+            
+            # Process the document
+            logger.info(f"⚙️ Running RAG pipeline for {filename}...")
+            success = await ingest_service.process_document(doc_id)
+            
+            if success:
+                await mongo_client.update_document_status(doc_id, "COMPLETED")
+                logger.info(f"✅ SUCCESS (attempt {attempt}): {filename} fully processed!")
+                return  # Success - exit retry loop
+            else:
+                # Partial success - retry
+                logger.warning(f"⚠️ PARTIAL SUCCESS (attempt {attempt}): {filename}")
+                if attempt < max_retries:
+                    await asyncio.sleep(5 * attempt)  # Exponential backoff
+                    continue
+                else:
+                    await mongo_client.update_document_status(doc_id, "COMPLETED", "Partial success after retries")
+                    return
+                    
+        except Exception as e:
+            logger.error(f"❌ ATTEMPT {attempt} FAILED: {filename} - {e}")
+            
+            if attempt < max_retries:
+                # Retry after delay
+                delay = 5 * attempt
+                logger.info(f"⏱️ Retrying in {delay} seconds...")
+                await asyncio.sleep(delay)
+            else:
+                # All retries exhausted
+                logger.error(f"❌ ALL {max_retries} ATTEMPTS FAILED for {filename}")
+                try:
+                    await mongo_client.update_document_status(doc_id, "FAILED", f"Failed after {max_retries} attempts: {str(e)}")
+                except:
+                    pass
+
+
+async def _process_document_immediate(doc_id, filename, mongo_client):
+    """IMMEDIATE background processing - runs right away."""
+    try:
+        logger.info(f"🔥 IMMEDIATE PROCESSING STARTED: {filename} (doc_id: {doc_id})")
+        
+        # Update status to PROCESSING immediately
+        await mongo_client.update_document_status(str(doc_id), "PROCESSING")
+        logger.info(f"📝 Status: PENDING → PROCESSING for {filename}")
+        
+        # Lazy initialize ingest service
+        from ..services.ingest_service import IngestService
+        
+        logger.info(f"🔧 Initializing ingest service...")
+        ingest_service = IngestService()
+        await ingest_service.initialize()
+        logger.info(f"✅ Ingest service ready")
+        
+        # Process the document
+        logger.info(f"⚙️ Running RAG pipeline: Extract → Chunk → Embed → Index")
+        success = await ingest_service.process_document(str(doc_id))
+        
+        if success:
+            await mongo_client.update_document_status(str(doc_id), "COMPLETED")
+            logger.info(f"✅ SUCCESS: {filename} fully processed and indexed!")
+        else:
+            await mongo_client.update_document_status(str(doc_id), "COMPLETED", "Partial success")
+            logger.warning(f"⚠️ PARTIAL: {filename} processed with warnings")
+            
+    except Exception as e:
+        logger.error(f"❌ FAILED: {filename} - {e}", exc_info=True)
+        try:
+            await mongo_client.update_document_status(str(doc_id), "FAILED", str(e))
+        except:
+            pass
+
+
 async def _process_document(doc_id, filename, content, mongo_client):
     """Background task to process uploaded document with chunking and embeddings."""
     try:
-        logger.info(f"🔄 Starting document processing: {filename} (doc_id: {doc_id})")
+        logger.info(f"🔄 BACKGROUND TASK STARTED: Processing {filename} (doc_id: {doc_id})")
+        
+        # Update status to PROCESSING immediately
+        await mongo_client.update_document_status(str(doc_id), "PROCESSING")
+        logger.info(f"📝 Status updated to PROCESSING for {filename}")
         
         # Lazy initialize ingest service (import here to avoid circular imports)
         from ..services.ingest_service import IngestService
         from ..core.db_qdrant import get_qdrant_client
-        from ..core.db_arango import get_arango_client
         from ..core.cache_redis import get_redis_client
         
+        logger.info(f"🔧 Initializing ingest service for {filename}...")
         # Create ingest service instance
         ingest_service = IngestService()
         await ingest_service.initialize()
+        logger.info(f"✅ Ingest service initialized for {filename}")
         
         # Process the document (chunks, embeddings, Qdrant storage)
+        logger.info(f"⚙️ Starting document processing pipeline for {filename}...")
         success = await ingest_service.process_document(str(doc_id))
         
         if success:
-            logger.info(f"✅ Document processing completed: {filename} (doc_id: {doc_id})")
+            logger.info(f"✅ Document processing completed successfully: {filename} (doc_id: {doc_id})")
+            await mongo_client.update_document_status(str(doc_id), "COMPLETED")
         else:
             logger.warning(f"⚠️ Document processing partial success: {filename} (doc_id: {doc_id})")
+            await mongo_client.update_document_status(str(doc_id), "COMPLETED", "Partial success")
             
     except Exception as e:
-        logger.error(f"❌ Error in document processing: {filename} (doc_id: {doc_id}) - {e}", exc_info=True)
+        logger.error(f"❌ CRITICAL ERROR in document processing: {filename} (doc_id: {doc_id}) - {e}", exc_info=True)
+        try:
+            await mongo_client.update_document_status(str(doc_id), "FAILED", str(e))
+        except Exception as status_error:
+            logger.error(f"Failed to update status: {status_error}")
 
 
 @router.get("/documents/list")
@@ -293,7 +461,7 @@ async def get_document_status(
         current_stage = "PENDING"
         
         for i, stage_name in enumerate(expected_stages):
-            stage_log = next((log for log in logs if log.get("stage") == stage_name), None)
+            stage_log = next((log for log in logs if log.get("step") == stage_name), None)
             
             if stage_log:
                 status = stage_log.get("status", "UNKNOWN")
@@ -361,3 +529,4 @@ async def get_document_status(
     except Exception as e:
         logger.error(f"Failed to get document status: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to get document status: {str(e)}")
+

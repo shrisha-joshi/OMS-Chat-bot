@@ -126,7 +126,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     const loadingMessage: ChatMessage = {
       id: `msg_${Date.now() + 1}`,
       role: 'assistant',
-      content: '⏳ Thinking...',
+      content: '🤔 Processing your question... This may take up to 2-3 minutes for complex queries.',
       timestamp: new Date().toISOString()
     }
 
@@ -140,7 +140,15 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     setIsProcessing(true)
 
     try {
-      // Call REST API
+      // Call REST API with extended timeout for LLM responses (3 minutes)
+      const controller = new AbortController()
+      const timeoutId = setTimeout(() => {
+        console.warn('⏰ Request timeout after 3 minutes, aborting...')
+        controller.abort()
+      }, 180000) // 3 minutes
+      
+      console.log('📤 Sending query to backend:', content.substring(0, 100))
+      
       const response = await fetch(`${API_BASE_URL}/chat/query`, {
         method: 'POST',
         headers: {
@@ -150,20 +158,37 @@ export function ChatProvider({ children }: { children: ReactNode }) {
           query: content,
           session_id: currentSession.id,
           context: []
-        })
+        }),
+        signal: controller.signal
       })
+      
+      clearTimeout(timeoutId)
+
+      console.log('✓ Fetch completed, status:', response.status, response.statusText)
+      console.log('✓ Response headers:', Object.fromEntries(response.headers.entries()))
 
       if (!response.ok) {
-        throw new Error(`API error: ${response.statusText}`)
+        const errorText = await response.text()
+        console.error('❌ Backend error response:', errorText)
+        throw new Error(`API error: ${response.statusText} - ${errorText}`)
       }
 
+      console.log('✓ Parsing JSON response...')
       const data = await response.json()
+      console.log('✓ Response received from backend:', data)
+      console.log('✓ Response content:', data.response ? data.response.substring(0, 100) : 'NO RESPONSE')
+
+      // Validate response has content
+      if (!data.response && !data.answer && !data.message) {
+        console.error('❌ Response has no content field:', Object.keys(data))
+        throw new Error('Backend response missing content field')
+      }
 
       // Replace loading message with response
       const assistantMessage: ChatMessage = {
         id: `msg_${Date.now()}`,
         role: 'assistant',
-        content: data.response || 'I apologize, but I could not generate a response.',
+        content: data.response || data.answer || data.message || 'I apologize, but I could not generate a response.',
         timestamp: new Date().toISOString(),
         sources: data.sources || [],
         attachments: data.attachments || [],
@@ -171,22 +196,33 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         tokens_generated: data.tokens_generated
       }
 
+      console.log('✓ Created assistant message with', assistantMessage.content.length, 'characters')
+
+      console.log('✓ Created assistant message with', assistantMessage.content.length, 'characters')
+
       updatedSession = {
         ...updatedSession,
         messages: [...updatedSession.messages.slice(0, -1), assistantMessage],
         updated_at: new Date().toISOString()
       }
 
+      console.log('✓ Updating session with', updatedSession.messages.length, 'messages')
       setCurrentSession(updatedSession)
       setSessions(prev => prev.map(s => s.id === updatedSession.id ? updatedSession : s))
+      console.log('✓ Chat response processed successfully!')
     } catch (error) {
-      console.error('Failed to send message:', error)
+      console.error('❌ Failed to send message:', error)
+      console.error('Error details:', {
+        name: error instanceof Error ? error.name : 'Unknown',
+        message: error instanceof Error ? error.message : String(error),
+        stack: error instanceof Error ? error.stack : undefined
+      })
 
       // Show error message
       const errorMessage: ChatMessage = {
         id: `msg_${Date.now()}`,
         role: 'assistant',
-        content: `I apologize, but I encountered an error: ${error instanceof Error ? error.message : 'Unknown error'}`,
+        content: `❌ Error: ${error instanceof Error ? error.message : 'Unknown error'}. Please check the browser console (F12) for details.`,
         timestamp: new Date().toISOString()
       }
 

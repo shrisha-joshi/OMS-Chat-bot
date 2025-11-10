@@ -312,6 +312,111 @@ class HybridSearchService:
         # Sort by hybrid score and return top-k
         ranked.sort(key=lambda x: x.get("hybrid_score", 0), reverse=True)
         return ranked[:top_k]
+    
+    async def hybrid_search_with_rrf(
+        self,
+        query: str,
+        query_embedding: List[float],
+        top_k: int = 10,
+        rrf_k: int = 60
+    ) -> Dict[str, Any]:
+        """
+        Perform hybrid search using Reciprocal Rank Fusion (RRF) algorithm.
+        RRF mathematically combines rankings from multiple sources with proven effectiveness.
+        
+        Args:
+            query: User query text
+            query_embedding: Query embedding vector
+            top_k: Number of results to return
+            rrf_k: RRF parameter (typically 60, controls contribution of each ranker)
+            
+        Returns:
+            Dictionary with RRF-fused results and metrics
+        """
+        try:
+            start_time = time.time()
+            
+            # Parallel execution: Vector search + BM25 search
+            vector_task = self._vector_search(query_embedding, top_k * 3)
+            bm25_task = self._bm25_search(query, top_k * 3)
+            
+            vector_results, bm25_results = await asyncio.gather(
+                vector_task,
+                bm25_task,
+                return_exceptions=True
+            )
+            
+            # Handle exceptions gracefully
+            if isinstance(vector_results, Exception):
+                logger.warning(f"Vector search failed in RRF: {vector_results}")
+                vector_results = []
+            
+            if isinstance(bm25_results, Exception):
+                logger.warning(f"BM25 search failed in RRF: {bm25_results}")
+                bm25_results = []
+            
+            # Apply RRF algorithm
+            rrf_scores = {}
+            
+            # RRF formula: score = 1 / (k + rank)
+            # where k is rrf_k parameter and rank is position in ranking
+            
+            # Process vector results
+            for rank, result in enumerate(vector_results, 1):
+                doc_id = str(result.get("_id") or result.get("chunk_index", ""))
+                if doc_id:
+                    rrf_score = 1.0 / (rrf_k + rank)
+                    if doc_id not in rrf_scores:
+                        rrf_scores[doc_id] = {"score": 0.0, "data": result, "sources": []}
+                    rrf_scores[doc_id]["score"] += rrf_score
+                    rrf_scores[doc_id]["sources"].append("vector")
+            
+            # Process BM25 results
+            for rank, result in enumerate(bm25_results, 1):
+                doc_id = str(result.get("_id") or result.get("chunk_index", ""))
+                if doc_id:
+                    rrf_score = 1.0 / (rrf_k + rank)
+                    if doc_id not in rrf_scores:
+                        rrf_scores[doc_id] = {"score": 0.0, "data": result, "sources": []}
+                    rrf_scores[doc_id]["score"] += rrf_score
+                    rrf_scores[doc_id]["sources"].append("keyword")
+            
+            # Sort by RRF score and prepare results
+            ranked_results = []
+            for doc_id, score_data in rrf_scores.items():
+                result = score_data["data"]
+                result["rrf_score"] = score_data["score"]
+                result["fusion_sources"] = list(set(score_data["sources"]))
+                result["appears_in_multiple"] = len(score_data["sources"]) > 1
+                ranked_results.append(result)
+            
+            # Sort by RRF score (descending) and get top-k
+            ranked_results.sort(key=lambda x: x.get("rrf_score", 0), reverse=True)
+            final_results = ranked_results[:top_k]
+            
+            elapsed = time.time() - start_time
+            
+            return {
+                "merged_results": final_results,
+                "vector_count": len(vector_results),
+                "bm25_count": len(bm25_results),
+                "rrf_count": len(rrf_scores),
+                "algorithm": "reciprocal_rank_fusion",
+                "rrf_k_parameter": rrf_k,
+                "total_time_ms": int(elapsed * 1000),
+                "deduplication_ratio": len(final_results) / max(1, len(rrf_scores))
+            }
+            
+        except Exception as e:
+            logger.error(f"RRF hybrid search failed: {e}")
+            return {
+                "merged_results": [],
+                "vector_count": 0,
+                "bm25_count": 0,
+                "rrf_count": 0,
+                "algorithm": "reciprocal_rank_fusion",
+                "error": str(e)
+            }
 
 
 class QueryRewritingService:
@@ -456,10 +561,13 @@ class EmbeddingCachingService:
     
     def __init__(self, redis_client: Optional[RedisClient] = None):
         self.redis_client = redis_client
-        self.cache_ttl = 86400  # 24 hours
+        # Extended TTL for embeddings since they are deterministic (same text = same embedding)
+        # 30 days = 2592000 seconds. Embeddings can be cached longer than query results.
+        self.embedding_cache_ttl = 2592000  # 30 days
+        self.query_cache_ttl = 86400  # 24 hours (for query-specific cache)
     
     async def get_cached_embedding(self, text: str) -> Optional[List[float]]:
-        """Get cached embedding for text."""
+        """Get cached embedding for text. Returns None if cache miss or expired."""
         if not self.redis_client:
             return None
         
@@ -468,7 +576,7 @@ class EmbeddingCachingService:
             cached = await self.redis_client.get(cache_key)
             
             if cached:
-                logger.debug(f"Cache hit for embedding")
+                logger.debug(f"Cache hit for embedding (will expire in ~30 days)")
                 return cached.get("embedding")
             
             return None
@@ -478,18 +586,31 @@ class EmbeddingCachingService:
             return None
     
     async def cache_embedding(self, text: str, embedding: List[float]) -> bool:
-        """Cache embedding for text."""
+        """Cache embedding for text with extended TTL (30 days).
+        
+        This uses a longer TTL than query results because:
+        1. Embeddings are deterministic (same input = same output)
+        2. Model doesn't change frequently during a session
+        3. Long-term cache reduces compute load
+        4. Embeddings can be safely evicted after 30 days
+        """
         if not self.redis_client:
             return False
         
         try:
             cache_key = f"embedding:{hash(text)}"
+            # Use extended TTL (30 days) instead of short 24-hour TTL
             await self.redis_client.set(
                 cache_key,
-                {"embedding": embedding, "timestamp": datetime.now().isoformat()},
-                ttl=self.cache_ttl
+                {
+                    "embedding": embedding,
+                    "timestamp": datetime.now().isoformat(),
+                    "ttl_days": 30
+                },
+                ttl=self.embedding_cache_ttl  # 30 days
             )
             
+            logger.debug(f"Embedding cached with 30-day TTL")
             return True
             
         except Exception as e:

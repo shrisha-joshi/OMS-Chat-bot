@@ -1,6 +1,7 @@
 """
 JSON file processing and parsing service.
 Extracts structured data from JSON files and stores in MongoDB for retrieval.
+Enhanced with automatic schema detection and adaptive processing.
 """
 
 import json
@@ -13,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 
 class JSONProcessorService:
-    """Service for processing and parsing JSON files."""
+    """Service for processing and parsing JSON files with automatic adaptation."""
     
     def __init__(self):
         self.supported_schemas = [
@@ -21,7 +22,10 @@ class JSONProcessorService:
             'nested',         # Nested objects
             'array',          # Array of objects
             'table',          # Table-like structure
-            'hierarchical'    # Hierarchical structure
+            'hierarchical',   # Hierarchical structure
+            'geo_json',       # GeoJSON format
+            'api_response',   # API response format
+            'csv_like'        # CSV-like JSON structure
         ]
     
     async def process_json_file(self, content: bytes, filename: str) -> Dict[str, Any]:
@@ -74,9 +78,33 @@ class JSONProcessorService:
             raise
     
     async def _detect_schema(self, data: Any) -> str:
-        """Detect the schema type of JSON data."""
+        """Detect the schema type of JSON data with enhanced detection."""
+        # GeoJSON detection
+        if isinstance(data, dict) and data.get('type') in ['Feature', 'FeatureCollection']:
+            return 'geo_json'
+        
+        # API response detection (has status, data, metadata pattern)
+        if isinstance(data, dict) and any(key in data for key in ['status', 'data', 'response', 'result']):
+            if 'data' in data or 'response' in data or 'result' in data:
+                return 'api_response'
+        
+        # Array of objects (most common)
+        if isinstance(data, list):
+            if len(data) > 0:
+                # Check if array contains objects
+                if all(isinstance(item, dict) for item in data):
+                    # Check if it's CSV-like (same keys in all objects)
+                    if len(data) > 1:
+                        first_keys = set(data[0].keys() if isinstance(data[0], dict) else [])
+                        if all(set(item.keys() if isinstance(item, dict) else []) == first_keys for item in data[1:5]):
+                            return 'csv_like'
+                    return 'array'
+                # Array of primitives
+                return 'flat'
+        
+        # Single object analysis
         if isinstance(data, dict):
-            # Check if it's a table-like structure
+            # Check if it's a flat structure
             if all(isinstance(v, (str, int, float, bool, type(None))) for v in data.values()):
                 return 'flat'
             
@@ -84,20 +112,14 @@ class JSONProcessorService:
             if any(isinstance(v, dict) for v in data.values()):
                 return 'nested'
             
-            # Check if it has arrays
+            # Check if it has arrays (hierarchical)
             if any(isinstance(v, list) for v in data.values()):
                 return 'hierarchical'
-        
-        elif isinstance(data, list):
-            if len(data) > 0:
-                # Check if array contains objects
-                if all(isinstance(item, dict) for item in data):
-                    return 'array'
         
         return 'flat'
     
     async def _extract_data(self, data: Any, schema_type: str) -> Dict[str, Any]:
-        """Extract structured data based on schema type."""
+        """Extract structured data based on schema type with enhanced handlers."""
         records = []
         fields = {}
         
@@ -109,7 +131,7 @@ class JSONProcessorService:
             records = self._flatten_nested(data)
             fields = self._get_fields_from_nested(data)
         
-        elif schema_type == 'array':
+        elif schema_type == 'array' or schema_type == 'csv_like':
             records = data
             if len(data) > 0:
                 fields = {k: type(v).__name__ for k, v in data[0].items() if isinstance(data[0], dict)}
@@ -118,10 +140,26 @@ class JSONProcessorService:
             records = self._flatten_hierarchical(data)
             fields = self._get_hierarchical_fields(data)
         
+        elif schema_type == 'geo_json':
+            records = self._extract_geojson(data)
+            fields = {'type': 'str', 'geometry': 'dict', 'properties': 'dict'}
+        
+        elif schema_type == 'api_response':
+            # Extract actual data from API response wrapper
+            data_key = next((k for k in ['data', 'response', 'result', 'items'] if k in data), None)
+            if data_key and isinstance(data[data_key], list):
+                records = data[data_key]
+                if len(records) > 0:
+                    fields = {k: type(v).__name__ for k, v in records[0].items() if isinstance(records[0], dict)}
+            else:
+                records = [data]
+                fields = {k: type(v).__name__ for k, v in data.items()}
+        
         return {
             'records': records,
             'fields': fields,
-            'record_count': len(records)
+            'record_count': len(records),
+            'schema_type': schema_type
         }
     
     def _flatten_nested(self, data: Dict, parent_key: str = '', sep: str = '.') -> List[Dict]:
@@ -196,6 +234,31 @@ class JSONProcessorService:
         
         extract_fields(data)
         return fields
+    
+    def _extract_geojson(self, data: Dict) -> List[Dict]:
+        """Extract features from GeoJSON format."""
+        records = []
+        
+        if data.get('type') == 'FeatureCollection':
+            features = data.get('features', [])
+            for feature in features:
+                record = {
+                    'type': feature.get('type'),
+                    'geometry_type': feature.get('geometry', {}).get('type'),
+                    'coordinates': str(feature.get('geometry', {}).get('coordinates')),
+                    **feature.get('properties', {})
+                }
+                records.append(record)
+        elif data.get('type') == 'Feature':
+            record = {
+                'type': data.get('type'),
+                'geometry_type': data.get('geometry', {}).get('type'),
+                'coordinates': str(data.get('geometry', {}).get('coordinates')),
+                **data.get('properties', {})
+            }
+            records.append(record)
+        
+        return records
     
     async def _generate_embeddings_text(self, extracted_data: Dict[str, Any]) -> str:
         """Generate text content for embeddings from structured data."""

@@ -16,7 +16,6 @@ from datetime import datetime
 
 from ..core.db_mongo import get_mongodb_client, MongoDBClient
 from ..core.db_qdrant import get_qdrant_client, QdrantDBClient
-from ..core.db_arango import get_arango_client, ArangoDBClient
 from ..core.cache_redis import get_redis_client, RedisClient
 from ..services.chat_service import ChatService
 from ..config import settings

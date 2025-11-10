@@ -25,10 +25,10 @@ import tiktoken
 
 from ..core.db_mongo import get_mongodb_client, MongoDBClient
 from ..core.db_qdrant import get_qdrant_client, QdrantDBClient
-from ..core.db_arango import get_arango_client, ArangoDBClient
 from ..core.cache_redis import get_redis_client, RedisClient
 from .hierarchical_indexing_service import hierarchical_indexing_service
 from .json_processor_service import JSONProcessorService
+from .entity_extraction_service import entity_extraction_service
 from ..config import settings
 
 logger = logging.getLogger(__name__)
@@ -42,7 +42,6 @@ class IngestService:
         self.tokenizer = None
         self.mongo_client = None
         self.qdrant_client = None
-        self.arango_client = None
         self.redis_client = None
         self.json_processor = None
     
@@ -54,7 +53,6 @@ class IngestService:
             # Get database clients
             self.mongo_client = await get_mongodb_client()
             self.qdrant_client = await get_qdrant_client()
-            self.arango_client = await get_arango_client()
             self.redis_client = await get_redis_client()
             
             # Initialize embedding model
@@ -205,18 +203,32 @@ class IngestService:
             )
             
             # Step 6: Extract entities and build graph (if enabled)
-            if settings.use_graph_search and self.nlp_model:
+            if settings.use_graph_search:
                 await self.mongo_client.log_ingestion_step(
                     doc_id, "EXTRACT_ENTITIES", "PROCESSING", "Extracting entities for knowledge graph"
                 )
                 
-                entity_count = await self._extract_and_store_entities(text_content, doc_id, chunks)
-                
-                await self.mongo_client.log_ingestion_step(
-                    doc_id, "EXTRACT_ENTITIES", "SUCCESS", 
-                    f"Extracted {entity_count} entities",
-                    {"entity_count": entity_count}
-                )
+                try:
+                    # Use LLM-based entity extraction service
+                    graph_stats = await entity_extraction_service.process_document_for_graph(
+                        doc_id=doc_id,
+                        chunks=chunks
+                    )
+                    
+                    entity_count = graph_stats.get("entities_created", 0)
+                    relationship_count = graph_stats.get("relationships_created", 0)
+                    
+                    await self.mongo_client.log_ingestion_step(
+                        doc_id, "EXTRACT_ENTITIES", "SUCCESS", 
+                        f"Extracted {entity_count} entities and {relationship_count} relationships",
+                        {"entity_count": entity_count, "relationship_count": relationship_count}
+                    )
+                except Exception as e:
+                    logger.warning(f"Graph extraction failed (non-critical): {e}")
+                    await self.mongo_client.log_ingestion_step(
+                        doc_id, "EXTRACT_ENTITIES", "WARNING", 
+                        f"Graph extraction failed: {str(e)}"
+                    )
             
             # Step 7: Cache document for faster retrieval
             await self._cache_document_metadata(doc_id, document, len(chunks))
@@ -245,12 +257,20 @@ class IngestService:
                 doc_id, "JSON_PARSE", "PROCESSING", "Parsing JSON file structure"
             )
             
-            # Parse JSON and extract data
-            json_data = json.loads(file_content.decode("utf-8", errors="ignore"))
+            # Parse JSON with automatic sanitization fallback
+            try:
+                json_data = json.loads(file_content.decode("utf-8", errors="ignore"))
+                logger.info(f"✓ Standard JSON parse successful for {filename}")
+            except json.JSONDecodeError as e:
+                logger.warning(f"Standard JSON parse failed, using sanitizer: {e}")
+                # Use sanitizer as fallback
+                from ..utils.json_sanitizer import sanitize_json
+                json_data, cleaning_steps = sanitize_json(file_content.decode("utf-8", errors="ignore"))
+                logger.info(f"✓ JSON sanitized with {len(cleaning_steps)} fixes")
             
             # Use JSON processor to extract structured data
-            schema_type = self.json_processor.detect_schema_type(json_data)
-            extracted_data = self.json_processor.extract_structured_data(json_data)
+            schema_type = await self.json_processor._detect_schema(json_data)
+            extracted_data = await self.json_processor._extract_data(json_data, schema_type)
             
             await self.mongo_client.log_ingestion_step(
                 doc_id, "JSON_PARSE", "SUCCESS", 
@@ -262,7 +282,7 @@ class IngestService:
                 doc_id, "JSON_QA", "PROCESSING", "Generating Q&A pairs from JSON data"
             )
             
-            qa_pairs = self.json_processor.generate_qa_pairs(json_data, extracted_data)
+            qa_pairs = await self.json_processor.create_qa_pairs(extracted_data)
             
             await self.mongo_client.log_ingestion_step(
                 doc_id, "JSON_QA", "SUCCESS", 
@@ -316,8 +336,8 @@ class IngestService:
                 doc_id, "STORE_VECTORS", "PROCESSING", "Storing embeddings in vector database"
             )
             
-            vector_success = await self.qdrant_client.store_chunks(
-                chunks, embeddings, doc_id, filename
+            vector_success = await self.qdrant_client.upsert_vectors(
+                doc_id, chunks, embeddings
             )
             if not vector_success:
                 raise ValueError("Failed to store embeddings in vector database")
@@ -669,7 +689,7 @@ class IngestService:
     
     async def _extract_and_store_entities(self, text: str, doc_id: str, chunks: List[Dict]) -> int:
         """
-        Extract entities from text and store in knowledge graph.
+        Extract entities from text and store in MongoDB.
         
         Args:
             text: Full document text
@@ -689,6 +709,7 @@ class IngestService:
             doc = self.nlp_model(text[:1000000])  # Limit text length for processing
             
             # Extract entities
+            entities_list = []
             entities_by_chunk = {}
             
             for ent in doc.ents:
@@ -697,40 +718,58 @@ class IngestService:
                     chunk_id = self._find_entity_chunk(ent.start_char, chunks)
                     
                     if chunk_id:
-                        entity_key = await self.arango_client.create_entity(
-                            name=ent.text,
-                            entity_type=ent.label_,
-                            doc_id=doc_id,
-                            chunk_id=chunk_id
-                        )
+                        entity_doc = {
+                            "name": ent.text,
+                            "type": ent.label_,
+                            "doc_id": doc_id,
+                            "chunk_id": chunk_id,
+                            "char_offset": ent.start_char,
+                            "confidence": 0.9,  # NER confidence
+                            "created_at": datetime.utcnow()
+                        }
                         
-                        if entity_key:
-                            entity_count += 1
-                            
-                            # Track entities per chunk for relationship building
-                            if chunk_id not in entities_by_chunk:
-                                entities_by_chunk[chunk_id] = []
-                            entities_by_chunk[chunk_id].append({
-                                "key": entity_key,
-                                "name": ent.text,
-                                "type": ent.label_
-                            })
+                        # Store entity in MongoDB
+                        result = await self.mongo_client.database.entities.insert_one(entity_doc)
+                        entity_id = str(result.inserted_id)
+                        entity_count += 1
+                        
+                        # Track entities per chunk for relationship building
+                        if chunk_id not in entities_by_chunk:
+                            entities_by_chunk[chunk_id] = []
+                        entities_by_chunk[chunk_id].append({
+                            "id": entity_id,
+                            "name": ent.text,
+                            "type": ent.label_
+                        })
+                        
+                        entities_list.append(entity_doc)
             
-            # Create relationships between entities in the same chunk
+            # Create relationships between entities in the same chunk and store in MongoDB
+            relationships = []
             for chunk_id, chunk_entities in entities_by_chunk.items():
                 if len(chunk_entities) > 1:
                     for i, entity1 in enumerate(chunk_entities):
                         for entity2 in chunk_entities[i+1:]:
-                            await self.arango_client.create_relation(
-                                entity1["key"],
-                                entity2["key"],
-                                "CO_OCCURS",
-                                confidence=0.6,
-                                doc_id=doc_id,
-                                chunk_id=chunk_id
-                            )
+                            relationship_doc = {
+                                "entity1_id": entity1["id"],
+                                "entity1_name": entity1["name"],
+                                "entity2_id": entity2["id"],
+                                "entity2_name": entity2["name"],
+                                "relation_type": "CO_OCCURS",
+                                "confidence": 0.6,
+                                "doc_id": doc_id,
+                                "chunk_id": chunk_id,
+                                "created_at": datetime.utcnow()
+                            }
+                            
+                            # Store relationship in MongoDB
+                            await self.mongo_client.database.entity_relationships.insert_one(relationship_doc)
+                            relationships.append(relationship_doc)
             
             logger.info(f"Extracted {entity_count} entities from document {doc_id}")
+            if relationships:
+                logger.info(f"Created {len(relationships)} entity relationships")
+            
             return entity_count
             
         except Exception as e:

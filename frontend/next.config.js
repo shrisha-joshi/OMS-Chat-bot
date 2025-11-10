@@ -5,8 +5,8 @@ const nextConfig = {
     unoptimized: true
   },
   env: {
-    NEXT_PUBLIC_API_URL: process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000',
-    NEXT_PUBLIC_WS_URL: process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:8000'
+    NEXT_PUBLIC_API_URL: process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000',
+    NEXT_PUBLIC_WS_URL: process.env.NEXT_PUBLIC_WS_URL || 'ws://127.0.0.1:8000'
   },
   webpack: (config, { isServer }) => {
     // Fix for modules that can't be used on the client side
@@ -26,6 +26,18 @@ const nextConfig = {
   // Optimize for Windows development
   swcMinify: true,
   
+  // Fix chunk loading timeouts on Windows
+  experimental: {
+    workerThreads: false,
+    cpus: 1
+  },
+  
+  // Increase timeout for chunk loading
+  onDemandEntries: {
+    maxInactiveAge: 60 * 1000,
+    pagesBufferLength: 5,
+  },
+  
   // Headers for CORS during development
   async headers() {
     return [
@@ -34,7 +46,7 @@ const nextConfig = {
         headers: [
           {
             key: 'Access-Control-Allow-Origin',
-            value: 'http://localhost:8000'
+            value: 'http://127.0.0.1:8000'
           }
         ]
       }

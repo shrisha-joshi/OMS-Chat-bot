@@ -36,6 +36,7 @@ class Settings(BaseSettings):
     neo4j_username: Optional[str] = Field(default="neo4j", alias="NEO4J_USERNAME")
     neo4j_password: Optional[str] = Field(default="", alias="NEO4J_PASSWORD")
     neo4j_database: Optional[str] = Field(default="neo4j", alias="NEO4J_DATABASE")
+    neo4j_disabled: bool = Field(default=False, alias="NEO4J_DISABLED")
     
     # Security
     jwt_secret_key: str = Field(default="test-secret-key-for-development-min-32-chars", alias="JWT_SECRET_KEY")

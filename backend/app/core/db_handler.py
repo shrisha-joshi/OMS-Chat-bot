@@ -17,6 +17,7 @@ class DatabaseConnectionHandler:
         self.qdrant_available = False
         self.arango_available = False
         self.redis_available = False
+        self.neo4j_available = False
         
     async def connect_mongodb(self) -> bool:
         """Try to connect to MongoDB, return success status."""
@@ -70,6 +71,22 @@ class DatabaseConnectionHandler:
             logger.warning(f"⚠️ Redis not available: {e}")
         return False
     
+    async def connect_neo4j(self) -> bool:
+        """Try to connect to Neo4j, return success status."""
+        try:
+            if os.getenv('NEO4J_URI') and not os.getenv('NEO4J_DISABLED'):
+                from .db_neo4j import neo4j_client
+                success = await neo4j_client.connect()
+                if success:
+                    self.neo4j_available = True
+                    logger.info("✅ Neo4j connected and schema initialized")
+                    return True
+                else:
+                    logger.warning("⚠️ Neo4j connection failed")
+        except Exception as e:
+            logger.warning(f"⚠️ Neo4j not available: {e}")
+        return False
+    
     async def connect_all(self):
         """Attempt to connect to all databases."""
         logger.info("🔌 Attempting database connections...")
@@ -78,16 +95,18 @@ class DatabaseConnectionHandler:
         await self.connect_qdrant()
         await self.connect_arango()
         await self.connect_redis()
+        await self.connect_neo4j()  # Add Neo4j connection
         
         # Log summary
         connected = sum([
             self.mongodb_available,
             self.qdrant_available, 
             self.arango_available,
-            self.redis_available
+            self.redis_available,
+            self.neo4j_available
         ])
         
-        logger.info(f"📊 Database Status: {connected}/4 services connected")
+        logger.info(f"📊 Database Status: {connected}/5 services connected")
         if connected == 0:
             logger.warning("⚠️ No databases connected - running in minimal mode")
         
@@ -96,6 +115,7 @@ class DatabaseConnectionHandler:
             'qdrant': self.qdrant_available,
             'arango': self.arango_available,
             'redis': self.redis_available,
+            'neo4j': self.neo4j_available,
             'total_connected': connected
         }
 

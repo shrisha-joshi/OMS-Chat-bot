@@ -8,6 +8,7 @@ import logging
 import httpx
 import json
 import asyncio
+import re
 from typing import Dict, Any, List, Optional, AsyncGenerator
 from datetime import datetime
 import tiktoken
@@ -25,7 +26,7 @@ class LLMHandler:
         self.tokenizer = None
         self.http_client = None
         self.max_retries = 3
-        self.timeout = 120.0
+        self.timeout = 300.0  # 5 minutes for LMStudio responses
         self.provider_health = {}
         
         # Initialize tokenizer immediately
@@ -38,8 +39,8 @@ class LLMHandler:
         
         # Initialize HTTP client immediately
         try:
-            self.http_client = httpx.AsyncClient(timeout=self.timeout)
-            logger.debug("HTTP client initialized in __init__")
+            self.http_client = httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0))
+            logger.debug("HTTP client initialized in __init__ with 5-minute timeout")
         except Exception as e:
             logger.warning(f"Failed to initialize HTTP client: {e}")
             self.http_client = None
@@ -56,15 +57,16 @@ class LLMHandler:
             # Initialize tokenizer
             self.tokenizer = tiktoken.get_encoding("cl100k_base")
             
-            # Initialize HTTP client
-            self.http_client = httpx.AsyncClient(timeout=self.timeout)
+            # Initialize HTTP client with extended timeout for LMStudio
+            self.http_client = httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0))
+            logger.info(f"HTTP client initialized with 5-minute timeout")
             
             # Configure providers
             self._setup_providers()
             
-            # Test provider health
-            await self._check_provider_health()
-            
+            # SKIP health check for now - it's causing startup hangs
+            # Providers will be tested on first actual use
+            logger.info("Skipping provider health check (will test on first use)")
             logger.info(f"LLM handler initialized with {len(self.providers)} providers")
             
         except Exception as e:
@@ -97,27 +99,38 @@ class LLMHandler:
         self.providers.sort(key=lambda x: x.get("priority", 999))
     
     async def _check_provider_health(self):
-        """Check health of all providers."""
+        """Check health of all providers with aggressive timeouts."""
         logger.info("Checking provider health...")
         for provider in self.providers:
             try:
                 logger.info(f"Checking health of '{provider['name']}' at {provider['url']}/models")
-                async with httpx.AsyncClient(timeout=5.0) as client:
-                    response = await client.get(
-                        f"{provider['url']}/models",
-                        headers={"Accept": "application/json"}
-                    )
+                
+                # Use asyncio.wait_for to enforce strict timeout
+                async with httpx.AsyncClient(timeout=3.0) as client:
+                    try:
+                        # Wrap the request in wait_for for double protection
+                        response = await asyncio.wait_for(
+                            client.get(
+                                f"{provider['url']}/models",
+                                headers={"Accept": "application/json"}
+                            ),
+                            timeout=3.0  # 3 second absolute timeout
+                        )
+                        
+                        if response.status_code == 200:
+                            self.provider_health[provider["name"]] = {
+                                "healthy": True,
+                                "last_check": datetime.now().isoformat(),
+                                "response_time": response.elapsed.total_seconds()
+                            }
+                            logger.info(f"✅ Provider '{provider['name']}' is healthy (response_time: {response.elapsed.total_seconds():.3f}s)")
+                        else:
+                            self.provider_health[provider["name"]] = {"healthy": False}
+                            logger.warning(f"⚠️ Provider '{provider['name']}' returned status {response.status_code}")
                     
-                    if response.status_code == 200:
-                        self.provider_health[provider["name"]] = {
-                            "healthy": True,
-                            "last_check": datetime.now().isoformat(),
-                            "response_time": response.elapsed.total_seconds()
-                        }
-                        logger.info(f"✅ Provider '{provider['name']}' is healthy (response_time: {response.elapsed.total_seconds():.3f}s)")
-                    else:
+                    except asyncio.TimeoutError:
                         self.provider_health[provider["name"]] = {"healthy": False}
-                        logger.warning(f"⚠️ Provider '{provider['name']}' returned status {response.status_code}")
+                        logger.warning(f"⚠️ Provider '{provider['name']}' health check timed out after 3s")
                         
             except Exception as e:
                 self.provider_health[provider["name"]] = {"healthy": False}
@@ -235,6 +248,7 @@ class LLMHandler:
         """Get non-streaming response from provider. Returns response text directly."""
         try:
             url = f"{provider['url']}/chat/completions"
+            logger.info(f"🔗 Connecting to LMStudio at {url}")
             logger.debug(f"Making request to {url} with model {provider['model']}")
             
             payload = {
@@ -246,14 +260,27 @@ class LLMHandler:
                 "stream": False
             }
             
-            logger.debug(f"Request payload: model={payload['model']}, max_tokens={payload['max_tokens']}, temperature={payload['temperature']}")
+            logger.info(f"📤 Sending request to LMStudio (model={payload['model']}, max_tokens={payload['max_tokens']})")
+            logger.debug(f"Request payload: {json.dumps(payload, indent=2)[:500]}")
             
             start_time = datetime.now()
-            response = await self.http_client.post(url, json=payload)
+            
+            try:
+                response = await self.http_client.post(url, json=payload)
+            except httpx.ConnectError as e:
+                logger.error(f"❌ Connection failed to LMStudio at {url}")
+                logger.error(f"   Error: {e}")
+                logger.error(f"   Make sure LMStudio is running and accessible at {provider['url']}")
+                raise Exception(f"Cannot connect to LMStudio at {provider['url']}. Is it running?")
+            except httpx.TimeoutException as e:
+                logger.error(f"⏰ Request to LMStudio timed out after {self.timeout}s")
+                logger.error(f"   The model might be too slow or not responding")
+                raise Exception(f"LMStudio request timed out after {self.timeout}s")
+            
             end_time = datetime.now()
             latency = (end_time - start_time).total_seconds()
             
-            logger.info(f"Received response from {provider['name']} in {latency:.2f}s (status: {response.status_code})")
+            logger.info(f"📥 Received response from {provider['name']} in {latency:.2f}s (status: {response.status_code})")
             
             if response.status_code != 200:
                 logger.error(f"Provider returned error status {response.status_code}")
@@ -383,6 +410,239 @@ class LLMHandler:
         except Exception as e:
             logger.error(f"Response validation error: {e}")
             return False
+    
+    # ============================================================================
+    # Phase 4: ADAPTIVE LLM INFERENCE
+    # ============================================================================
+    
+    def get_adaptive_inference_params(self, query: str, context: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Detect query type and determine optimal LLM inference parameters.
+        
+        Args:
+            query: User query
+            context: Optional context
+            
+        Returns:
+            Dictionary with optimized temperature, top_p, and other parameters
+        """
+        try:
+            query_lower = query.lower()
+            
+            # Default adaptive params structure
+            adaptive_params = {
+                "query_type": "general",
+                "temperature": 0.7,
+                "top_p": 0.9,
+                "max_tokens": settings.max_llm_output_tokens,
+                "reasoning_level": "standard",
+                "parameter_reasoning": ""
+            }
+            
+            # Pattern 1: Factual/Definitive Queries
+            # These need low temperature for deterministic answers
+            factual_patterns = [
+                r"\b(what|when|where|who)\b.*\?",
+                r"\b(define|explain|describe|meaning)\b",
+                r"\b(list|enumerate|how many)\b",
+                r"\b(fact|truth|definition)\b"
+            ]
+            
+            for pattern in factual_patterns:
+                if re.search(pattern, query_lower):
+                    adaptive_params.update({
+                        "query_type": "factual",
+                        "temperature": 0.3,  # Low for deterministic answers
+                        "top_p": 0.85,
+                        "max_tokens": min(settings.max_llm_output_tokens, 1024),
+                        "reasoning_level": "direct",
+                        "parameter_reasoning": "Low temperature for factual accuracy"
+                    })
+                    break
+            
+            # Pattern 2: Analytical/Comparative Queries
+            # Medium temperature for balanced analysis
+            analytical_patterns = [
+                r"\b(compare|difference|contrast|versus)\b",
+                r"\b(analyze|evaluate|assess)\b",
+                r"\b(pros|cons|advantages|disadvantages)\b",
+                r"\b(better|best|vs|versus)\b"
+            ]
+            
+            for pattern in analytical_patterns:
+                if re.search(pattern, query_lower):
+                    adaptive_params.update({
+                        "query_type": "analytical",
+                        "temperature": 0.6,  # Medium for balanced perspective
+                        "top_p": 0.9,
+                        "max_tokens": min(settings.max_llm_output_tokens, 2048),
+                        "reasoning_level": "analytical",
+                        "parameter_reasoning": "Medium temperature for balanced analysis"
+                    })
+                    break
+            
+            # Pattern 3: Creative/Generative Queries
+            # Higher temperature for diverse outputs
+            creative_patterns = [
+                r"\b(create|generate|write|compose|imagine)\b",
+                r"\b(example|scenario|use case)\b",
+                r"\b(brainstorm|idea)\b",
+                r"\b(suggest|recommend)\b"
+            ]
+            
+            for pattern in creative_patterns:
+                if re.search(pattern, query_lower):
+                    adaptive_params.update({
+                        "query_type": "creative",
+                        "temperature": 0.8,  # Higher for creativity
+                        "top_p": 0.95,
+                        "max_tokens": min(settings.max_llm_output_tokens, 2048),
+                        "reasoning_level": "creative",
+                        "parameter_reasoning": "Higher temperature for creative outputs"
+                    })
+                    break
+            
+            # Pattern 4: Technical/Debug Queries
+            # Low temperature but specific reasoning
+            technical_patterns = [
+                r"\b(debug|troubleshoot|error|fix)\b",
+                r"\b(code|script|program|implement)\b",
+                r"\b(syntax|error message)\b",
+                r"\b(how to solve|solution)\b"
+            ]
+            
+            for pattern in technical_patterns:
+                if re.search(pattern, query_lower):
+                    adaptive_params.update({
+                        "query_type": "technical",
+                        "temperature": 0.4,  # Low for technical accuracy
+                        "top_p": 0.85,
+                        "max_tokens": min(settings.max_llm_output_tokens, 2048),
+                        "reasoning_level": "step_by_step",
+                        "parameter_reasoning": "Low temperature for technical precision, step-by-step reasoning"
+                    })
+                    break
+            
+            # Pattern 5: Procedural/How-To Queries
+            # Structured reasoning
+            procedural_patterns = [
+                r"\b(how to|steps|process|procedure)\b",
+                r"\b(guide|tutorial|manual)\b",
+                r"\b(step by step)\b"
+            ]
+            
+            for pattern in procedural_patterns:
+                if re.search(pattern, query_lower):
+                    adaptive_params.update({
+                        "query_type": "procedural",
+                        "temperature": 0.5,
+                        "top_p": 0.9,
+                        "max_tokens": min(settings.max_llm_output_tokens, 2048),
+                        "reasoning_level": "structured",
+                        "parameter_reasoning": "Medium temperature with structured output for procedures"
+                    })
+                    break
+            
+            # Pattern 6: Opinion/Discussion Queries
+            # Higher temperature for discussion
+            opinion_patterns = [
+                r"\b(opinion|think|believe|discuss)\b",
+                r"\b(what do you|your thoughts)\b",
+                r"\b(why|possible reasons)\b"
+            ]
+            
+            for pattern in opinion_patterns:
+                if re.search(pattern, query_lower):
+                    adaptive_params.update({
+                        "query_type": "discussion",
+                        "temperature": 0.7,
+                        "top_p": 0.9,
+                        "max_tokens": min(settings.max_llm_output_tokens, 2048),
+                        "reasoning_level": "exploratory",
+                        "parameter_reasoning": "Balanced temperature for discussion"
+                    })
+                    break
+            
+            # Adjust based on query length
+            query_tokens = self.count_tokens(query)
+            if query_tokens > 200:
+                adaptive_params["temperature"] = max(0.3, adaptive_params["temperature"] - 0.1)
+                adaptive_params["max_tokens"] = min(adaptive_params["max_tokens"], 1024)
+            
+            logger.info(f"Adaptive params - Type: {adaptive_params['query_type']}, "
+                       f"Temp: {adaptive_params['temperature']}, Top-p: {adaptive_params['top_p']}")
+            
+            return adaptive_params
+            
+        except Exception as e:
+            logger.warning(f"Adaptive parameter detection failed: {e}")
+            return {
+                "query_type": "general",
+                "temperature": 0.7,
+                "top_p": 0.9,
+                "max_tokens": settings.max_llm_output_tokens,
+                "reasoning_level": "standard",
+                "parameter_reasoning": "Default parameters (error in detection)"
+            }
+    
+    async def generate_response_adaptive(
+        self,
+        prompt: str,
+        query: str,
+        system_prompt: Optional[str] = None,
+        stream: bool = False
+    ) -> Dict[str, Any]:
+        """
+        Generate response with adaptive parameters based on query type.
+        
+        Args:
+            prompt: The LLM prompt
+            query: Original user query (for type detection)
+            system_prompt: Optional system context
+            stream: Whether to stream response
+            
+        Returns:
+            Response dict with adaptive parameters applied
+        """
+        try:
+            # Step 1: Detect query type and get adaptive params
+            adaptive_params = self.get_adaptive_inference_params(query, system_prompt)
+            
+            logger.info(f"🎯 Using adaptive parameters:")
+            logger.info(f"  Type: {adaptive_params['query_type']}")
+            logger.info(f"  Temperature: {adaptive_params['temperature']}")
+            logger.info(f"  Top-P: {adaptive_params['top_p']}")
+            logger.info(f"  Reasoning: {adaptive_params['reasoning_level']}")
+            
+            # Step 2: Generate response with adaptive params
+            response = await self.generate_response(
+                prompt=prompt,
+                system_prompt=system_prompt,
+                temperature=adaptive_params["temperature"],
+                top_p=adaptive_params["top_p"],
+                max_tokens=adaptive_params["max_tokens"],
+                stream=stream
+            )
+            
+            # Step 3: Add adaptive metadata to response
+            if isinstance(response, dict):
+                response["adaptive_metadata"] = {
+                    "query_type": adaptive_params["query_type"],
+                    "temperature_applied": adaptive_params["temperature"],
+                    "reasoning_level": adaptive_params["reasoning_level"],
+                    "parameter_reasoning": adaptive_params["parameter_reasoning"]
+                }
+            
+            return response
+            
+        except Exception as e:
+            logger.warning(f"Adaptive response generation failed, falling back to default: {e}")
+            return await self.generate_response(
+                prompt=prompt,
+                system_prompt=system_prompt,
+                temperature=0.7,
+                top_p=0.9
+            )
     
     async def close(self):
         """Close HTTP client."""

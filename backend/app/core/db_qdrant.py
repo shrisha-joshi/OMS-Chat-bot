@@ -119,9 +119,11 @@ class QdrantDBClient:
             points = []
             for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
                 chunk_id = f"{doc_id}_chunk_{i}"
+                # Generate UUID for Qdrant point ID (required format)
+                point_uuid = str(uuid.uuid4())
                 
                 point = PointStruct(
-                    id=chunk_id,
+                    id=point_uuid,
                     vector=embedding,
                     payload={
                         "doc_id": doc_id,

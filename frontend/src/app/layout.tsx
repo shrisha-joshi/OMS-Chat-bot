@@ -8,7 +8,11 @@ const inter = Inter({ subsets: ['latin'] })
 export const metadata = {
   title: 'OMS Chatbot - RAG + Knowledge Graph Assistant',
   description: 'Intelligent chatbot with retrieval-augmented generation and knowledge graph capabilities',
-  viewport: 'width=device-width, initial-scale=1',
+}
+
+export const viewport = {
+  width: 'device-width',
+  initialScale: 1,
   themeColor: '#3b82f6'
 }
 

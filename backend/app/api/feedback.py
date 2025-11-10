@@ -9,6 +9,7 @@ from typing import Optional, Dict, Any, List
 from pydantic import BaseModel, Field
 from datetime import datetime
 import logging
+from bson import ObjectId
 
 from ..core.db_mongo import get_mongodb_client, MongoDBClient
 from ..core.cache_redis import get_redis_client, RedisClient
@@ -466,6 +467,403 @@ async def get_feedback_trends(
     except Exception as e:
         logger.error(f"Failed to get feedback trends: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve feedback trends")
+
+# ============================================================================
+# Phase 5: ADVANCED FEEDBACK SYSTEM FOR CONTINUOUS IMPROVEMENT
+# ============================================================================
+
+@router.post("/submit-advanced")
+async def submit_advanced_feedback(
+    session_id: str,
+    query: str,
+    response: str,
+    rating: int,
+    feedback_type: str = "general",
+    comment: Optional[str] = None,
+    source_documents: Optional[List[str]] = None,
+    mongo_client: MongoDBClient = Depends(get_mongodb_client)
+) -> Dict[str, Any]:
+    """
+    Advanced feedback submission for ML-driven improvements.
+    
+    Args:
+        session_id: Session ID
+        query: Original query
+        response: System response
+        rating: Rating 1-5
+        feedback_type: Type of feedback (helpful, incorrect, incomplete, misleading)
+        comment: Optional detailed comment
+        source_documents: Optional list of source document IDs
+        mongo_client: MongoDB client
+        
+    Returns:
+        Feedback submission confirmation
+    """
+    try:
+        if not 1 <= rating <= 5:
+            raise HTTPException(status_code=400, detail="Rating must be between 1 and 5")
+        
+        # Store advanced feedback
+        feedback_doc = {
+            "session_id": session_id,
+            "query": query,
+            "response": response[:500],  # Store truncated
+            "rating": rating,
+            "feedback_type": feedback_type,
+            "comment": comment,
+            "source_documents": source_documents or [],
+            "created_at": datetime.utcnow(),
+            "processed": False,
+            "training_data_generated": False,
+            "phase": "phase_5_advanced"
+        }
+        
+        result = await mongo_client.database.feedback_submissions.insert_one(feedback_doc)
+        feedback_id = str(result.inserted_id)
+        
+        logger.info(f"✅ Advanced feedback submitted: {feedback_id} (rating: {rating}/5, type: {feedback_type})")
+        
+        # Log low ratings for priority processing
+        if rating <= 2:
+            logger.warning(f"⚠️  Critical feedback: {feedback_type} - {comment or 'No comment'}")
+        
+        return {
+            "success": True,
+            "feedback_id": feedback_id,
+            "rating": rating,
+            "feedback_type": feedback_type,
+            "message": "Advanced feedback recorded for system improvement"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to submit advanced feedback: {e}")
+        raise HTTPException(status_code=500, detail="Failed to submit feedback")
+
+
+@router.get("/analytics-advanced")
+async def get_advanced_analytics(
+    time_period: str = "7d",
+    mongo_client: MongoDBClient = Depends(get_mongodb_client)
+) -> Dict[str, Any]:
+    """
+    Get comprehensive feedback analytics for system improvement.
+    
+    Args:
+        time_period: "1d", "7d", "30d", or "all"
+        mongo_client: MongoDB client
+        
+    Returns:
+        Detailed analytics and insights
+    """
+    try:
+        from datetime import timedelta
+        
+        # Time range calculation
+        time_ranges = {
+            "1d": timedelta(days=1),
+            "7d": timedelta(days=7),
+            "30d": timedelta(days=30),
+            "all": None
+        }
+        
+        time_delta = time_ranges.get(time_period, timedelta(days=7))
+        query = {}
+        
+        if time_delta:
+            cutoff_date = datetime.utcnow() - time_delta
+            query["created_at"] = {"$gte": cutoff_date}
+        
+        # Get all feedback
+        feedback_entries = await mongo_client.database.feedback_submissions.find(query).to_list(None)
+        total_feedback = len(feedback_entries)
+        
+        if total_feedback == 0:
+            return {
+                "total_feedback": 0,
+                "message": "No feedback data available for period",
+                "period": time_period
+            }
+        
+        # Calculate comprehensive metrics
+        ratings = [f.get("rating", 3) for f in feedback_entries if "rating" in f]
+        avg_rating = sum(ratings) / len(ratings) if ratings else 3.0
+        
+        # Rating distribution
+        rating_dist = {1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
+        for rating in ratings:
+            if 1 <= rating <= 5:
+                rating_dist[rating] += 1
+        
+        # Feedback type distribution
+        feedback_types = {}
+        for entry in feedback_entries:
+            ftype = entry.get("feedback_type", "general")
+            feedback_types[ftype] = feedback_types.get(ftype, 0) + 1
+        
+        # Issue analysis for low ratings
+        issues = {}
+        low_rating_entries = [f for f in feedback_entries if f.get("rating", 5) <= 2]
+        
+        for entry in low_rating_entries:
+            issue = entry.get("feedback_type", "other")
+            issues[issue] = issues.get(issue, 0) + 1
+        
+        top_issues = sorted(issues.items(), key=lambda x: x[1], reverse=True)[:5]
+        
+        # Generate insights
+        insights = []
+        
+        if avg_rating < 2.5:
+            insights.append({
+                "severity": "critical",
+                "message": "System quality critically low",
+                "recommendation": "Immediate model retraining required"
+            })
+        elif avg_rating < 3.0:
+            insights.append({
+                "severity": "warning",
+                "message": "System quality below acceptable threshold",
+                "recommendation": "Focus on accuracy improvements"
+            })
+        
+        low_rating_pct = (len(low_rating_entries) / total_feedback * 100) if total_feedback > 0 else 0
+        if low_rating_pct > 20:
+            insights.append({
+                "severity": "warning",
+                "message": f"{low_rating_pct:.1f}% of responses rated poorly",
+                "recommendation": "Investigate and improve retrieval and generation"
+            })
+        
+        # Quality metrics
+        quality_metrics = {
+            "accuracy": (rating_dist[5] / total_feedback * 100) if total_feedback > 0 else 0,
+            "acceptability": ((rating_dist[4] + rating_dist[5]) / total_feedback * 100) if total_feedback > 0 else 0,
+            "poor_quality": ((rating_dist[1] + rating_dist[2]) / total_feedback * 100) if total_feedback > 0 else 0
+        }
+        
+        logger.info(f"✅ Analytics generated: {total_feedback} entries, avg {avg_rating:.2f}/5")
+        
+        return {
+            "period": time_period,
+            "total_feedback": total_feedback,
+            "average_rating": round(avg_rating, 2),
+            "rating_distribution": rating_dist,
+            "feedback_type_distribution": feedback_types,
+            "top_issues": [{"issue": issue, "count": count} for issue, count in top_issues],
+            "quality_metrics": quality_metrics,
+            "insights": insights,
+            "actionable_recommendations": [
+                "Review low-rated responses for patterns",
+                "Analyze feedback comments for improvement areas",
+                "Consider retraining models with collected data",
+                "Improve document retrieval quality",
+                "Enhance response validation"
+            ]
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to get advanced analytics: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve analytics")
+
+
+@router.post("/generate-training-data")
+async def generate_training_data_from_feedback(
+    min_rating: int = 4,
+    mongo_client: MongoDBClient = Depends(get_mongodb_client),
+    redis_client: RedisClient = Depends(get_redis_client)
+) -> Dict[str, Any]:
+    """
+    Generate training data from high-quality feedback for model improvement.
+    
+    Args:
+        min_rating: Minimum rating for positive examples (default: 4)
+        mongo_client: MongoDB client
+        redis_client: Redis client
+        
+    Returns:
+        Training data generation status
+    """
+    try:
+        # Get high-quality feedback
+        high_quality = await mongo_client.database.feedback_submissions.find({
+            "rating": {"$gte": min_rating},
+            "training_data_generated": False
+        }).to_list(None)
+        
+        # Get low-quality feedback for negative examples
+        low_quality = await mongo_client.database.feedback_submissions.find({
+            "rating": {"$lt": 3},
+            "training_data_generated": False
+        }).to_list(None)
+        
+        training_data = []
+        
+        # Positive examples
+        for entry in high_quality:
+            training_data.append({
+                "query": entry.get("query"),
+                "response": entry.get("response"),
+                "label": "positive",
+                "rating": entry.get("rating"),
+                "feedback_type": entry.get("feedback_type"),
+                "source_id": str(entry.get("_id"))
+            })
+        
+        # Negative examples
+        for entry in low_quality:
+            training_data.append({
+                "query": entry.get("query"),
+                "response": entry.get("response"),
+                "label": "negative",
+                "rating": entry.get("rating"),
+                "feedback_type": entry.get("feedback_type"),
+                "source_id": str(entry.get("_id"))
+            })
+        
+        # Store in Redis
+        if training_data:
+            await redis_client.set_json(
+                "training_data:phase5:generated",
+                {
+                    "entries": training_data,
+                    "generated_at": datetime.utcnow().isoformat(),
+                    "total_count": len(training_data),
+                    "positive_count": len(high_quality),
+                    "negative_count": len(low_quality),
+                    "ready_for_retraining": True
+                },
+                expire_seconds=604800  # 7 days
+            )
+            
+            # Mark as processed
+            processed_ids = [entry["source_id"] for entry in training_data]
+            await mongo_client.database.feedback_submissions.update_many(
+                {"_id": {"$in": [ObjectId(id) for id in processed_ids]}},
+                {"$set": {"training_data_generated": True}}
+            )
+            
+            logger.info(f"✅ Training data generated: {len(training_data)} samples "
+                       f"({len(high_quality)} positive, {len(low_quality)} negative)")
+        
+        return {
+            "success": True,
+            "training_samples": len(training_data),
+            "positive_examples": len(high_quality),
+            "negative_examples": len(low_quality),
+            "status": "ready_for_retraining" if training_data else "no_new_data",
+            "message": "Training data ready for model improvement"
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to generate training data: {e}")
+        raise HTTPException(status_code=500, detail="Failed to generate training data")
+
+
+@router.get("/system-insights")
+async def get_system_insights_from_feedback(
+    mongo_client: MongoDBClient = Depends(get_mongodb_client)
+) -> Dict[str, Any]:
+    """
+    Get high-level system insights from all feedback.
+    
+    Args:
+        mongo_client: MongoDB client
+        
+    Returns:
+        System-level insights and recommendations
+    """
+    try:
+        total_entries = await mongo_client.database.feedback_submissions.count_documents({})
+        
+        if total_entries == 0:
+            return {
+                "total_feedback": 0,
+                "status": "no_data",
+                "message": "No feedback collected yet"
+            }
+        
+        all_feedback = await mongo_client.database.feedback_submissions.find({}).to_list(None)
+        ratings = [f.get("rating", 3) for f in all_feedback if "rating" in f]
+        
+        avg_rating = sum(ratings) / len(ratings) if ratings else 3.0
+        
+        # Rating distribution
+        excellent = sum(1 for r in ratings if r >= 4)
+        acceptable = sum(1 for r in ratings if r == 3)
+        poor = sum(1 for r in ratings if r <= 2)
+        
+        # Issues breakdown
+        issues_map = {}
+        for entry in all_feedback:
+            if entry.get("rating", 5) <= 2:
+                issue = entry.get("feedback_type", "other")
+                issues_map[issue] = issues_map.get(issue, 0) + 1
+        
+        # System health status
+        if avg_rating >= 4.0:
+            health_status = "excellent"
+            priority = "monitor"
+        elif avg_rating >= 3.5:
+            health_status = "good"
+            priority = "maintain"
+        elif avg_rating >= 3.0:
+            health_status = "acceptable"
+            priority = "improve"
+        else:
+            health_status = "poor"
+            priority = "critical"
+        
+        # Generate actionable insights
+        recommendations = []
+        
+        if health_status == "poor":
+            recommendations.append("🚨 CRITICAL: System requires immediate attention")
+            recommendations.append("   Action: Review and retrain models with collected feedback data")
+        
+        if (poor / total_entries * 100) > 25:
+            recommendations.append(f"⚠️  {(poor / total_entries * 100):.1f}% of responses rated poorly")
+            recommendations.append("   Action: Investigate retrieval and generation quality")
+        
+        if issues_map.get("incorrect", 0) > total_entries * 0.2:
+            recommendations.append(f"⚠️  High incorrect response rate ({issues_map.get('incorrect', 0)} cases)")
+            recommendations.append("   Action: Verify source documents and improve accuracy")
+        
+        if issues_map.get("incomplete", 0) > total_entries * 0.3:
+            recommendations.append(f"⚠️  Many incomplete responses ({issues_map.get('incomplete', 0)} cases)")
+            recommendations.append("   Action: Improve context retrieval and response length")
+        
+        logger.info(f"✅ System insights: {total_entries} feedback entries, health={health_status}, priority={priority}")
+        
+        return {
+            "feedback_summary": {
+                "total_feedback": total_entries,
+                "average_rating": round(avg_rating, 2),
+                "rating_breakdown": {
+                    "excellent_4_5": excellent,
+                    "acceptable_3": acceptable,
+                    "poor_1_2": poor
+                }
+            },
+            "system_health": {
+                "status": health_status,
+                "priority": priority,
+                "confidence": round(min(excellent / total_entries, 1.0), 2) if total_entries > 0 else 0
+            },
+            "issues_detected": dict(sorted(issues_map.items(), key=lambda x: x[1], reverse=True)[:5]),
+            "recommendations": recommendations,
+            "next_actions": {
+                "immediate": "Review feedback for patterns",
+                "short_term": "Generate and apply training data",
+                "medium_term": "Retrain models with feedback",
+                "long_term": "Implement continuous improvement loop"
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to get system insights: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve insights")
 
 # Utility functions
 
