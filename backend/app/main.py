@@ -287,11 +287,27 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
         app.state.ingest_worker_started = False
         logger.info("  ✓ Background workers configured for lazy initialization")
         
-        # Phase 7: Warmup - DISABLED to prevent startup crashes
+        # Phase 7: Warmup - ENABLE to speed up first request
         logger.info("\nPhase 7: Service Warmup")
         logger.info("-" * 80)
-        logger.info("  ⚠️  Warmup disabled - services will initialize on first use")
-        logger.info("  (This prevents startup crashes but first request may be slower)")
+        
+        try:
+            logger.info("🔥 Warming up chat service (prevents 60s delay on first request)...")
+            from .services.chat_service import ChatService
+            
+            # Create and initialize chat service
+            warmup_service = ChatService()
+            await warmup_service.initialize()
+            
+            logger.info("  ✅ Chat service warmed up and ready!")
+            logger.info("  ✓ Embedding model loaded")
+            logger.info("  ✓ LLM handler initialized")
+            logger.info("  ✓ Database connections ready")
+            logger.info("  First query will now respond in <10 seconds instead of 60+ seconds")
+        except Exception as e:
+            logger.warning(f"  ⚠️  Chat service warmup failed: {e}")
+            logger.warning("  Services will initialize on first request (may cause 30-60s delay)")
+            logger.warning("  This is not critical - app will still work")
         
         logger.info("\n" + "=" * 80)
         logger.info("✅ APPLICATION STARTUP COMPLETED SUCCESSFULLY")

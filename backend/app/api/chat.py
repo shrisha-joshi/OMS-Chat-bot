@@ -25,6 +25,53 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+# Simple test endpoint to verify LMStudio connectivity
+@router.post("/test-llm")
+async def test_llm_direct(request: dict):
+    """
+    Direct LLM test endpoint - bypasses entire RAG pipeline.
+    Use this to verify LMStudio is working without database/embedding dependencies.
+    
+    Test with: POST /chat/test-llm {"query": "Say hello"}
+    """
+    try:
+        logger.info("=" * 80)
+        logger.info("🧪 DIRECT LLM TEST (bypassing RAG pipeline)")
+        logger.info("=" * 80)
+        logger.info(f"Query: {request.get('query', 'NO QUERY')}")
+        
+        from ..services.llm_handler import LLMHandler
+        
+        llm = LLMHandler()
+        logger.info("Initializing LLM handler...")
+        await llm.initialize()
+        logger.info("✅ LLM handler initialized")
+        
+        logger.info("Generating response...")
+        response = await llm.generate_response(
+            prompt=request.get("query", "Say hello"),
+            max_tokens=100,
+            temperature=0.7
+        )
+        
+        logger.info(f"✅ Response received: {len(response)} characters")
+        logger.info("=" * 80)
+        
+        return {
+            "response": response,
+            "status": "success",
+            "message": "Direct LLM test successful - LMStudio is working!"
+        }
+    except Exception as e:
+        logger.error(f"❌ Direct LLM test failed: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return {
+            "response": "",
+            "status": "error",
+            "message": str(e)
+        }
+
 # Pydantic models
 class ChatMessage(BaseModel):
     role: str  # "user" or "assistant"
@@ -92,20 +139,31 @@ async def chat_query(
     try:
         start_time = time.time()
         
+        # DEBUG: Log incoming request
+        logger.info("=" * 80)
+        logger.info("📥 INCOMING CHAT REQUEST")
+        logger.info("=" * 80)
+        logger.info(f"Query: {request.query[:200]}")
+        logger.info(f"Session ID: {request.session_id}")
+        logger.info(f"Stream: {request.stream}")
+        logger.info(f"Context messages: {len(request.context) if request.context else 0}")
+        logger.info("=" * 80)
+        
         # Generate session ID if not provided
         if not request.session_id:
             request.session_id = _generate_session_id()
+            logger.info(f"Generated new session ID: {request.session_id}")
         
         # Check cache for recent identical queries
         query_hash = hashlib.md5(f"{request.query}:{request.session_id}".encode()).hexdigest()
         cached_response = await redis_client.get_cached_query_result(query_hash)
         
         if cached_response and not request.stream:
-            logger.info(f"Returning cached response for query: {request.query[:50]}...")
+            logger.info(f"✅ Returning cached response for query: {request.query[:50]}...")
             return ChatResponse(**cached_response)
         
         # Process the query
-        logger.info(f"Processing chat query: {request.query[:100]}...")
+        logger.info(f"🔄 Processing chat query: {request.query[:100]}...")
         
         result = await service.process_query(
             query=request.query,
@@ -229,12 +287,29 @@ async def chat_query(
             len(result["sources"])
         )
         
-        logger.info(f"Chat query processed in {processing_time:.2f}s")
+        logger.info("=" * 80)
+        logger.info("📤 SENDING RESPONSE TO FRONTEND")
+        logger.info("=" * 80)
+        logger.info(f"Response length: {len(response.response)} characters")
+        logger.info(f"Sources: {len(response.sources)}")
+        logger.info(f"Attachments: {len(response.attachments)}")
+        logger.info(f"Tokens generated: {response.tokens_generated}")
+        logger.info(f"Processing time: {processing_time:.2f}s")
+        logger.info(f"Response preview: {response.response[:200]}...")
+        logger.info("=" * 80)
+        
         return response
         
     except Exception as e:
-        logger.error(f"Chat query failed: {e}")
-        raise HTTPException(status_code=500, detail="Failed to process chat query")
+        logger.error("=" * 80)
+        logger.error("❌ CHAT QUERY FAILED")
+        logger.error("=" * 80)
+        logger.error(f"Error: {e}")
+        logger.error(f"Error type: {type(e).__name__}")
+        import traceback
+        logger.error(f"Traceback:\n{traceback.format_exc()}")
+        logger.error("=" * 80)
+        raise HTTPException(status_code=500, detail=f"Failed to process chat query: {str(e)}")
 
 @router.websocket("/ws")
 async def websocket_chat(websocket: WebSocket):
