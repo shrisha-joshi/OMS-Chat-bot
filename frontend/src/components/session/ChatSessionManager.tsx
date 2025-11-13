@@ -161,7 +161,7 @@ export function ChatSessionManager({ className = '' }: ChatSessionManagerProps) 
                             onChange={(e) => setEditTitle(e.target.value)}
                             className="flex-1 text-sm font-medium border border-gray-300 rounded px-2 py-1"
                             autoFocus
-                            onKeyPress={(e) => e.key === 'Enter' && handleSaveEdit()}
+                            onKeyDown={(e) => e.key === 'Enter' && handleSaveEdit()}
                             onBlur={handleSaveEdit}
                           />
                         </div>

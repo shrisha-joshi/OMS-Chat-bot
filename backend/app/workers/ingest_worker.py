@@ -7,7 +7,7 @@ including parsing, chunking, embedding, and indexing operations.
 import asyncio
 import logging
 from typing import Dict, Any
-from datetime import datetime
+from datetime import datetime, timezone
 import hashlib
 
 from ..core.db_mongo import get_mongodb_client, MongoDBClient
@@ -16,6 +16,12 @@ from ..core.db_arango import get_arango_client, ArangoDBClient
 from ..core.cache_redis import get_redis_client, RedisClient
 from ..services.ingest_service import IngestService
 from ..config import settings
+
+
+# Custom Exceptions
+class DocumentProcessingError(Exception):
+    """Raised when document processing fails."""
+    pass
 
 logger = logging.getLogger(__name__)
 
@@ -56,41 +62,41 @@ class IngestWorker:
         try:
             while self.is_running:
                 try:
-                    # Wait for ingestion tasks with timeout to check is_running flag
-                    try:
-                        doc_id = await asyncio.wait_for(
-                            ingestion_queue.get(), 
-                            timeout=1.0
-                        )
-                        
-                        # Lazy initialize on first document
-                        if not self._initialized:
-                            logger.info("Lazy-initializing IngestService on first document...")
-                            await self.initialize()
-                        
-                        logger.info(f"Processing document: {doc_id}")
-                        await self._process_document(doc_id)
-                        
-                        # Mark task as done
-                        ingestion_queue.task_done()
-                        
-                    except asyncio.TimeoutError:
-                        # No tasks available, check flag and continue loop
-                        if not self.is_running:
-                            logger.info("Ingest worker is_running flag is False, breaking loop")
-                            break
-                        continue
-                        
+                    # Wait for ingestion tasks with timeout
+                    doc_id = await asyncio.wait_for(
+                        ingestion_queue.get(), 
+                        timeout=1.0
+                    )
+                    
+                    # Lazy initialize on first document
+                    if not self._initialized:
+                        logger.info("Lazy-initializing IngestService on first document...")
+                        await self.initialize()
+                    
+                    logger.info(f"Processing document: {doc_id}")
+                    await self._process_document(doc_id)
+                    
+                    # Mark task as done
+                    ingestion_queue.task_done()
+                    
+                except asyncio.TimeoutError:
+                    # No tasks available, check flag and continue
+                    if not self.is_running:
+                        logger.info("Ingest worker is_running flag is False, breaking loop")
+                        break
+                    continue
+                    
                 except asyncio.CancelledError:
-                    logger.info("Ingest worker received cancellation signal in task processing")
-                    raise
+                    logger.info("Ingest worker received cancellation signal")
+                    raise  # Re-raise to propagate cancellation
+                    
                 except Exception as e:
                     logger.error(f"Worker error during document processing: {e}", exc_info=True)
                     await asyncio.sleep(1)
                     
         except asyncio.CancelledError:
             logger.info("Ingest worker loop was cancelled")
-            self.is_running = False
+            raise  # Re-raise to propagate cancellation
         except Exception as e:
             logger.error(f"Fatal error in ingest worker loop: {e}", exc_info=True)
             self.is_running = False
@@ -98,7 +104,7 @@ class IngestWorker:
         finally:
             logger.info("Ingest worker loop exited successfully")
     
-    async def stop(self):
+    def stop(self):
         """Stop the background worker."""
         self.is_running = False
         logger.info(f"Ingest worker stopped. Processed: {self.processed_count}, Failed: {self.failed_count}")
@@ -110,7 +116,7 @@ class IngestWorker:
         Args:
             doc_id: Document ID to process
         """
-        start_time = datetime.utcnow()
+        start_time = datetime.now(timezone.utc)
         
         try:
             # Get MongoDB client
@@ -139,7 +145,7 @@ class IngestWorker:
                 )
                 
                 # Publish completion update
-                processing_time = (datetime.utcnow() - start_time).total_seconds()
+                processing_time = (datetime.now(timezone.utc) - start_time).total_seconds()
                 await redis_client.publish_ingestion_update(
                     doc_id, "COMPLETED", 
                     f"Document processed successfully in {processing_time:.2f}s",
@@ -149,7 +155,7 @@ class IngestWorker:
                 self.processed_count += 1
                 logger.info(f"Document {doc_id} processed successfully")
             else:
-                raise Exception("Document processing failed")
+                raise DocumentProcessingError("Document processing failed")
                 
         except Exception as e:
             # Update status to failed
@@ -196,7 +202,7 @@ async def enqueue_document(doc_id: str):
         logger.error(f"Failed to enqueue document {doc_id}: {e}")
 
 
-async def get_queue_status() -> Dict[str, Any]:
+def get_queue_status() -> Dict[str, Any]:
     """Get current queue status."""
     return {
         "queue_size": ingestion_queue.qsize(),
@@ -219,7 +225,7 @@ async def start_ingest_worker():
         logger.info("Ingest worker startup: worker.start() returned normally")
     except asyncio.CancelledError:
         logger.info("Ingest worker task was cancelled by system")
-        await worker.stop()
+        raise  # Re-raise to propagate cancellation
     except Exception as e:
         logger.error(f"Ingest worker failed during startup: {e}", exc_info=True)
         await worker.stop()
@@ -232,7 +238,7 @@ async def stop_ingest_worker():
 
 # Utility functions for queue management
 
-async def clear_queue():
+def clear_queue():
     """Clear all items from the ingestion queue."""
     try:
         count = 0

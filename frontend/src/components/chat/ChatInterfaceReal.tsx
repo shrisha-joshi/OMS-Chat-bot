@@ -1,7 +1,7 @@
 'use client'
 
 import React, { useState, useRef, useEffect, useCallback } from 'react'
-import { Send, Paperclip, Loader, AlertCircle, CheckCircle, Copy, Download } from 'lucide-react'
+import { Send, Paperclip, Loader } from 'lucide-react'
 import toast from 'react-hot-toast'
 
 interface Message {
@@ -46,7 +46,7 @@ interface ChatInterfaceProps {
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE || 'http://localhost:8000'
 
-export function ChatInterfaceReal({ sessionId: propSessionId }: ChatInterfaceProps) {
+export function ChatInterfaceReal({ sessionId: propSessionId }: Readonly<ChatInterfaceProps>) {
   const [messages, setMessages] = useState<Message[]>([])
   const [input, setInput] = useState('')
   const [isLoading, setIsLoading] = useState(false)
@@ -179,7 +179,7 @@ export function ChatInterfaceReal({ sessionId: propSessionId }: ChatInterfacePro
   }, [input, sessionId])
 
   // Handle key press
-  const handleKeyPress = (e: React.KeyboardEvent) => {
+  const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault()
       handleSendMessage()
@@ -196,7 +196,7 @@ export function ChatInterfaceReal({ sessionId: propSessionId }: ChatInterfacePro
               <iframe
                 src={`https://www.youtube.com/embed/${attachment.videoId}?modestbranding=1&rel=0`}
                 title={attachment.title || 'YouTube Video'}
-                frameBorder="0"
+                style={{ border: 0 }}
                 allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
                 allowFullScreen
                 className="absolute inset-0 w-full h-full"
@@ -378,7 +378,7 @@ export function ChatInterfaceReal({ sessionId: propSessionId }: ChatInterfacePro
                       <div className="space-y-1">
                         {message.sources.map((source, idx) => (
                           <div
-                            key={idx}
+                            key={`${message.id}-source-${idx}`}
                             className={`text-xs p-2 rounded ${
                               message.role === 'user'
                                 ? 'bg-blue-500 bg-opacity-50'
@@ -414,7 +414,7 @@ export function ChatInterfaceReal({ sessionId: propSessionId }: ChatInterfacePro
                   )}
 
                   {/* Metadata */}
-                  {message.processing_time && (
+                  {Boolean(message.processing_time) && (
                     <div className={`text-xs mt-2 ${message.role === 'user' ? 'text-blue-100' : 'text-gray-500'}`}>
                       ⏱️ {message.processing_time.toFixed(2)}s | 🔢 {message.tokens_generated} tokens
                     </div>
@@ -447,7 +447,7 @@ export function ChatInterfaceReal({ sessionId: propSessionId }: ChatInterfacePro
               <textarea
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
-                onKeyPress={handleKeyPress}
+                onKeyDown={handleKeyDown}
                 placeholder="Ask me anything about your documents..."
                 className="flex-1 p-3 border border-gray-300 rounded-lg resize-none focus:outline-none focus:ring-2 focus:ring-blue-500"
                 rows={1}

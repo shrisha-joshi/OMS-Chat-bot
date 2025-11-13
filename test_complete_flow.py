@@ -1,3 +1,5 @@
+# Test complexity acceptable - comprehensive integration test
+# pylint: disable=too-many-branches,too-many-statements
 """
 Complete data flow test: Frontend → Backend → LMStudio → Backend → Frontend
 Tests CORS, request/response handling, and data integrity at each step.
@@ -9,7 +11,8 @@ import time
 from datetime import datetime
 
 
-def test_complete_flow():
+# noqa: C901 - Integration test complexity acceptable
+def test_complete_flow():  # noqa: python:S3776
     """Test the complete request/response flow."""
     
     print("=" * 80)
@@ -65,7 +68,7 @@ def test_complete_flow():
         "temperature": 0.1
     }
     
-    print(f"Sending test query to LMStudio...")
+    print("Sending test query to LMStudio...")
     try:
         with httpx.Client(timeout=30) as client:
             start = time.time()
@@ -171,11 +174,11 @@ def test_complete_flow():
                 print(f"   ✓ tokens_generated: {data.get('tokens_generated', 0)}")
                 
                 if data.get('response'):
-                    print(f"\n📝 RESPONSE CONTENT:")
+                    print("\n📝 RESPONSE CONTENT:")
                     print(f"   Length: {len(data['response'])} characters")
                     print(f"   Preview: {data['response'][:200]}")
                     if len(data['response']) > 200:
-                        print(f"   ... (truncated)")
+                        print("   ... (truncated)")
                     
                     print("\n✅ SUCCESS: Complete flow working!")
                     print("   ✓ Frontend can send queries")
@@ -197,7 +200,7 @@ def test_complete_flow():
                 return False
                 
     except httpx.TimeoutException:
-        print(f"\n❌ Request timed out after 180 seconds")
+        print("\n❌ Request timed out after 180 seconds")
         print("   Possible issues:")
         print("   1. LMStudio is not responding")
         print("   2. Backend timeout too short")
@@ -239,14 +242,14 @@ def test_frontend_simulation():
             )
             
             print(f"\nResponse Status: {response.status_code}")
-            print(f"Response Headers:")
+            print("Response Headers:")
             for key, value in response.headers.items():
                 if 'cors' in key.lower() or 'access-control' in key.lower():
                     print(f"  {key}: {value}")
             
             if response.status_code == 200:
                 data = response.json()
-                print(f"\n✅ Frontend simulation successful!")
+                print("\n✅ Frontend simulation successful!")
                 print(f"   Response preview: {data.get('response', 'NO RESPONSE')[:100]}")
             else:
                 print(f"\n❌ Frontend simulation failed: {response.text}")

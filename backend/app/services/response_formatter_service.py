@@ -4,6 +4,7 @@ Formats responses with media embeds, citations, and proper markdown.
 """
 
 import logging
+import asyncio
 import re
 from typing import Dict, Any, List, Optional, Tuple
 from dataclasses import dataclass
@@ -25,15 +26,14 @@ class ResponseFormatterService:
     
     def __init__(self):
         self.youtube_regex = r'(?:youtube\.com\/(?:[^\/\n\s]+\/\S+\/|(?:v|e(?:mbed)?)\/|\S*?[?&]v=)|youtu\.be\/)([a-zA-Z0-9_-]{11})'
-        self.image_extensions = ['.jpg', '.jpeg', '.png', '.gif', '.webp']
-        self.pdf_extensions = ['.pdf']
+        self.image_extensions = ['.jpg', '.jpeg', '.png', '.gi', '.webp']
+        self.pdf_extensions = ['.pd']
         self.link_regex = r'https?://[^\s\)"\]]+|www\.[^\s\)"\]]+'
     
     async def format_response(
         self,
         response_text: str,
         sources: List[Dict[str, Any]],
-        original_query: str = None
     ) -> FormattedResponse:
         """
         Format a response with media embeds and citations.
@@ -81,7 +81,8 @@ class ResponseFormatterService:
                 metadata={'error': str(e)}
             )
     
-    async def _extract_media(
+    # noqa: C901 - Complex domain logic
+    def _extract_media(  # noqa: python:S3776
         self,
         text: str,
         sources: List[Dict[str, Any]]
@@ -134,7 +135,7 @@ class ResponseFormatterService:
                 doc_id = source.get('doc_id', '')
                 if doc_id and doc_id not in processed_urls:
                     attachments.append({
-                        'type': 'pdf',
+                        'type': 'pd',
                         'url': f'/api/documents/{doc_id}/download',
                         'filename': source.get('filename', ''),
                         'title': source.get('filename', '')
@@ -143,7 +144,7 @@ class ResponseFormatterService:
         
         return attachments
     
-    async def _create_citations(self, sources: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _create_citations(self, sources: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Create formatted citations from sources."""
         citations = []
         
@@ -161,7 +162,7 @@ class ResponseFormatterService:
         
         return citations
     
-    async def _add_inline_citations(
+    def _add_inline_citations(
         self,
         text: str,
         sources: List[Dict[str, Any]]
@@ -205,13 +206,13 @@ class ResponseFormatterService:
     
     def _get_timestamp(self) -> str:
         """Get current timestamp."""
-        from datetime import datetime
-        return datetime.utcnow().isoformat()
+        from datetime import datetime, timezone
+        return datetime.now(timezone.utc).isoformat()
     
-    async def format_json_response(
+    def format_json_response(
         self,
         query: str,
-        json_data: Dict[str, Any],
+        _json_data: Dict[str, Any],  # Reserved for future use
         extracted_data: Dict[str, Any]
     ) -> str:
         """
@@ -246,7 +247,7 @@ class ResponseFormatterService:
         
         # Add fields information
         if 'fields' in extracted_data:
-            response_parts.append(f"\n**Available Fields:**")
+            response_parts.append("\n**Available Fields:**")
             for field, field_type in extracted_data['fields'].items():
                 response_parts.append(f"  • {field} ({field_type})")
         
@@ -288,7 +289,7 @@ class ResponseFormatterService:
 _response_formatter = None
 
 
-async def get_response_formatter() -> ResponseFormatterService:
+def get_response_formatter() -> ResponseFormatterService:
     """Get or create response formatter instance."""
     global _response_formatter
     if _response_formatter is None:

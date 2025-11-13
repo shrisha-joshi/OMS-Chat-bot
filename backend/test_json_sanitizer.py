@@ -20,7 +20,7 @@ def test_case(name, content, expected_success=True):
     
     try:
         data, steps = sanitize_json(content)
-        print(f"✅ SUCCESS!")
+        print("✅ SUCCESS!")
         print(f"Cleaning steps applied: {len(steps)}")
         for step in steps:
             print(f"  {step}")
@@ -260,7 +260,7 @@ def run_all_tests():
     
     # Summary
     print(f"\n{'='*80}")
-    print(f" TEST SUMMARY")
+    print(" TEST SUMMARY")
     print(f"{'='*80}")
     print(f"Total tests: {tests_total}")
     print(f"Passed: {tests_passed}")

@@ -154,7 +154,7 @@ class TestPhase3ChatServiceIntegration:
         # Verify structure
         assert "phase3_metrics" in response_dict
         assert response_dict["phase3_metrics"]["query_variants_generated"] == 2
-        assert response_dict["phase3_metrics"]["accuracy_improvement_est"] == 0.15
+        assert abs(response_dict["phase3_metrics"]["accuracy_improvement_est"] - 0.15) < 0.01
 
 
 class TestPhase3CodeModifications:
@@ -304,10 +304,10 @@ class TestPhase3Performance:
         start = time.time()
         
         try:
-            qr_service = QueryRewritingService()
-            cache_service = EmbeddingCachingService()
-            search_service = HybridSearchService()
-            retrieval_service = ContextualRetrievalService()
+            _qr_service = QueryRewritingService()
+            _cache_service = EmbeddingCachingService()
+            _search_service = HybridSearchService()
+            _retrieval_service = ContextualRetrievalService()
             
             elapsed = time.time() - start
             

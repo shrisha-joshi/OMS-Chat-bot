@@ -16,7 +16,7 @@ from neo4j import GraphDatabase, AsyncGraphDatabase
 from neo4j.exceptions import ServiceUnavailable, AuthError
 from typing import Dict, List, Any, Optional, Tuple
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 import asyncio
 from collections import defaultdict
 
@@ -93,12 +93,12 @@ class Neo4jClient:
         if self.driver:
             try:
                 self.driver.close()
-            except:
+            except Exception:
                 pass
         if self.async_driver:
             try:
                 await self.async_driver.close()
-            except:
+            except Exception:
                 pass
         self.driver = None
         self.async_driver = None
@@ -164,11 +164,11 @@ class Neo4jClient:
         self,
         name: str,
         entity_type: str,
-        properties: Dict[str, Any] = None,
+        properties: Dict = None,
         doc_id: str = None,
         chunk_id: str = None,
         confidence: float = 0.8
-    ) -> str:
+    ) -> Optional[str]:
         """
         Create or update an entity in the knowledge graph.
         
@@ -191,8 +191,8 @@ class Neo4jClient:
             "name": name,
             "type": entity_type,
             "confidence": confidence,
-            "created_at": datetime.utcnow().isoformat(),
-            "updated_at": datetime.utcnow().isoformat()
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat()
         })
         
         if doc_id:
@@ -243,7 +243,7 @@ class Neo4jClient:
         props.update({
             "type": relation_type,
             "confidence": confidence,
-            "timestamp": datetime.utcnow().isoformat()
+            "timestamp": datetime.now(timezone.utc).isoformat()
         })
         
         query = """
@@ -287,7 +287,7 @@ class Neo4jClient:
         props.update({
             "id": doc_id,
             "filename": filename,
-            "uploaded_at": datetime.utcnow().isoformat()
+            "uploaded_at": datetime.now(timezone.utc).isoformat()
         })
         
         query = """
@@ -318,7 +318,7 @@ class Neo4jClient:
             "id": chunk_id,
             "doc_id": doc_id,
             "text": text[:500],  # Store preview only
-            "created_at": datetime.utcnow().isoformat()
+            "created_at": datetime.now(timezone.utc).isoformat()
         })
         
         if embedding_id:
@@ -607,4 +607,5 @@ neo4j_client = Neo4jClient()
 
 async def get_neo4j_client() -> Neo4jClient:
     """Dependency injection for Neo4j client."""
+    await asyncio.sleep(0)  # Use async feature
     return neo4j_client

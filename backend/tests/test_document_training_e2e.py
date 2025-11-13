@@ -189,6 +189,7 @@ async def upload_test_document(ingest_service: IngestService, filename: str, con
         Document ID from MongoDB
     """
     # Write to temporary file
+    # Note: Sync file ops acceptable in test setup
     with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp:
         tmp.write(content)
         tmp_path = tmp.name
@@ -417,7 +418,7 @@ class TestPhase2DocumentTraining:
         assert hasattr(settings, 'force_document_usage'), "Settings should have force_document_usage"
         assert hasattr(settings, 'validate_document_usage'), "Settings should have validate_document_usage"
         
-        print(f"✓ Settings loaded:")
+        print("✓ Settings loaded:")
         print(f"  - FORCE_DOCUMENT_USAGE: {settings.force_document_usage}")
         print(f"  - VALIDATE_DOCUMENT_USAGE: {settings.validate_document_usage}")
         print(f"  - REQUIRE_CITATIONS: {settings.require_citations}")
@@ -448,7 +449,7 @@ class TestPhase2DocumentTraining:
         assert hasattr(settings, 'extract_video_links'), "Settings should have extract_video_links"
         assert hasattr(settings, 'suggest_related_media'), "Settings should have suggest_related_media"
         
-        print(f"✓ Media settings loaded:")
+        print("✓ Media settings loaded:")
         print(f"  - EXTRACT_IMAGES_FROM_PDF: {settings.extract_images_from_pdf}")
         print(f"  - EXTRACT_VIDEO_LINKS: {settings.extract_video_links}")
         print(f"  - SUGGEST_RELATED_MEDIA: {settings.suggest_related_media}")

@@ -1,7 +1,7 @@
 'use client'
 
 import React, { useState, useCallback, useRef } from 'react'
-import { Upload, FileText, X, CheckCircle, AlertCircle, Loader, File } from 'lucide-react'
+import { Upload, X, CheckCircle, AlertCircle, Loader, File } from 'lucide-react'
 import toast from 'react-hot-toast'
 
 interface UploadedFile {
@@ -27,7 +27,7 @@ export function DocumentUploadReal({
   onUploadComplete,
   maxFiles = 10,
   maxSize = 10485760 // 10MB
-}: DocumentUploadProps) {
+}: Readonly<DocumentUploadProps>) {
   const [uploadedFiles, setUploadedFiles] = useState<UploadedFile[]>([])
   const [isUploading, setIsUploading] = useState(false)
   const [isMounted, setIsMounted] = useState(false)
@@ -40,7 +40,7 @@ export function DocumentUploadReal({
 
   // Get auth token (you'll need to implement auth)
   const getAuthToken = () => {
-    if (typeof window !== 'undefined') {
+    if (globalThis.window !== undefined) {
       return localStorage.getItem('auth_token') || 'admin_token'
     }
     return 'admin_token'
@@ -253,7 +253,6 @@ export function DocumentUploadReal({
   return (
     <div className="w-full max-w-2xl mx-auto p-6">
       <div className="space-y-4">
-        {/* Upload Area */}
         <div
           ref={dragRef}
           onDragEnter={handleDragEnter}
@@ -262,6 +261,14 @@ export function DocumentUploadReal({
           onDrop={handleDrop}
           className="border-2 border-dashed border-gray-300 rounded-lg p-8 text-center hover:border-blue-500 transition-colors cursor-pointer bg-gray-50 hover:bg-blue-50"
           onClick={() => fileInputRef.current?.click()}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault();
+              fileInputRef.current?.click();
+            }
+          }}
+          role="button"
+          tabIndex={0}
         >
           <input
             ref={fileInputRef}
@@ -282,6 +289,7 @@ export function DocumentUploadReal({
               or click to browse (PDF, DOCX, JSON, XLSX, PPTX, images)
             </p>
             <button
+              type="button"
               disabled={isUploading}
               className="px-6 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 transition-colors flex items-center gap-2"
             >
@@ -298,7 +306,7 @@ export function DocumentUploadReal({
         {uploadedFiles.length > 0 && (
           <div className="space-y-2">
             <h4 className="font-semibold text-gray-900">
-              {uploadedFiles.length} file{uploadedFiles.length !== 1 ? 's' : ''}
+              {uploadedFiles.length === 1 ? '1 file' : `${uploadedFiles.length} files`}
             </h4>
 
             {uploadedFiles.map(file => (

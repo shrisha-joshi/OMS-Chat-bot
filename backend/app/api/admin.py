@@ -20,11 +20,14 @@ from ..utils.json_sanitizer import validate_json_file
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
+# Constants
+DEFAULT_CONTENT_TYPE = "application/octet-stream"
+
 
 class UploadJSONRequest(BaseModel):
     filename: str
     content_base64: str
-    content_type: Optional[str] = "application/octet-stream"
+    content_type: Optional[str] = DEFAULT_CONTENT_TYPE
 
 
 @router.post("/documents/upload")
@@ -71,7 +74,7 @@ async def upload_document_multipart(
         doc_id = await mongo_client.save_document(
             filename=file.filename,
             content=content,
-            content_type=file.content_type or "application/octet-stream",
+            content_type=file.content_type or DEFAULT_CONTENT_TYPE,
             size=size
         )
         
@@ -80,17 +83,19 @@ async def upload_document_multipart(
         # Invalidate document list cache (documents may have changed)
         try:
             from ..core.cache_redis import get_redis_client
-            redis_client = await get_redis_client()
-            if redis_client.is_connected():
+            redis_cache_client = await get_redis_client()
+            if redis_cache_client.is_connected():
                 # Clear the document list cache patterns
-                await redis_client.clear_pattern("docs:list:*")
-                logger.info(f"🔄 Cleared document list cache")
+                await redis_cache_client.clear_pattern("docs:list:*")
+                logger.info("🔄 Cleared document list cache")
         except Exception as e:
             logger.warning(f"Failed to clear cache: {e}")
         
         # PROCESS IMMEDIATELY using asyncio.create_task (more reliable than BackgroundTasks)
         logger.info(f"🚀 Starting immediate processing: {file.filename}")
-        asyncio.create_task(_process_document_with_retry(doc_id, file.filename))
+        processing_task = asyncio.create_task(_process_document_with_retry(doc_id, file.filename))
+        # Store task reference to prevent garbage collection
+        background_tasks.add_task(lambda: processing_task)
         
         return {
             "success": True,
@@ -168,7 +173,7 @@ async def upload_document_json(
         doc_id = await mongo_client.save_document(
             filename=payload.filename,
             content=content,
-            content_type=payload.content_type or "application/octet-stream",
+            content_type=payload.content_type or DEFAULT_CONTENT_TYPE,
             size=size
         )
         
@@ -198,12 +203,49 @@ async def upload_document_json(
         raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
 
 
+async def _attempt_document_processing(doc_id: str, filename: str, mongo_client) -> bool:
+    """Single attempt to process a document. Returns True on success."""
+    # Update status to PROCESSING
+    await mongo_client.update_document_status(doc_id, "PROCESSING")
+    
+    # Initialize ingest service
+    from ..services.ingest_service import IngestService
+    ingest_service = IngestService()
+    await ingest_service.initialize()
+    
+    # Ensure Qdrant is connected
+    if not ingest_service.qdrant_client.is_connected():
+        await ingest_service.qdrant_client.connect()
+    
+    # Process the document
+    logger.info(f"⚙️ Running RAG pipeline for {filename}...")
+    success = await ingest_service.process_document(doc_id)
+    return success
+
+
+async def _handle_processing_failure(doc_id: str, filename: str, mongo_client, attempt: int, max_retries: int, error: Exception):
+    """Handle processing failure with retry logic or final failure status."""
+    logger.error(f"❌ ATTEMPT {attempt} FAILED: {filename} - {error}")
+    
+    if attempt < max_retries:
+        # Retry after delay
+        delay = 5 * attempt
+        logger.info(f"⏱️ Retrying in {delay} seconds...")
+        await asyncio.sleep(delay)
+    else:
+        # All retries exhausted
+        logger.error(f"❌ ALL {max_retries} ATTEMPTS FAILED for {filename}")
+        try:
+            await mongo_client.update_document_status(doc_id, "FAILED", f"Failed after {max_retries} attempts: {str(error)}")
+        except Exception as update_error:
+            logger.warning(f"Failed to update status: {update_error}")
+
+
 async def _process_document_with_retry(doc_id: str, filename: str, max_retries: int = 3):
     """
     Process document with automatic retry on failure.
     This runs in the background using asyncio.create_task.
     """
-    from ..services.ingest_service import IngestService
     from ..core.db_mongo import get_mongodb_client
     
     mongo_client = await get_mongodb_client()
@@ -212,20 +254,7 @@ async def _process_document_with_retry(doc_id: str, filename: str, max_retries: 
         try:
             logger.info(f"🔥 PROCESSING ATTEMPT {attempt}/{max_retries}: {filename} (ID: {doc_id})")
             
-            # Update status to PROCESSING
-            await mongo_client.update_document_status(doc_id, "PROCESSING")
-            
-            # Initialize ingest service
-            ingest_service = IngestService()
-            await ingest_service.initialize()
-            
-            # Ensure Qdrant is connected
-            if not ingest_service.qdrant_client.is_connected():
-                await ingest_service.qdrant_client.connect()
-            
-            # Process the document
-            logger.info(f"⚙️ Running RAG pipeline for {filename}...")
-            success = await ingest_service.process_document(doc_id)
+            success = await _attempt_document_processing(doc_id, filename, mongo_client)
             
             if success:
                 await mongo_client.update_document_status(doc_id, "COMPLETED")
@@ -242,20 +271,7 @@ async def _process_document_with_retry(doc_id: str, filename: str, max_retries: 
                     return
                     
         except Exception as e:
-            logger.error(f"❌ ATTEMPT {attempt} FAILED: {filename} - {e}")
-            
-            if attempt < max_retries:
-                # Retry after delay
-                delay = 5 * attempt
-                logger.info(f"⏱️ Retrying in {delay} seconds...")
-                await asyncio.sleep(delay)
-            else:
-                # All retries exhausted
-                logger.error(f"❌ ALL {max_retries} ATTEMPTS FAILED for {filename}")
-                try:
-                    await mongo_client.update_document_status(doc_id, "FAILED", f"Failed after {max_retries} attempts: {str(e)}")
-                except:
-                    pass
+            await _handle_processing_failure(doc_id, filename, mongo_client, attempt, max_retries, e)
 
 
 async def _process_document_immediate(doc_id, filename, mongo_client):
@@ -270,13 +286,13 @@ async def _process_document_immediate(doc_id, filename, mongo_client):
         # Lazy initialize ingest service
         from ..services.ingest_service import IngestService
         
-        logger.info(f"🔧 Initializing ingest service...")
+        logger.info("🔧 Initializing ingest service...")
         ingest_service = IngestService()
         await ingest_service.initialize()
-        logger.info(f"✅ Ingest service ready")
+        logger.info("✅ Ingest service ready")
         
         # Process the document
-        logger.info(f"⚙️ Running RAG pipeline: Extract → Chunk → Embed → Index")
+        logger.info("⚙️ Running RAG pipeline: Extract → Chunk → Embed → Index")
         success = await ingest_service.process_document(str(doc_id))
         
         if success:
@@ -290,11 +306,11 @@ async def _process_document_immediate(doc_id, filename, mongo_client):
         logger.error(f"❌ FAILED: {filename} - {e}", exc_info=True)
         try:
             await mongo_client.update_document_status(str(doc_id), "FAILED", str(e))
-        except:
-            pass
+        except Exception as update_error:
+            logger.warning(f"Failed to update status: {update_error}")
 
 
-async def _process_document(doc_id, filename, content, mongo_client):
+async def _process_document(doc_id, filename, mongo_client):
     """Background task to process uploaded document with chunking and embeddings."""
     try:
         logger.info(f"🔄 BACKGROUND TASK STARTED: Processing {filename} (doc_id: {doc_id})")
@@ -410,6 +426,63 @@ async def list_documents(
         raise HTTPException(status_code=500, detail=f"Failed to list documents: {str(e)}")
 
 
+def _build_stage_status(stage_name: str, stage_log: Optional[Dict]) -> Dict[str, Any]:
+    """Build status dict for a single processing stage."""
+    if stage_log:
+        return {
+            "name": stage_name,
+            "status": stage_log.get("status", "UNKNOWN"),
+            "message": stage_log.get("message", ""),
+            "metadata": stage_log.get("metadata", {}),
+            "timestamp": stage_log.get("timestamp", "")
+        }
+    else:
+        return {
+            "name": stage_name,
+            "status": "PENDING",
+            "message": "Awaiting processing",
+            "metadata": {},
+            "timestamp": ""
+        }
+
+
+def _determine_current_stage(stages_status: List[Dict], ingest_status: str) -> tuple[str, int]:
+    """Determine current stage and overall progress percentage."""
+    current_stage = "PENDING"
+    
+    # Find current stage from stages_status
+    for stage in stages_status:
+        status = stage["status"]
+        if status == "SUCCESS":
+            current_stage = stage["name"]
+        elif status in ("PROCESSING", "FAILED"):
+            current_stage = stage["name"]
+            break
+    
+    # Calculate progress
+    successful_stages = sum(1 for s in stages_status if s["status"] == "SUCCESS")
+    overall_progress = int((successful_stages / len(stages_status)) * 100) if stages_status else 0
+    
+    # Override based on ingest_status
+    if ingest_status == "complete":
+        current_stage = "COMPLETE"
+        overall_progress = 100
+    elif ingest_status == "failed":
+        current_stage = "FAILED"
+    
+    return current_stage, overall_progress
+
+
+async def _get_ingestion_logs(mongo_client: MongoDBClient, doc_id: str) -> List[Dict]:
+    """Retrieve ingestion logs for a document."""
+    try:
+        cursor = mongo_client.database.ingestion_logs.find({"doc_id": doc_id}).sort("timestamp", 1)
+        return await cursor.to_list(length=None)
+    except Exception as e:
+        logger.warning(f"Could not retrieve ingestion logs: {e}")
+        return []
+
+
 @router.get("/documents/status/{doc_id}")
 async def get_document_status(
     doc_id: str,
@@ -445,69 +518,27 @@ async def get_document_status(
             raise HTTPException(status_code=404, detail=f"Document {doc_id} not found")
         
         # Get ingestion logs
-        logs = []
-        try:
-            cursor = mongo_client.database.ingestion_logs.find({"doc_id": str(obj_id)}).sort("timestamp", 1)
-            logs = await cursor.to_list(length=None)
-        except Exception as e:
-            logger.warning(f"Could not retrieve ingestion logs: {e}")
+        logs = await _get_ingestion_logs(mongo_client, str(obj_id))
         
         # Define processing stages in order
         expected_stages = ["EXTRACT", "CHUNK", "EMBED", "STORE_CHUNKS", "INDEX_VECTORS", "EXTRACT_ENTITIES"]
         
         # Build status for each stage
         stages_status = []
-        current_stage_idx = -1
-        current_stage = "PENDING"
-        
-        for i, stage_name in enumerate(expected_stages):
+        for stage_name in expected_stages:
             stage_log = next((log for log in logs if log.get("step") == stage_name), None)
-            
-            if stage_log:
-                status = stage_log.get("status", "UNKNOWN")
-                stages_status.append({
-                    "name": stage_name,
-                    "status": status,
-                    "message": stage_log.get("message", ""),
-                    "metadata": stage_log.get("metadata", {}),
-                    "timestamp": stage_log.get("timestamp", "")
-                })
-                
-                if status == "SUCCESS":
-                    current_stage_idx = i
-                    current_stage = stage_name
-                elif status == "PROCESSING":
-                    current_stage = stage_name
-                    break
-                elif status == "FAILED":
-                    current_stage = stage_name
-                    break
-            else:
-                stages_status.append({
-                    "name": stage_name,
-                    "status": "PENDING",
-                    "message": "Awaiting processing",
-                    "metadata": {},
-                    "timestamp": ""
-                })
+            stages_status.append(_build_stage_status(stage_name, stage_log))
         
-        # Calculate overall progress (number of successful stages / total stages)
-        successful_stages = sum(1 for s in stages_status if s["status"] == "SUCCESS")
-        overall_progress = int((successful_stages / len(expected_stages)) * 100)
-        
-        # Check if all stages completed
+        # Determine current stage and progress
         ingest_status = doc.get("ingest_status", "pending")
-        if ingest_status == "complete":
-            current_stage = "COMPLETE"
-            overall_progress = 100
-        elif ingest_status == "failed":
-            current_stage = "FAILED"
+        current_stage, overall_progress = _determine_current_stage(stages_status, ingest_status)
         
         # Get error message if failed
         error_message = doc.get("error_message", "")
-        failed_log = next((log for log in logs if log.get("status") == "FAILED"), None)
-        if failed_log and not error_message:
-            error_message = failed_log.get("message", "")
+        if not error_message:
+            failed_log = next((log for log in logs if log.get("status") == "FAILED"), None)
+            if failed_log:
+                error_message = failed_log.get("message", "")
         
         logger.info(f"Status for document {doc_id}: {current_stage} ({overall_progress}%)")
         

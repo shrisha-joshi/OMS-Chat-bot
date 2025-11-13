@@ -9,7 +9,7 @@ from arango.database import StandardDatabase
 from arango.graph import Graph
 from typing import Dict, List, Any, Optional, Tuple
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 import hashlib
 import asyncio
 
@@ -94,7 +94,7 @@ class ArangoDBClient:
             # Setup graph structure (blocking operations) in a thread
             await asyncio.to_thread(self._setup_graph)
 
-            logger.info(f"ArangoDB graph setup completed successfully")
+            logger.info("ArangoDB graph setup completed successfully")
             return True
 
         try:
@@ -121,7 +121,7 @@ class ArangoDBClient:
             self.graph = None
             return False
     
-    async def disconnect(self):
+    def disconnect(self):
         """Close ArangoDB connection."""
         # ArangoDB client doesn't need explicit disconnection
         logger.info("Disconnected from ArangoDB")
@@ -136,7 +136,7 @@ class ArangoDBClient:
         try:
             # Create vertex collection for entities
             if not self.database.has_collection(self.entities_collection):
-                entities_col = self.database.create_collection(
+                _entities_col = self.database.create_collection(
                     self.entities_collection,
                     vertex=True
                 )
@@ -144,7 +144,7 @@ class ArangoDBClient:
 
             # Create edge collection for relations
             if not self.database.has_collection(self.relations_collection):
-                relations_col = self.database.create_collection(
+                _relations_col = self.database.create_collection(
                     self.relations_collection,
                     edge=True
                 )
@@ -177,8 +177,8 @@ class ArangoDBClient:
         This is synchronous and runs inside the same thread as _setup_graph.
         """
         try:
-            entities_col = self.database.collection(self.entities_collection)
-            relations_col = self.database.collection(self.relations_collection)
+            _entities_col = self.database.collection(self.entities_collection)
+            _relations_col = self.database.collection(self.relations_collection)
 
             # Entity indexes
             entities_col.add_hash_index(fields=["name"], unique=False)
@@ -216,7 +216,7 @@ class ArangoDBClient:
         """
         try:
             entity_key = self._generate_entity_key(name, entity_type)
-            entities_col = self.database.collection(self.entities_collection)
+            _entities_col = self.database.collection(self.entities_collection)
             
             entity_data = {
                 "_key": entity_key,
@@ -225,8 +225,8 @@ class ArangoDBClient:
                 "doc_ids": [doc_id] if doc_id else [],
                 "chunk_ids": [chunk_id] if chunk_id else [],
                 "metadata": metadata or {},
-                "created_at": datetime.utcnow().isoformat(),
-                "updated_at": datetime.utcnow().isoformat(),
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
                 "mention_count": 1
             }
             
@@ -245,7 +245,7 @@ class ArangoDBClient:
                         existing["chunk_ids"].append(chunk_id)
                     
                     existing["mention_count"] = existing.get("mention_count", 1) + 1
-                    existing["updated_at"] = datetime.utcnow().isoformat()
+                    existing["updated_at"] = datetime.now(timezone.utc).isoformat()
                     
                     entities_col.update(entity_key, existing)
                     logger.debug(f"Updated existing entity: {name} ({entity_type})")
@@ -274,7 +274,7 @@ class ArangoDBClient:
             bool: Success status
         """
         try:
-            relations_col = self.database.collection(self.relations_collection)
+            _relations_col = self.database.collection(self.relations_collection)
             
             # Create unique key for the relation
             relation_key = hashlib.md5(
@@ -289,7 +289,7 @@ class ArangoDBClient:
                 "confidence": confidence,
                 "doc_id": doc_id,
                 "chunk_id": chunk_id,
-                "created_at": datetime.utcnow().isoformat()
+                "created_at": datetime.now(timezone.utc).isoformat()
             }
             
             # Insert or update relation
@@ -301,7 +301,7 @@ class ArangoDBClient:
                 existing = relations_col.get(relation_key)
                 if existing and confidence > existing.get("confidence", 0):
                     existing["confidence"] = confidence
-                    existing["updated_at"] = datetime.utcnow().isoformat()
+                    existing["updated_at"] = datetime.now(timezone.utc).isoformat()
                     relations_col.update(relation_key, existing)
             
             return True
@@ -494,8 +494,8 @@ class ArangoDBClient:
     async def get_graph_statistics(self) -> Dict[str, Any]:
         """Get statistics about the knowledge graph."""
         try:
-            entities_col = self.database.collection(self.entities_collection)
-            relations_col = self.database.collection(self.relations_collection)
+            _entities_col = self.database.collection(self.entities_collection)
+            _relations_col = self.database.collection(self.relations_collection)
             
             # Basic counts
             entity_count = entities_col.count()

@@ -4,7 +4,7 @@ This module handles user authentication, token generation, and access control
 for admin endpoints.
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any
 from jose import JWTError, jwt
 from passlib.context import CryptContext
@@ -112,9 +112,9 @@ class AuthService:
             
             # Set expiration time
             if expires_delta:
-                expire = datetime.utcnow() + expires_delta
+                expire = datetime.now(timezone.utc) + expires_delta
             else:
-                expire = datetime.utcnow() + timedelta(minutes=self.access_token_expire_minutes)
+                expire = datetime.now(timezone.utc) + timedelta(minutes=self.access_token_expire_minutes)
             
             to_encode.update({"exp": expire})
             
@@ -172,7 +172,7 @@ class AuthService:
             "username": username,
             "role": role,
             "permissions": permissions,
-            "issued_at": datetime.utcnow().isoformat()
+            "issued_at": datetime.now(timezone.utc).isoformat()
         }
 
 
@@ -268,7 +268,7 @@ class User:
         self.email = email
         self.role = role
         self.permissions = permissions
-        self.created_at = datetime.utcnow()
+        self.created_at = datetime.now(timezone.utc)
         self.last_login = None
         self.is_active = True
     
@@ -339,7 +339,7 @@ def create_api_key(user_id: str, expires_days: int = 30) -> str:
     data = {
         "user_id": user_id,
         "type": "api_key",
-        "exp": datetime.utcnow() + timedelta(days=expires_days)
+        "exp": datetime.now(timezone.utc) + timedelta(days=expires_days)
     }
     
     return auth_service.create_access_token(data, timedelta(days=expires_days))

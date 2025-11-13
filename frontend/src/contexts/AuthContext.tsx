@@ -21,7 +21,7 @@ interface AuthContextType {
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined)
 
-export function AuthProvider({ children }: { children: ReactNode }) {
+export function AuthProvider({ children }: Readonly<{ children: ReactNode }>) {
   const [user, setUser] = useState<User | null>(null)
   const [isLoading, setIsLoading] = useState(true)
 
@@ -32,30 +32,33 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const checkAuthStatus = async () => {
     try {
       const token = localStorage.getItem('access_token')
-      if (token) {
-        // Verify token with backend with timeout
-        const apiUrl = (typeof process !== 'undefined' ? process.env.NEXT_PUBLIC_API_URL : undefined) || 'http://localhost:8000'
-        
-        // Add 2 second timeout
-        const controller = new AbortController()
-        const timeoutId = setTimeout(() => controller.abort(), 2000)
-        
-        const response = await fetch(`${apiUrl}/auth/me`, {
-          headers: {
-            'Authorization': `Bearer ${token}`
-          },
-          signal: controller.signal
-        })
-        
-        clearTimeout(timeoutId)
-        
-        if (response.ok) {
-          const userData = await response.json()
-          setUser(userData)
-        } else {
-          localStorage.removeItem('access_token')
-          localStorage.removeItem('refresh_token')
-        }
+      if (!token) {
+        setIsLoading(false)
+        return
+      }
+      
+      // Verify token with backend with timeout
+      const apiUrl = process?.env?.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000'
+      
+      // Add 2 second timeout
+      const controller = new AbortController()
+      const timeoutId = setTimeout(() => controller.abort(), 2000)
+      
+      const response = await fetch(`${apiUrl}/auth/me`, {
+        headers: {
+          'Authorization': `Bearer ${token}`
+        },
+        signal: controller.signal
+      })
+      
+      clearTimeout(timeoutId)
+      
+      if (response.ok) {
+        const userData = await response.json()
+        setUser(userData)
+      } else {
+        localStorage.removeItem('access_token')
+        localStorage.removeItem('refresh_token')
       }
     } catch (error) {
       console.error('Auth check failed:', error)
@@ -94,13 +97,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     authService.logout()
   }
 
-  const value = {
+  const value = React.useMemo(() => ({
     user,
     login,
     logout,
     isLoading,
     isAuthenticated: !!user
-  }
+  }), [user, isLoading])
 
   return (
     <AuthContext.Provider value={value}>

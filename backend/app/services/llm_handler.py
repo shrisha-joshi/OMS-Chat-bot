@@ -52,6 +52,7 @@ class LLMHandler:
     async def initialize(self):
         """Initialize LLM handler with available providers."""
         try:
+            await asyncio.sleep(0)
             logger.info("Initializing LLM handler...")
             
             # Initialize tokenizer
@@ -59,7 +60,7 @@ class LLMHandler:
             
             # Initialize HTTP client with extended timeout for LMStudio
             self.http_client = httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0))
-            logger.info(f"HTTP client initialized with 5-minute timeout")
+            logger.info("HTTP client initialized with 5-minute timeout")
             
             # Configure providers
             self._setup_providers()
@@ -147,6 +148,28 @@ class LLMHandler:
             logger.warning(f"Token counting failed: {e}, estimating...")
             return len(text) // 4  # Rough estimate
     
+    def _prepare_messages(self, prompt: str, system_prompt: Optional[str]) -> tuple:
+        """Prepare messages and count tokens."""
+        if system_prompt:
+            combined_prompt = f"{system_prompt}\n\n{prompt}"
+        else:
+            combined_prompt = prompt
+        
+        messages = [{"role": "user", "content": combined_prompt}]
+        prompt_tokens = self.count_tokens(combined_prompt)
+        
+        return messages, prompt_tokens
+    
+    def _calculate_max_tokens(self, max_tokens: Optional[int], prompt_tokens: int) -> int:
+        """Calculate appropriate max_tokens for generation."""
+        if max_tokens:
+            return max_tokens
+        
+        configured_max = settings.max_llm_output_tokens
+        available_for_output = 32768 - prompt_tokens - 256  # Leave buffer
+        calculated_max = min(configured_max, available_for_output)
+        return max(calculated_max, 512)  # Ensure minimum
+    
     async def generate_response(
         self,
         prompt: str,
@@ -171,29 +194,11 @@ class LLMHandler:
             Dictionary with response and metadata
         """
         try:
-            # Prepare messages
-            # Note: Some models don't support 'system' role, so we prepend system prompt to user message
-            messages = []
+            # Prepare messages and count tokens
+            messages, prompt_tokens = self._prepare_messages(prompt, system_prompt)
             
-            if system_prompt:
-                # Combine system prompt with user prompt
-                combined_prompt = f"{system_prompt}\n\n{prompt}"
-            else:
-                combined_prompt = prompt
-            
-            messages.append({"role": "user", "content": combined_prompt})
-            
-            # Count tokens
-            prompt_tokens = self.count_tokens(combined_prompt)
-            system_tokens = 0  # Already included in combined_prompt
-            
-            # Set max tokens if not provided
-            if not max_tokens:
-                # Use configured max output tokens, but ensure it fits in context window
-                configured_max = settings.max_llm_output_tokens
-                available_for_output = 32768 - prompt_tokens - system_tokens - 256  # Leave buffer
-                max_tokens = min(configured_max, available_for_output)
-                max_tokens = max(max_tokens, 512)  # Ensure minimum
+            # Calculate max tokens
+            max_tokens = self._calculate_max_tokens(max_tokens, prompt_tokens)
             
             # Try providers with retry logic
             logger.debug(f"Provider health status: {self.provider_health}")
@@ -204,7 +209,7 @@ class LLMHandler:
                 
                 if not provider:
                     logger.error("No available LLM providers found")
-                    raise Exception("No available LLM providers")
+                    raise RuntimeError("No available LLM providers")
                 
                 logger.info(f"Attempting to use provider '{provider['name']}' (attempt {attempt + 1}/{self.max_retries})")
                 logger.debug(f"Provider URL: {provider['url']}/chat/completions")
@@ -225,7 +230,7 @@ class LLMHandler:
                     logger.warning(f"Marked '{provider['name']}' as unhealthy")
                     
                     if attempt < self.max_retries - 1:
-                        logger.info(f"Retrying with next provider in 1 second...")
+                        logger.info("Retrying with next provider in 1 second...")
                         await asyncio.sleep(1)  # Brief delay before retry
                         continue
                     else:
@@ -268,14 +273,14 @@ class LLMHandler:
             try:
                 response = await self.http_client.post(url, json=payload)
             except httpx.ConnectError as e:
-                logger.error(f"❌ Connection failed to LMStudio at {url}")
-                logger.error(f"   Error: {e}")
-                logger.error(f"   Make sure LMStudio is running and accessible at {provider['url']}")
-                raise Exception(f"Cannot connect to LMStudio at {provider['url']}. Is it running?")
+                    logger.error(f"❌ Connection failed to LMStudio at {url}")
+                    logger.error(f"   Error: {e}")
+                    logger.error(f"   Make sure LMStudio is running and accessible at {provider['url']}")
+                    raise ConnectionError(f"Cannot connect to LMStudio at {provider['url']}. Is it running?")
             except httpx.TimeoutException as e:
                 logger.error(f"⏰ Request to LMStudio timed out after {self.timeout}s")
-                logger.error(f"   The model might be too slow or not responding")
-                raise Exception(f"LMStudio request timed out after {self.timeout}s")
+                logger.error("   The model might be too slow or not responding")
+                raise TimeoutError(f"LMStudio request timed out after {self.timeout}s")
             
             end_time = datetime.now()
             latency = (end_time - start_time).total_seconds()
@@ -285,14 +290,33 @@ class LLMHandler:
             if response.status_code != 200:
                 logger.error(f"Provider returned error status {response.status_code}")
                 logger.error(f"Response text: {response.text[:500]}")
-                raise Exception(f"Provider returned status {response.status_code}: {response.text}")
+                raise RuntimeError(f"Provider returned status {response.status_code}: {response.text}")
             
             data = response.json()
+            logger.debug(f"📦 Response data structure: {json.dumps(data, indent=2)[:500]}")
             
             completion_tokens = data.get("usage", {}).get("completion_tokens", 0)
             total_tokens = data.get("usage", {}).get("total_tokens", prompt_tokens + completion_tokens)
             
-            response_content = data["choices"][0]["message"]["content"]
+            # Handle both chat completion and text completion response formats
+            if "choices" in data and len(data["choices"]) > 0:
+                choice = data["choices"][0]
+                
+                # Try message.content first (chat completion format)
+                if "message" in choice and "content" in choice["message"]:
+                    response_content = choice["message"]["content"]
+                    logger.debug("✓ Extracted response from message.content (chat format)")
+                # Fall back to text field (text completion format - LMStudio default)
+                elif "text" in choice:
+                    response_content = choice["text"]
+                    logger.debug("✓ Extracted response from text field (completion format)")
+                else:
+                    logger.error(f"❌ Unknown response format: {json.dumps(choice, indent=2)}")
+                    raise ValueError("Response format not recognized")
+            else:
+                logger.error(f"❌ No choices in response: {json.dumps(data, indent=2)}")
+                raise ValueError("No choices in LLM response")
+            
             logger.info(f"✅ Successfully generated response ({len(response_content)} chars, {completion_tokens} completion tokens)")
             
             # Log token usage
@@ -305,6 +329,33 @@ class LLMHandler:
             logger.error(f"Error with provider '{provider['name']}': {e}", exc_info=True)
             raise
     
+    def _parse_stream_line(self, line: str) -> Optional[str]:
+        """Parse a single SSE line and extract content."""
+        if not line.startswith("data: "):
+            return None
+        
+        data_str = line[6:].strip()
+        if data_str == "[DONE]":
+            return None
+        
+        try:
+            data = json.loads(data_str)
+            if "choices" not in data or len(data["choices"]) == 0:
+                return None
+            
+            choice = data["choices"][0]
+            # Try delta.content first (chat completion streaming)
+            delta = choice.get("delta", {})
+            content = delta.get("content", "")
+            
+            # Fall back to text field (text completion streaming)
+            if not content:
+                content = choice.get("text", "")
+            
+            return content if content else None
+        except json.JSONDecodeError:
+            return None
+    
     async def _stream_response(
         self,
         provider: Dict[str, Any],
@@ -312,7 +363,7 @@ class LLMHandler:
         temperature: float,
         top_p: float,
         max_tokens: int,
-        prompt_tokens: int
+        _prompt_tokens: int
     ) -> AsyncGenerator[str, None]:
         """Stream response from provider."""
         try:
@@ -329,23 +380,12 @@ class LLMHandler:
             
             async with self.http_client.stream("POST", url, json=payload) as response:
                 if response.status_code != 200:
-                    raise Exception(f"Provider returned status {response.status_code}")
+                    raise RuntimeError(f"Provider returned status {response.status_code}")
                 
                 async for line in response.aiter_lines():
-                    if line.startswith("data: "):
-                        data_str = line[6:].strip()
-                        if data_str == "[DONE]":
-                            break
-                        
-                        try:
-                            data = json.loads(data_str)
-                            if "choices" in data and len(data["choices"]) > 0:
-                                delta = data["choices"][0].get("delta", {})
-                                content = delta.get("content", "")
-                                if content:
-                                    yield content
-                        except json.JSONDecodeError:
-                            continue
+                    content = self._parse_stream_line(line)
+                    if content:
+                        yield content
                             
         except Exception as e:
             logger.error(f"Stream error with provider '{provider['name']}': {e}")
@@ -379,6 +419,7 @@ class LLMHandler:
             bool: Whether response is valid
         """
         try:
+            await asyncio.sleep(0)
             # Check length
             if len(response) > max_length:
                 logger.warning(f"Response exceeds max length: {len(response)} > {max_length}")
@@ -415,6 +456,130 @@ class LLMHandler:
     # Phase 4: ADAPTIVE LLM INFERENCE
     # ============================================================================
     
+    def _check_factual_patterns(self, query_lower: str) -> Optional[Dict[str, Any]]:
+        """Check for factual query patterns."""
+        factual_patterns = [
+            r"\b(what|when|where|who)\b.*\?",
+            r"\b(define|explain|describe|meaning)\b",
+            r"\b(list|enumerate|how many)\b",
+            r"\b(fact|truth|definition)\b"
+        ]
+        
+        for pattern in factual_patterns:
+            if re.search(pattern, query_lower):
+                return {
+                    "query_type": "factual",
+                    "temperature": 0.3,
+                    "top_p": 0.85,
+                    "max_tokens": min(settings.max_llm_output_tokens, 1024),
+                    "reasoning_level": "direct",
+                    "parameter_reasoning": "Low temperature for factual accuracy"
+                }
+        return None
+    
+    def _check_analytical_patterns(self, query_lower: str) -> Optional[Dict[str, Any]]:
+        """Check for analytical query patterns."""
+        analytical_patterns = [
+            r"\b(compare|difference|contrast|versus)\b",
+            r"\b(analyze|evaluate|assess)\b",
+            r"\b(pros|cons|advantages|disadvantages)\b",
+            r"\b(better|best|vs|versus)\b"
+        ]
+        
+        for pattern in analytical_patterns:
+            if re.search(pattern, query_lower):
+                return {
+                    "query_type": "analytical",
+                    "temperature": 0.6,
+                    "top_p": 0.9,
+                    "max_tokens": min(settings.max_llm_output_tokens, 2048),
+                    "reasoning_level": "analytical",
+                    "parameter_reasoning": "Medium temperature for balanced analysis"
+                }
+        return None
+    
+    def _check_creative_patterns(self, query_lower: str) -> Optional[Dict[str, Any]]:
+        """Check for creative query patterns."""
+        creative_patterns = [
+            r"\b(create|generate|write|compose|imagine)\b",
+            r"\b(example|scenario|use case)\b",
+            r"\b(brainstorm|idea)\b",
+            r"\b(suggest|recommend)\b"
+        ]
+        
+        for pattern in creative_patterns:
+            if re.search(pattern, query_lower):
+                return {
+                    "query_type": "creative",
+                    "temperature": 0.8,
+                    "top_p": 0.95,
+                    "max_tokens": min(settings.max_llm_output_tokens, 2048),
+                    "reasoning_level": "creative",
+                    "parameter_reasoning": "Higher temperature for creative outputs"
+                }
+        return None
+    
+    def _check_technical_patterns(self, query_lower: str) -> Optional[Dict[str, Any]]:
+        """Check for technical query patterns."""
+        technical_patterns = [
+            r"\b(debug|troubleshoot|error|fix)\b",
+            r"\b(code|script|program|implement)\b",
+            r"\b(syntax|error message)\b",
+            r"\b(how to solve|solution)\b"
+        ]
+        
+        for pattern in technical_patterns:
+            if re.search(pattern, query_lower):
+                return {
+                    "query_type": "technical",
+                    "temperature": 0.4,
+                    "top_p": 0.85,
+                    "max_tokens": min(settings.max_llm_output_tokens, 2048),
+                    "reasoning_level": "step_by_step",
+                    "parameter_reasoning": "Low temperature for technical precision, step-by-step reasoning"
+                }
+        return None
+    
+    def _check_procedural_patterns(self, query_lower: str) -> Optional[Dict[str, Any]]:
+        """Check for procedural query patterns."""
+        procedural_patterns = [
+            r"\b(how to|steps|process|procedure)\b",
+            r"\b(guide|tutorial|manual)\b",
+            r"\b(step by step)\b"
+        ]
+        
+        for pattern in procedural_patterns:
+            if re.search(pattern, query_lower):
+                return {
+                    "query_type": "procedural",
+                    "temperature": 0.5,
+                    "top_p": 0.9,
+                    "max_tokens": min(settings.max_llm_output_tokens, 2048),
+                    "reasoning_level": "structured",
+                    "parameter_reasoning": "Medium temperature with structured output for procedures"
+                }
+        return None
+    
+    def _check_opinion_patterns(self, query_lower: str) -> Optional[Dict[str, Any]]:
+        """Check for opinion/discussion query patterns."""
+        opinion_patterns = [
+            r"\b(opinion|think|believe|discuss)\b",
+            r"\b(what do you|your thoughts)\b",
+            r"\b(why|possible reasons)\b"
+        ]
+        
+        for pattern in opinion_patterns:
+            if re.search(pattern, query_lower):
+                return {
+                    "query_type": "discussion",
+                    "temperature": 0.7,
+                    "top_p": 0.9,
+                    "max_tokens": min(settings.max_llm_output_tokens, 2048),
+                    "reasoning_level": "exploratory",
+                    "parameter_reasoning": "Balanced temperature for discussion"
+                }
+        return None
+    
     def get_adaptive_inference_params(self, query: str, context: Optional[str] = None) -> Dict[str, Any]:
         """
         Detect query type and determine optimal LLM inference parameters.
@@ -429,7 +594,7 @@ class LLMHandler:
         try:
             query_lower = query.lower()
             
-            # Default adaptive params structure
+            # Default params
             adaptive_params = {
                 "query_type": "general",
                 "temperature": 0.7,
@@ -439,128 +604,20 @@ class LLMHandler:
                 "parameter_reasoning": ""
             }
             
-            # Pattern 1: Factual/Definitive Queries
-            # These need low temperature for deterministic answers
-            factual_patterns = [
-                r"\b(what|when|where|who)\b.*\?",
-                r"\b(define|explain|describe|meaning)\b",
-                r"\b(list|enumerate|how many)\b",
-                r"\b(fact|truth|definition)\b"
+            # Check each pattern type
+            pattern_checkers = [
+                self._check_factual_patterns,
+                self._check_analytical_patterns,
+                self._check_creative_patterns,
+                self._check_technical_patterns,
+                self._check_procedural_patterns,
+                self._check_opinion_patterns
             ]
             
-            for pattern in factual_patterns:
-                if re.search(pattern, query_lower):
-                    adaptive_params.update({
-                        "query_type": "factual",
-                        "temperature": 0.3,  # Low for deterministic answers
-                        "top_p": 0.85,
-                        "max_tokens": min(settings.max_llm_output_tokens, 1024),
-                        "reasoning_level": "direct",
-                        "parameter_reasoning": "Low temperature for factual accuracy"
-                    })
-                    break
-            
-            # Pattern 2: Analytical/Comparative Queries
-            # Medium temperature for balanced analysis
-            analytical_patterns = [
-                r"\b(compare|difference|contrast|versus)\b",
-                r"\b(analyze|evaluate|assess)\b",
-                r"\b(pros|cons|advantages|disadvantages)\b",
-                r"\b(better|best|vs|versus)\b"
-            ]
-            
-            for pattern in analytical_patterns:
-                if re.search(pattern, query_lower):
-                    adaptive_params.update({
-                        "query_type": "analytical",
-                        "temperature": 0.6,  # Medium for balanced perspective
-                        "top_p": 0.9,
-                        "max_tokens": min(settings.max_llm_output_tokens, 2048),
-                        "reasoning_level": "analytical",
-                        "parameter_reasoning": "Medium temperature for balanced analysis"
-                    })
-                    break
-            
-            # Pattern 3: Creative/Generative Queries
-            # Higher temperature for diverse outputs
-            creative_patterns = [
-                r"\b(create|generate|write|compose|imagine)\b",
-                r"\b(example|scenario|use case)\b",
-                r"\b(brainstorm|idea)\b",
-                r"\b(suggest|recommend)\b"
-            ]
-            
-            for pattern in creative_patterns:
-                if re.search(pattern, query_lower):
-                    adaptive_params.update({
-                        "query_type": "creative",
-                        "temperature": 0.8,  # Higher for creativity
-                        "top_p": 0.95,
-                        "max_tokens": min(settings.max_llm_output_tokens, 2048),
-                        "reasoning_level": "creative",
-                        "parameter_reasoning": "Higher temperature for creative outputs"
-                    })
-                    break
-            
-            # Pattern 4: Technical/Debug Queries
-            # Low temperature but specific reasoning
-            technical_patterns = [
-                r"\b(debug|troubleshoot|error|fix)\b",
-                r"\b(code|script|program|implement)\b",
-                r"\b(syntax|error message)\b",
-                r"\b(how to solve|solution)\b"
-            ]
-            
-            for pattern in technical_patterns:
-                if re.search(pattern, query_lower):
-                    adaptive_params.update({
-                        "query_type": "technical",
-                        "temperature": 0.4,  # Low for technical accuracy
-                        "top_p": 0.85,
-                        "max_tokens": min(settings.max_llm_output_tokens, 2048),
-                        "reasoning_level": "step_by_step",
-                        "parameter_reasoning": "Low temperature for technical precision, step-by-step reasoning"
-                    })
-                    break
-            
-            # Pattern 5: Procedural/How-To Queries
-            # Structured reasoning
-            procedural_patterns = [
-                r"\b(how to|steps|process|procedure)\b",
-                r"\b(guide|tutorial|manual)\b",
-                r"\b(step by step)\b"
-            ]
-            
-            for pattern in procedural_patterns:
-                if re.search(pattern, query_lower):
-                    adaptive_params.update({
-                        "query_type": "procedural",
-                        "temperature": 0.5,
-                        "top_p": 0.9,
-                        "max_tokens": min(settings.max_llm_output_tokens, 2048),
-                        "reasoning_level": "structured",
-                        "parameter_reasoning": "Medium temperature with structured output for procedures"
-                    })
-                    break
-            
-            # Pattern 6: Opinion/Discussion Queries
-            # Higher temperature for discussion
-            opinion_patterns = [
-                r"\b(opinion|think|believe|discuss)\b",
-                r"\b(what do you|your thoughts)\b",
-                r"\b(why|possible reasons)\b"
-            ]
-            
-            for pattern in opinion_patterns:
-                if re.search(pattern, query_lower):
-                    adaptive_params.update({
-                        "query_type": "discussion",
-                        "temperature": 0.7,
-                        "top_p": 0.9,
-                        "max_tokens": min(settings.max_llm_output_tokens, 2048),
-                        "reasoning_level": "exploratory",
-                        "parameter_reasoning": "Balanced temperature for discussion"
-                    })
+            for checker in pattern_checkers:
+                result = checker(query_lower)
+                if result:
+                    adaptive_params.update(result)
                     break
             
             # Adjust based on query length
@@ -608,7 +665,7 @@ class LLMHandler:
             # Step 1: Detect query type and get adaptive params
             adaptive_params = self.get_adaptive_inference_params(query, system_prompt)
             
-            logger.info(f"🎯 Using adaptive parameters:")
+            logger.info("🎯 Using adaptive parameters:")
             logger.info(f"  Type: {adaptive_params['query_type']}")
             logger.info(f"  Temperature: {adaptive_params['temperature']}")
             logger.info(f"  Top-P: {adaptive_params['top_p']}")

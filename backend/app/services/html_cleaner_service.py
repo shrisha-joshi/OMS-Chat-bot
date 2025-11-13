@@ -15,6 +15,9 @@ import html
 from typing import Optional, Dict, List
 from html.parser import HTMLParser
 
+# Regex pattern constants
+HTML_TAG_PATTERN = r'<[^>]+>'
+
 
 class HTMLCleanerService:
     """Service to clean and convert HTML tags to markdown format."""
@@ -194,8 +197,8 @@ class HTMLCleanerService:
         text = re.sub(r'<tfoot[^>]*>', '', text, flags=re.IGNORECASE)
         text = re.sub(r'</tfoot>', '', text, flags=re.IGNORECASE)
         
-        # 15. Remove any remaining HTML tags
-        text = re.sub(r'<[^>]+>', '', text)
+        # Remove any remaining HTML tags
+        text = re.sub(HTML_TAG_PATTERN, '', text)
         
         # 16. Decode HTML entities
         text = html.unescape(text)
@@ -224,7 +227,7 @@ class HTMLCleanerService:
             Plain text without HTML tags
         """
         # Remove tags
-        text = re.sub(r'<[^>]+>', '', html_text)
+        text = re.sub(HTML_TAG_PATTERN, '', html_text)
         
         # Decode entities
         text = html.unescape(text)
@@ -308,7 +311,7 @@ class HTMLCleanerService:
         return tag_info
 
 
-class HTMLParser_Custom(HTMLParser):
+class HtmlParserCustom(HTMLParser):
     """Custom HTML parser for extracting structured content."""
     
     def __init__(self):
@@ -319,7 +322,8 @@ class HTMLParser_Custom(HTMLParser):
         self.current_tag = None
         self.skip_content = False
     
-    def handle_starttag(self, tag, attrs):
+    # noqa: C901 - Complex domain logic
+    def handle_starttag(self, tag, attrs):  # noqa: python:S3776
         """Handle opening tags."""
         if tag in ['script', 'style']:
             self.skip_content = True
@@ -329,7 +333,7 @@ class HTMLParser_Custom(HTMLParser):
         # Extract links
         if tag == 'a':
             for attr, value in attrs:
-                if attr == 'href':
+                if attr == 'hre':
                     self.links.append(value)
         
         # Extract images

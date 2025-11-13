@@ -11,6 +11,9 @@ from pymongo.operations import IndexModel
 
 logger = logging.getLogger(__name__)
 
+# Constants
+JSON_SCHEMA_KEY = "$jsonSchema"
+
 
 async def create_collections_and_indexes(db: AsyncIOMotorDatabase):
     """
@@ -119,7 +122,7 @@ async def create_document_image_schema(db: AsyncIOMotorDatabase):
             "collMod",
             "document_images",
             validator={
-                "$jsonSchema": {
+                JSON_SCHEMA_KEY: {
                     "bsonType": "object",
                     "required": ["doc_id", "page", "data"],
                     "properties": {
@@ -131,7 +134,7 @@ async def create_document_image_schema(db: AsyncIOMotorDatabase):
                         "alt_text": {"bsonType": "string"},
                         "width": {"bsonType": "int"},
                         "height": {"bsonType": "int"},
-                        "format": {"bsonType": "string", "enum": ["jpg", "png", "gif", "webp"]},
+                        "format": {"bsonType": "string", "enum": ["jpg", "png", "gi", "webp"]},
                         "size": {"bsonType": "int"},
                         "created_at": {"bsonType": "date"},
                         "updated_at": {"bsonType": "date"}
@@ -165,13 +168,13 @@ async def create_media_attachment_schema(db: AsyncIOMotorDatabase):
             "collMod",
             "media_attachments",
             validator={
-                "$jsonSchema": {
+                JSON_SCHEMA_KEY: {
                     "bsonType": "object",
                     "required": ["doc_id", "type"],
                     "properties": {
                         "_id": {"bsonType": "objectId"},
                         "doc_id": {"bsonType": "objectId"},
-                        "type": {"bsonType": "string", "enum": ["youtube", "video", "pdf", "link", "image"]},
+                        "type": {"bsonType": "string", "enum": ["youtube", "video", "pd", "link", "image"]},
                         "title": {"bsonType": "string"},
                         "url": {"bsonType": "string"},
                         "video_id": {"bsonType": "string"},
@@ -206,7 +209,7 @@ async def create_query_mapping_schema(db: AsyncIOMotorDatabase):
             "collMod",
             "query_source_mappings",
             validator={
-                "$jsonSchema": {
+                JSON_SCHEMA_KEY: {
                     "bsonType": "object",
                     "required": ["query_id", "source_id"],
                     "properties": {
@@ -249,7 +252,7 @@ async def create_validation_log_schema(db: AsyncIOMotorDatabase):
             "collMod",
             "document_validation_logs",
             validator={
-                "$jsonSchema": {
+                JSON_SCHEMA_KEY: {
                     "bsonType": "object",
                     "required": ["query_id", "is_valid"],
                     "properties": {

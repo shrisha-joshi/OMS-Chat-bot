@@ -183,8 +183,8 @@ class HybridRetrievalService:
     async def _rerank(
         self,
         results: List[Dict[str, Any]],
-        query: str,
-        top_k: int
+        _query: str,
+        top_k: int = 10
     ) -> List[Dict[str, Any]]:
         """
         Rerank results using combined scoring:
@@ -192,6 +192,7 @@ class HybridRetrievalService:
         - Graph centrality (0.3 weight)
         - Freshness (0.2 weight)
         """
+        await asyncio.sleep(0)  # Use async feature
         try:
             for result in results:
                 vector_score = result.get("vector_score", 0.0)

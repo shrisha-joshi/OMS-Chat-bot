@@ -3,6 +3,7 @@ Response validation service for ensuring chatbot responses are based on document
 Validates that responses use source materials and aren't generic.
 """
 
+import asyncio
 import logging
 import re
 from typing import Dict, Any, Tuple, List
@@ -44,7 +45,7 @@ class ResponseValidationService:
         self.generic_regex = [re.compile(p) for p in self.GENERIC_PHRASES]
         self.citation_regex = [re.compile(p) for p in self.CITATION_PATTERNS]
     
-    async def validate_response(
+    def validate_response(
         self,
         response: str,
         sources: List[Dict[str, Any]],
@@ -250,7 +251,7 @@ class ResponseValidationService:
             logger.debug(f"Error checking for specific details: {e}")
             return True  # Assume specific if we can't determine
     
-    async def get_validation_score(
+    def get_validation_score(
         self,
         response: str,
         sources: List[Dict[str, Any]]
@@ -301,6 +302,6 @@ class ResponseValidationService:
 response_validation_service = ResponseValidationService()
 
 
-async def get_response_validation_service() -> ResponseValidationService:
+def get_response_validation_service() -> ResponseValidationService:
     """Dependency injection for response validation service."""
     return response_validation_service

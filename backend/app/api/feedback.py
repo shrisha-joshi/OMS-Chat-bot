@@ -7,7 +7,8 @@ and data for future fine-tuning operations.
 from fastapi import APIRouter, HTTPException, Depends, Query
 from typing import Optional, Dict, Any, List
 from pydantic import BaseModel, Field
-from datetime import datetime
+from datetime import datetime, timezone
+import asyncio
 import logging
 from bson import ObjectId
 
@@ -18,6 +19,10 @@ from ..config import settings
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# MongoDB query constants
+RATING_FIELD = "$rating"
+COND_OPERATOR = "$cond"
 
 # Pydantic models
 class FeedbackRequest(BaseModel):
@@ -95,11 +100,11 @@ async def submit_feedback(
             "response_time": feedback.response_time,
             "sources_helpful": feedback.sources_helpful,
             "category": feedback.category,
-            "timestamp": datetime.utcnow().isoformat()
+            "timestamp": datetime.now(timezone.utc).isoformat()
         }
         
         # Cache feedback for analytics
-        feedback_key = f"feedback:{feedback.session_id}:{int(datetime.utcnow().timestamp())}"
+        feedback_key = f"feedback:{feedback.session_id}:{int(datetime.now(timezone.utc).timestamp())}"
         await redis_client.set_cache(feedback_key, feedback_metadata, expiry_seconds=86400)
         
         # Update feedback counters
@@ -138,7 +143,7 @@ async def get_feedback_stats(
         from datetime import timedelta
         
         # Calculate date range
-        end_date = datetime.utcnow()
+        end_date = datetime.now(timezone.utc)
         start_date = end_date - timedelta(days=days)
         
         # Query feedback from database
@@ -155,10 +160,10 @@ async def get_feedback_stats(
                 "$group": {
                     "_id": None,
                     "total_feedback": {"$sum": 1},
-                    "ratings": {"$push": "$rating"},
+                    "ratings": {"$push": RATING_FIELD},
                     "corrections": {
                         "$sum": {
-                            "$cond": [
+                            COND_OPERATOR: [
                                 {"$ne": ["$correction", None]},
                                 1,
                                 0
@@ -248,7 +253,7 @@ async def get_recent_feedback(
                 session_id=feedback.get("session_id", ""),
                 query=feedback.get("query", "")[:100] + "..." if len(feedback.get("query", "")) > 100 else feedback.get("query", ""),
                 rating=feedback.get("rating", ""),
-                timestamp=feedback.get("created_at", datetime.utcnow()).isoformat(),
+                timestamp=feedback.get("created_at", datetime.now(timezone.utc)).isoformat(),
                 has_correction=bool(feedback.get("correction")),
                 category=feedback.get("category")
             ))
@@ -288,7 +293,7 @@ async def get_feedback_corrections(
                 "original_response": feedback.get("response", ""),
                 "user_correction": feedback.get("correction", ""),
                 "rating": feedback.get("rating", ""),
-                "timestamp": feedback.get("created_at", datetime.utcnow()).isoformat()
+                "timestamp": feedback.get("created_at", datetime.now(timezone.utc)).isoformat()
             })
         
         return {
@@ -325,7 +330,7 @@ async def export_feedback_for_training(
         import json
         
         # Calculate date range
-        end_date = datetime.utcnow()
+        end_date = datetime.now(timezone.utc)
         start_date = end_date - timedelta(days=days)
         
         # Build query
@@ -345,7 +350,7 @@ async def export_feedback_for_training(
                 "query": feedback.get("query", ""),
                 "response": feedback.get("correction") or feedback.get("response", ""),
                 "rating": feedback.get("rating", ""),
-                "timestamp": feedback.get("created_at", datetime.utcnow()).isoformat()
+                "timestamp": feedback.get("created_at", datetime.now(timezone.utc)).isoformat()
             }
             
             if format == "jsonl":
@@ -357,7 +362,7 @@ async def export_feedback_for_training(
             "format": format,
             "data": export_data,
             "count": len(export_data),
-            "exported_at": datetime.utcnow().isoformat(),
+            "exported_at": datetime.now(timezone.utc).isoformat(),
             "date_range": {
                 "start": start_date.isoformat(),
                 "end": end_date.isoformat()
@@ -398,7 +403,7 @@ async def get_feedback_trends(
         from datetime import timedelta
         
         # Calculate date range
-        end_date = datetime.utcnow()
+        end_date = datetime.now(timezone.utc)
         start_date = end_date - timedelta(days=days)
         
         # Aggregate feedback by day
@@ -419,8 +424,8 @@ async def get_feedback_trends(
                     "total_feedback": {"$sum": 1},
                     "positive_feedback": {
                         "$sum": {
-                            "$cond": [
-                                {"$in": ["$rating", ["thumbs_up", "helpful", "4", "5"]]},
+                            COND_OPERATOR: [
+                                {"$in": [RATING_FIELD, ["thumbs_up", "helpful", "4", "5"]]},
                                 1,
                                 0
                             ]
@@ -428,8 +433,8 @@ async def get_feedback_trends(
                     },
                     "negative_feedback": {
                         "$sum": {
-                            "$cond": [
-                                {"$in": ["$rating", ["thumbs_down", "not_helpful", "1", "2"]]},
+                            COND_OPERATOR: [
+                                {"$in": [RATING_FIELD, ["thumbs_down", "not_helpful", "1", "2"]]},
                                 1,
                                 0
                             ]
@@ -512,7 +517,7 @@ async def submit_advanced_feedback(
             "feedback_type": feedback_type,
             "comment": comment,
             "source_documents": source_documents or [],
-            "created_at": datetime.utcnow(),
+            "created_at": datetime.now(timezone.utc),
             "processed": False,
             "training_data_generated": False,
             "phase": "phase_5_advanced"
@@ -543,7 +548,7 @@ async def submit_advanced_feedback(
 
 
 @router.get("/analytics-advanced")
-async def get_advanced_analytics(
+async def get_advanced_analytics(  # noqa: python:S3776
     time_period: str = "7d",
     mongo_client: MongoDBClient = Depends(get_mongodb_client)
 ) -> Dict[str, Any]:
@@ -572,7 +577,7 @@ async def get_advanced_analytics(
         query = {}
         
         if time_delta:
-            cutoff_date = datetime.utcnow() - time_delta
+            cutoff_date = datetime.now(timezone.utc) - time_delta
             query["created_at"] = {"$gte": cutoff_date}
         
         # Get all feedback
@@ -728,7 +733,7 @@ async def generate_training_data_from_feedback(
                 "training_data:phase5:generated",
                 {
                     "entries": training_data,
-                    "generated_at": datetime.utcnow().isoformat(),
+                    "generated_at": datetime.now(timezone.utc).isoformat(),
                     "total_count": len(training_data),
                     "positive_count": len(high_quality),
                     "negative_count": len(low_quality),
@@ -881,7 +886,7 @@ async def _update_feedback_counters(rating: str, redis_client: RedisClient):
             await redis_client.increment_counter("feedback:negative", 86400)
         
         # Update daily counter
-        today = datetime.utcnow().strftime("%Y-%m-%d")
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         await redis_client.increment_counter(f"feedback:daily:{today}", 86400)
         
     except Exception as e:

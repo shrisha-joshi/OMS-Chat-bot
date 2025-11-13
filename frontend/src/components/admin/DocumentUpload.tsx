@@ -1,7 +1,7 @@
 'use client'
 
 import React, { useState, useRef, useEffect } from 'react'
-import { Upload, FileText, CheckCircle, AlertCircle, Loader, RefreshCw, Trash2 } from 'lucide-react'
+import { Upload, FileText, CheckCircle, AlertCircle, Loader, RefreshCw } from 'lucide-react'
 import IngestionStatus from '../IngestionStatus'
 
 interface UploadedFile {
@@ -92,9 +92,9 @@ export function DocumentUpload() {
   const handleFileSelect = (event: React.ChangeEvent<HTMLInputElement>) => {
     const selectedFiles = event.target.files
     if (selectedFiles) {
-      Array.from(selectedFiles).forEach(file => {
+      for (const file of Array.from(selectedFiles)) {
         handleFileUpload(file)
-      })
+      }
     }
     // Reset input
     if (fileInputRef.current) {
@@ -167,20 +167,20 @@ export function DocumentUpload() {
     }
   }
 
-  const handleDragOver = (e: React.DragEvent<HTMLDivElement>) => {
+  const handleDragOver = (e: React.DragEvent<HTMLElement>) => {
     e.preventDefault()
     e.stopPropagation()
   }
 
-  const handleDrop = (e: React.DragEvent<HTMLDivElement>) => {
+  const handleDrop = (e: React.DragEvent<HTMLElement>) => {
     e.preventDefault()
     e.stopPropagation()
 
     const droppedFiles = e.dataTransfer.files
     if (droppedFiles) {
-      Array.from(droppedFiles).forEach(file => {
+      for (const file of Array.from(droppedFiles)) {
         handleFileUpload(file)
-      })
+      }
     }
   }
 
@@ -198,11 +198,11 @@ export function DocumentUpload() {
       </div>
 
       {/* Upload Area */}
-      <div
+      <label
+        htmlFor="document-upload-input"
         onDragOver={handleDragOver}
         onDrop={handleDrop}
-        className="border-2 border-dashed border-gray-300 rounded-lg p-8 text-center hover:border-blue-400 hover:bg-blue-50 transition-colors cursor-pointer"
-        onClick={() => fileInputRef.current?.click()}
+        className="border-2 border-dashed border-gray-300 rounded-lg p-8 text-center hover:border-blue-400 hover:bg-blue-50 transition-colors cursor-pointer w-full"
       >
         <Upload className="w-12 h-12 mx-auto mb-3 text-gray-400" />
         <h3 className="text-lg font-medium text-gray-900 mb-1">
@@ -212,6 +212,7 @@ export function DocumentUpload() {
           or click to browse from your computer
         </p>
         <button
+          type="button"
           className="inline-block px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 font-medium text-sm"
           onClick={(e) => {
             e.stopPropagation()
@@ -222,6 +223,7 @@ export function DocumentUpload() {
         </button>
         <input
           ref={fileInputRef}
+          id="document-upload-input"
           type="file"
           multiple
           onChange={handleFileSelect}
@@ -229,7 +231,7 @@ export function DocumentUpload() {
           className="hidden"
           disabled={isUploading}
         />
-      </div>
+  </label>
 
       {/* Upload Status */}
       {files.length > 0 && (

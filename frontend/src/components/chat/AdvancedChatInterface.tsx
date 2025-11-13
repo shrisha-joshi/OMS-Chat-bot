@@ -60,7 +60,7 @@ export function AdvancedChatInterface() {
     
     const userMessage = message.trim()
     setMessage('')
-    await sendMessage(userMessage)
+    sendMessage(userMessage)
   }
 
   const handleKeyPress = (e: React.KeyboardEvent) => {
@@ -198,7 +198,7 @@ export function AdvancedChatInterface() {
                           </h4>
                           <div className="space-y-2">
                             {msg.sources.map((source, idx) => (
-                              <div key={idx} className="text-xs bg-white p-2 rounded border">
+                              <div key={`source-${msg.id}-${idx}`} className="text-xs bg-white p-2 rounded border">
                                 <div className="flex items-center justify-between mb-1">
                                   <span className="font-medium text-blue-600">{source.filename}</span>
                                   <span className="text-gray-500">Score: {(source.similarity * 100).toFixed(1)}%</span>
@@ -303,7 +303,7 @@ export function AdvancedChatInterface() {
                       {msg.attachments && msg.attachments.length > 0 && (
                         <div className="mt-3 space-y-2">
                           {msg.attachments.map((attachment, idx) => (
-                            <div key={idx} className="flex items-center space-x-2 p-2 bg-gray-50 rounded border">
+                            <div key={`attachment-${msg.id}-${idx}`} className="flex items-center space-x-2 p-2 bg-gray-50 rounded border">
                               {attachment.type.startsWith('image') ? (
                                 <Image className="w-4 h-4 text-gray-500" />
                               ) : (
@@ -414,7 +414,7 @@ export function AdvancedChatInterface() {
               <textarea
                 value={message}
                 onChange={(e) => setMessage(e.target.value)}
-                onKeyPress={handleKeyPress}
+                onKeyDown={handleKeyPress}
                 placeholder="Ask anything about your documents..."
                 className="w-full p-3 pr-12 border border-gray-300 rounded-lg resize-none focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
                 rows={1}
@@ -498,10 +498,10 @@ export function AdvancedChatInterface() {
             <h3 className="text-lg font-medium mb-4">Provide Feedback</h3>
             
             <div className="mb-4">
-              <label className="block text-sm font-medium text-gray-700 mb-2">
+              <label htmlFor="rating-selector" className="block text-sm font-medium text-gray-700 mb-2">
                 How would you rate this response?
               </label>
-              <div className="flex space-x-2">
+              <div id="rating-selector" className="flex space-x-2">
                 {[1, 2, 3, 4, 5].map((rating) => (
                   <button
                     key={rating}
@@ -523,10 +523,11 @@ export function AdvancedChatInterface() {
             </div>
 
             <div className="mb-4">
-              <label className="block text-sm font-medium text-gray-700 mb-2">
+              <label htmlFor="feedback-comment" className="block text-sm font-medium text-gray-700 mb-2">
                 Additional Comments (Optional)
               </label>
               <textarea
+                id="feedback-comment"
                 value={feedbackComment}
                 onChange={(e) => setFeedbackComment(e.target.value)}
                 placeholder="Tell us what could be improved..."

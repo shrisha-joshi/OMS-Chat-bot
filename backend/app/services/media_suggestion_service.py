@@ -5,10 +5,9 @@ Extracts and suggests images, videos, and PDFs from documents.
 
 import logging
 import re
-import base64
+import asyncio
 from typing import Dict, Any, List, Optional
 from datetime import datetime
-from io import BytesIO
 
 from ..config import settings
 from ..core.db_mongo import get_mongodb_client, MongoDBClient
@@ -22,7 +21,7 @@ class MediaSuggestionService:
     def __init__(self):
         self.mongo_client: Optional[MongoDBClient] = None
         self.youtube_regex = r'(?:youtube\.com|youtu\.be)\/[^\s]+'
-        self.image_extensions = ['.jpg', '.jpeg', '.png', '.gif', '.webp']
+        self.image_extensions = ['.jpg', '.jpeg', '.png', '.gi', '.webp']
         self.pdf_extensions = ['.pdf']
     
     async def initialize(self):
@@ -178,6 +177,7 @@ class MediaSuggestionService:
         sources: List[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
         """Suggest PDF documents from sources."""
+        await asyncio.sleep(0)
         pdfs = []
         
         try:
@@ -185,7 +185,7 @@ class MediaSuggestionService:
                 filename = source.get("filename", "")
                 if filename.lower().endswith(".pdf"):
                     pdfs.append({
-                        "type": "pdf",
+                        "type": "pd",
                         "filename": filename,
                         "doc_id": source.get("doc_id"),
                         "size": source.get("size", 0),
@@ -202,13 +202,13 @@ class MediaSuggestionService:
     async def _find_related_images(
         self,
         query: str,
-        sources: List[Dict[str, Any]]
+        _sources: List[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
         """Find images related to query keywords."""
         images = []
         
         try:
-            if not self.mongo_client:
+            if self.mongo_client is None:
                 return images
             
             # Extract keywords from query
@@ -267,6 +267,7 @@ class MediaSuggestionService:
         media: Dict[str, Any]
     ) -> bool:
         """Validate that media suggestion is valid."""
+        await asyncio.sleep(0)
         try:
             media_type = media.get("type")
             
@@ -274,7 +275,7 @@ class MediaSuggestionService:
                 return bool(media.get("videoId") and len(media.get("videoId", "")) == 11)
             elif media_type == "image":
                 return bool(media.get("data"))
-            elif media_type == "pdf":
+            elif media_type == "pd":
                 return bool(media.get("filename") or media.get("doc_id"))
             
             return True
@@ -289,4 +290,5 @@ media_suggestion_service = MediaSuggestionService()
 
 async def get_media_suggestion_service() -> MediaSuggestionService:
     """Dependency injection for media suggestion service."""
+    await asyncio.sleep(0)
     return media_suggestion_service

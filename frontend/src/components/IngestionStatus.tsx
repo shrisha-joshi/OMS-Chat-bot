@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { apiClient } from '@/lib/api';
 
 interface IngestionLog {
@@ -38,11 +38,43 @@ const stageNames: Record<string, string> = {
   JSON_QA: 'Generating Q&A',
 };
 
-export default function IngestionStatus({ docId, onComplete }: IngestionStatusProps) {
+export default function IngestionStatus({ docId, onComplete }: Readonly<IngestionStatusProps>) {
   const [logs, setLogs] = useState<IngestionLog[]>([]);
   const [isProcessing, setIsProcessing] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [ws, setWs] = useState<WebSocket | null>(null);
+  const wsRef = useRef<WebSocket | null>(null);
+
+  // Helper: add a new ingestion log entry if it doesn't already exist
+  const addLogEntry = (data: any) => {
+    setLogs((prev) => {
+      const exists = prev.find((log) => log.step === data.step && log.timestamp === data.timestamp);
+      if (exists) return prev;
+      return [
+        ...prev,
+        {
+          step: data.step,
+          status: data.status,
+          message: data.message,
+          metadata: data.metadata,
+          timestamp: data.timestamp,
+        },
+      ];
+    });
+  };
+
+  // Helper: process parsed websocket message
+  const handleIngestionEvent = (data: any) => {
+    if (data.type === 'ingestion_progress') {
+      addLogEntry(data);
+    } else if (data.type === 'ingestion_complete') {
+      setIsProcessing(false);
+      if (data.status === 'SUCCESS' && onComplete) {
+        onComplete();
+      } else if (data.status === 'FAILED') {
+        setError('Document ingestion failed');
+      }
+    }
+  };
 
   useEffect(() => {
     // Fetch initial status
@@ -66,8 +98,8 @@ export default function IngestionStatus({ docId, onComplete }: IngestionStatusPr
     fetchInitialStatus();
 
     // Connect to WebSocket for real-time updates
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}/monitoring/ws/ingestion/${docId}`;
+    const protocol = globalThis.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = `${protocol}//${globalThis.location.host}/monitoring/ws/ingestion/${docId}`;
     
     try {
       const websocket = new WebSocket(wsUrl);
@@ -75,32 +107,9 @@ export default function IngestionStatus({ docId, onComplete }: IngestionStatusPr
       websocket.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data);
-
-          if (data.type === 'ingestion_progress') {
-            setLogs((prev) => {
-              const exists = prev.find((log) => log.step === data.step && log.timestamp === data.timestamp);
-              if (exists) return prev;
-              return [
-                ...prev,
-                {
-                  step: data.step,
-                  status: data.status,
-                  message: data.message,
-                  metadata: data.metadata,
-                  timestamp: data.timestamp,
-                },
-              ];
-            });
-          } else if (data.type === 'ingestion_complete') {
-            setIsProcessing(false);
-            if (data.status === 'SUCCESS' && onComplete) {
-              onComplete();
-            } else if (data.status === 'FAILED') {
-              setError('Document ingestion failed');
-            }
-          }
-        } catch (parseErr) {
-          console.error('Failed to parse WebSocket message:', parseErr);
+          handleIngestionEvent(data);
+        } catch (error_) {
+          console.error('Failed to parse WebSocket message:', error_);
         }
       };
 
@@ -108,13 +117,13 @@ export default function IngestionStatus({ docId, onComplete }: IngestionStatusPr
         setError('WebSocket connection error');
       };
 
-      setWs(websocket);
+  wsRef.current = websocket;
 
       return () => {
         websocket.close();
       };
-    } catch (wsErr) {
-      console.error('Failed to connect WebSocket:', wsErr);
+    } catch (error_) {
+      console.error('Failed to connect WebSocket:', error_);
       setError('Failed to connect to real-time updates');
     }
   }, [docId, onComplete]);
@@ -161,14 +170,17 @@ export default function IngestionStatus({ docId, onComplete }: IngestionStatusPr
               <div className="flex-1 min-w-0">
                 <div className="flex items-center gap-2">
                   <span className="text-xl">{icon}</span>
-                  <span className={`font-medium ${
-                    status === 'success' ? 'text-green-700' :
-                    status === 'failed' ? 'text-red-700' :
-                    status === 'processing' ? 'text-blue-700' :
-                    'text-slate-500'
-                  }`}>
-                    {name}
-                  </span>
+                  {(() => {
+                    let colorClass = 'text-slate-500';
+                    if (status === 'success') colorClass = 'text-green-700';
+                    else if (status === 'failed') colorClass = 'text-red-700';
+                    else if (status === 'processing') colorClass = 'text-blue-700';
+                    return (
+                      <span className={`font-medium ${colorClass}`}>
+                        {name}
+                      </span>
+                    );
+                  })()}
                 </div>
 
                 {log && (
@@ -177,7 +189,27 @@ export default function IngestionStatus({ docId, onComplete }: IngestionStatusPr
                     {log.metadata && Object.keys(log.metadata).length > 0 && (
                       <p className="text-xs text-slate-500 mt-1">
                         {Object.entries(log.metadata)
-                          .map(([key, value]) => `${key}: ${value}`)
+                          .map(([key, value]) => {
+                            let val: string;
+                            if (value === null || value === undefined) {
+                              val = '';
+                            } else if (typeof value === 'object') {
+                              try {
+                                val = JSON.stringify(value);
+                              } catch {
+                                val = '[object]';
+                              }
+                            } else if (typeof value === 'string') {
+                              val = value;
+                            } else if (typeof value === 'number') {
+                              val = Number.isFinite(value) ? value.toString() : 'NaN';
+                            } else if (typeof value === 'boolean') {
+                              val = value ? 'true' : 'false';
+                            } else {
+                              val = '';
+                            }
+                            return `${key}: ${val}`;
+                          })
                           .join(' • ')}
                       </p>
                     )}

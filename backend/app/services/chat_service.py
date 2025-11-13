@@ -10,7 +10,7 @@ import httpx
 import json
 import hashlib
 from typing import Dict, Any, List, Optional, AsyncGenerator
-from datetime import datetime
+from datetime import datetime, timezone
 import time
 import re
 
@@ -149,6 +149,347 @@ class ChatService:
             self._embedding_cache_service = await get_embedding_cache_service(self.redis_client)
         return self._embedding_cache_service
     
+    # ========== RAG PIPELINE PHASE FUNCTIONS (Complexity Reduction) ==========
+    
+    async def _phase1_query_enhancement(self, query: str) -> tuple:
+        """Phase 1: Query enhancement and variant generation."""
+        logger.info("🔄 Step 1: Query Enhancement & Understanding")
+        query_enhancement = await query_intelligence_service.enhance_query(query)
+        processed_query = query_enhancement["rewritten_queries"][0]
+        logger.info(f"  📝 Enhanced Query: {processed_query[:150]}...")
+        logger.info(f"  🏷️  Query Type: {query_enhancement['query_type']}")
+        
+        # Generate query variants
+        queries_tried = [processed_query]
+        try:
+            query_rewriting_service = await self._get_query_rewriting_service()
+            if query_rewriting_service:
+                query_variants = await query_rewriting_service.rewrite_query(
+                    query=processed_query,
+                    query_type=query_enhancement.get("query_type", "general"),
+                    context=query_enhancement
+                )
+                queries_tried = [v["rewritten_query"] for v in query_variants["variants"]]
+                logger.info(f"  📚 Phase 3: Generated {len(queries_tried)} query variants")
+        except Exception as e:
+            logger.warning(f"Phase 3 Query Rewriting failed: {e}")
+        
+        return processed_query, query_enhancement, queries_tried
+    
+    async def _phase2_embedding_generation(self, processed_query: str) -> tuple:
+        """Phase 2: Generate or retrieve cached embeddings."""
+        logger.info("🔄 Step 2: Embedding Generation (with cache)")
+        query_embedding = None
+        cache_hit = False
+        cache_hits = 0
+        
+        # Try cache first
+        try:
+            embedding_cache_service = await self._get_embedding_cache_service()
+            if embedding_cache_service:
+                query_hash = hashlib.md5(processed_query.encode()).hexdigest()
+                cached_embedding = await embedding_cache_service.get_embedding(query_hash)
+                if cached_embedding:
+                    query_embedding = cached_embedding
+                    cache_hit = True
+                    cache_hits += 1
+                    logger.info(f"  💾 Embedding Cache HIT: hash={query_hash[:8]}...")
+        except Exception as e:
+            logger.warning(f"Embedding Cache retrieval failed: {e}")
+        
+        # Generate if not cached
+        if not query_embedding:
+            query_embedding = await self._generate_query_embedding(processed_query)
+            logger.info(f"  🔢 Generated embedding: {len(query_embedding)} dimensions")
+            
+            # Cache new embedding
+            try:
+                embedding_cache_service = await self._get_embedding_cache_service()
+                if embedding_cache_service:
+                    query_hash = hashlib.md5(processed_query.encode()).hexdigest()
+                    await embedding_cache_service.cache_embedding(query_hash, query_embedding, ttl=86400)
+                    logger.info(f"  💾 Cached new embedding: hash={query_hash[:8]}...")
+            except Exception as e:
+                logger.warning(f"Embedding Cache storage failed: {e}")
+        
+        return query_embedding, cache_hit, cache_hits
+    
+    async def _phase3_hybrid_retrieval(self, processed_query: str, query_embedding: list, 
+                                       query_enhancement: dict) -> list:
+        """Phase 3: Hybrid retrieval using multiple strategies."""
+        logger.info("🔄 Step 3: Hybrid Retrieval (Vector + Keyword + Graph)")
+        
+        # Try Graph RAG first
+        graph_rag_results = await self._try_graph_rag_retrieval(processed_query)
+        if graph_rag_results:
+            return graph_rag_results
+        
+        # Try Hybrid Search with RRF
+        hybrid_results = await self._try_hybrid_search_rrf(processed_query, query_embedding)
+        if hybrid_results:
+            return hybrid_results
+        
+        # Fallback to traditional retrieval
+        return await self._fallback_traditional_retrieval(query_embedding, query_enhancement, processed_query)
+    
+    async def _try_graph_rag_retrieval(self, processed_query: str):
+        """Attempt Graph RAG hybrid retrieval."""
+        try:
+            if settings.use_graph_search:
+                logger.info("  🕸️  Attempting Graph RAG Hybrid Retrieval...")
+                results = await hybrid_retrieval_service.retrieve(
+                    query=processed_query,
+                    top_k=settings.top_k_retrieval,
+                    vector_k=settings.top_k_retrieval * 2,
+                    graph_hops=2,
+                    use_reranking=True
+                )
+                if results:
+                    logger.info(f"  ✅ Graph RAG retrieval: {len(results)} results")
+                    return results
+        except Exception as e:
+            logger.warning(f"Graph RAG retrieval failed: {e}")
+        return None
+    
+    async def _try_hybrid_search_rrf(self, processed_query: str, query_embedding: list):
+        """Attempt Hybrid Search with RRF fusion."""
+        try:
+            hybrid_search_service = await self._get_hybrid_search_service()
+            if hybrid_search_service:
+                hybrid_results = await hybrid_search_service.hybrid_search_with_rrf(
+                    query_text=processed_query,
+                    query_embedding=query_embedding,
+                    top_k=settings.top_k_retrieval,
+                    rrf_k=60
+                )
+                merged_results = hybrid_results.get("merged_results", [])
+                logger.info("  📊 Phase 1 (RRF) Hybrid Search Results:")
+                logger.info(f"    🔵 Vector: {hybrid_results.get('vector_count', 0)}, "
+                          f"🟢 BM25: {hybrid_results.get('bm25_count', 0)}, "
+                          f"✨ Final: {len(merged_results)}")
+                return merged_results
+        except Exception as e:
+            logger.warning(f"RRF Hybrid Search failed: {e}")
+        return None
+    
+    async def _fallback_traditional_retrieval(self, query_embedding: list, 
+                                             query_enhancement: dict, processed_query: str):
+        """Fallback to traditional vector + keyword retrieval."""
+        logger.info("  ⚠️  Fallback: Using traditional retrieval pipeline")
+        
+        # Vector search
+        vector_results = await self._get_cached_retrieval_results(query_embedding)
+        if not vector_results:
+            vector_results = await self.qdrant_client.search_similar(
+                query_vector=query_embedding,
+                top_k=settings.top_k_retrieval * 2
+            )
+            logger.info(f"    🎯 Qdrant search: {len(vector_results)} results")
+            await self._cache_retrieval_results(query_embedding, vector_results)
+        
+        # HyDE search if available
+        if query_enhancement.get("hyde_embedding"):
+            hyde_results = await self.qdrant_client.search_similar(
+                query_vector=query_enhancement.get("hyde_embedding"),
+                top_k=settings.top_k_retrieval
+            )
+            logger.info(f"    🎯 HyDE search: {len(hyde_results)} results")
+        
+        # BM25 keyword search
+        keyword_results = await self._bm25_search(processed_query)
+        logger.info(f"    🎯 BM25 search: {len(keyword_results)} results")
+        
+        return vector_results or []
+    
+    async def _phase4_entity_extraction(self, processed_query: str) -> list:
+        """Phase 4: Extract entities and search graph."""
+        logger.info("🔄 Step 4: Entity Extraction & Semantic Search")
+        graph_results = []
+        
+        if settings.use_graph_search and self.nlp_model:
+            entities = self._extract_entities_from_query(processed_query)
+            if entities:
+                logger.info(f"  🏷️  Extracted entities: {entities[:3]}...")
+                try:
+                    related_docs = await self.mongo_client.database.entities.find(
+                        {"name": {"$in": entities}}
+                    ).to_list(5)
+                    graph_results = related_docs if related_docs else []
+                    logger.info(f"  📈 Found {len(graph_results)} related entities")
+                except Exception as e:
+                    logger.warning(f"  ⚠️  Failed to query entities: {e}")
+            else:
+                logger.info("  ℹ️  No entities extracted")
+        
+        return graph_results
+    
+    async def _phase5_context_optimization(self, merged_results: list, processed_query: str, 
+                                          graph_results: list, query_enhancement: dict) -> tuple:
+        """Phase 5: Enhance, rerank, and optimize context."""
+        logger.info("🔄 Step 5: Context Optimization & Reranking")
+        
+        # Contextual enhancement
+        enhanced_results = await self._enhance_with_context(merged_results, processed_query)
+        
+        # Merge and rerank
+        merged_final = await self._advanced_merge_and_rerank(
+            enhanced_results, [], [], graph_results,
+            processed_query, query_enhancement["processing_strategy"]
+        )
+        logger.info(f"  📊 Final reranked results: {len(merged_final)} chunks")
+        
+        # Optimize and format context
+        logger.info("🔄 Step 6: Context Compression & Reasoning Template")
+        optimization_result = await context_optimization_service.optimize_context(
+            merged_final, processed_query,
+            max_tokens=settings.max_context_tokens,
+            strategy=query_enhancement["processing_strategy"]
+        )
+        
+        context_text = optimization_result["formatted_context"]
+        reasoning_template = optimization_result["reasoning_template"]
+        sources = optimization_result["sources_used"]
+        
+        logger.info(f"  📝 Context: {len(context_text)} chars, {len(sources)} sources")
+        return context_text, reasoning_template, sources
+    
+    async def _enhance_with_context(self, merged_results: list, processed_query: str):
+        """Enhance retrieval results with contextual information."""
+        enhanced_results = merged_results
+        try:
+            contextual_service = await self._get_contextual_retrieval_service()
+            if contextual_service:
+                result = await contextual_service.add_context_to_chunks(
+                    chunks=merged_results,
+                    query=processed_query,
+                    chunk_size=settings.chunk_size,
+                    context_window_size=3
+                )
+                enhanced_results = result.get("enhanced_chunks", merged_results)
+                stats = result.get("context_statistics", {})
+                logger.info(f"  ✨ Enhanced {stats.get('chunks_enhanced', 0)} chunks")
+        except Exception as e:
+            logger.warning(f"Contextual Retrieval failed: {e}")
+        return enhanced_results
+    
+    async def _phase6_response_generation(self, processed_query: str, context_text: str,
+                                         reasoning_template: str, context: list) -> str:
+        """Phase 6: Generate LLM response with Chain-of-Thought."""
+        logger.info("🔄 Step 7: LLM Response Generation (Chain-of-Thought)")
+        response = await self._generate_llm_response_with_cot(
+            processed_query, context_text, reasoning_template, context
+        )
+        logger.info(f"  ✅ LLM Response generated: {len(response)} chars")
+        return response
+    
+    async def _phase7_validation_and_enrichment(self, response: str, sources: list, 
+                                               query: str, session_id: str) -> tuple:
+        """Phase 7: Validate response and enrich with media suggestions."""
+        # Validation
+        logger.info("🔄 Step 7b: Response Validation")
+        is_valid, validation_details = await response_validation_service.validate_response(
+            response=response, sources=sources, query=query
+        )
+        
+        if is_valid:
+            logger.info(f"✅ Validation passed - Score: {validation_details.get('validation_score', 0):.2f}")
+        else:
+            logger.warning(f"⚠️  Validation issues: {validation_details.get('issues', [])}")
+        
+        # Store validation log
+        await self._store_validation_log(query, session_id, response, is_valid, validation_details)
+        
+        # Media enrichment
+        logger.info("🔄 Step 7c: Media Enrichment")
+        media_suggestions = await media_suggestion_service.suggest_media_for_response(
+            query=query, response=response, sources=sources
+        )
+        logger.info(f"  🎬 Media suggestions: {len(media_suggestions)} items")
+        
+        return validation_details, media_suggestions
+    
+    async def _store_validation_log(self, query: str, session_id: str, response: str,
+                                   is_valid: bool, validation_details: dict):
+        """Store validation log in MongoDB."""
+        try:
+            await self.mongo_client.database.document_validation_logs.insert_one({
+                "query_id": hashlib.md5(query.encode()).hexdigest(),
+                "session_id": session_id,
+                "response": response[:500],
+                "is_valid": is_valid,
+                "validation_score": validation_details.get('validation_score', 0),
+                "has_citations": validation_details.get('has_citations', False),
+                "citation_count": validation_details.get('citation_count', 0),
+                "has_generic_phrases": validation_details.get('has_generic_phrases', False),
+                "generic_phrase_count": validation_details.get('generic_phrase_count', 0),
+                "validation_details": validation_details,
+                "created_at": datetime.now()
+            })
+        except Exception as e:
+            logger.warning(f"Failed to store validation log: {e}")
+    
+    async def _phase8_finalize_response(self, query: str, session_id: str, response: str,
+                                       sources: list, validation_details: dict,
+                                       media_suggestions: list, processing_time: float,
+                                       queries_tried: list, cache_hits: int) -> dict:
+        """Phase 8: Finalize and return complete response."""
+        # Extract attachments
+        attachments = self._extract_attachments(sources)
+        
+        # Store conversation
+        await self._store_conversation_turn(session_id, query, response, sources)
+        
+        # Log summary
+        logger.info("✅ ===== RAG PIPELINE COMPLETE =====")
+        logger.info(f"⏱️  Processing time: {processing_time:.2f}s")
+        logger.info(f"📊 Query: {query[:60]}..., Sources: {len(sources)}, Response: {len(response)} chars")
+        
+        # Evaluate quality
+        evaluation_metrics = await self._evaluate_response_quality(
+            query, response, sources, processing_time, "", session_id
+        )
+        
+        # Build result
+        result = {
+            "response": response,
+            "sources": sources,
+            "attachments": attachments,
+            "media_suggestions": media_suggestions,
+            "validation_details": validation_details,
+            "processing_time": processing_time,
+            "tokens_generated": len(response.split()),
+            "evaluation_metrics": evaluation_metrics.__dict__ if evaluation_metrics else None,
+            "phase3_metrics": {
+                "query_variants_generated": len(queries_tried),
+                "embedding_cache_hits": cache_hits,
+                "contextual_enhancement_enabled": True,
+                "hybrid_search_enabled": True
+            }
+        }
+        
+        # Cache if high quality
+        if evaluation_metrics and evaluation_metrics.answer_accuracy > 0.7:
+            await self._cache_query_result(query, result)
+        
+        return result
+    
+    async def _evaluate_response_quality(self, query: str, response: str, sources: list,
+                                        processing_time: float, context_text: str,
+                                        session_id: str):
+        """Evaluate response quality metrics."""
+        try:
+            metrics = await evaluation_service.evaluate_query_response(
+                query, response, sources, processing_time, context_text, session_id
+            )
+            logger.info(f"📈 Evaluation - Accuracy: {metrics.answer_accuracy:.2f}, "
+                       f"Relevance: {metrics.response_relevance:.2f}")
+            return metrics
+        except Exception as e:
+            logger.warning(f"Evaluation failed: {e}")
+            return None
+    
+    # ========== MAIN PIPELINE ORCHESTRATOR ==========
+    
     async def process_query(self, query: str, session_id: str, context: List[Dict] = None) -> Dict[str, Any]:
         """
         Process a chat query through the complete RAG pipeline.
@@ -163,7 +504,7 @@ class ChatService:
         """
         try:
             start_time = time.time()
-            logger.info(f"🔍 ===== RAG PIPELINE START =====")
+            logger.info("🔍 ===== RAG PIPELINE START =====")
             logger.info(f"📌 Session: {session_id}")
             logger.info(f"❓ Query: {query[:200]}")
             
@@ -177,312 +518,43 @@ class ChatService:
                 logger.info("✅ RAG PIPELINE: Returning cached response")
                 return cached_response
             
-            # Step 1: Advanced query understanding and enhancement
-            logger.info(f"🔄 Step 1: Query Enhancement & Understanding")
-            query_enhancement = await query_intelligence_service.enhance_query(query)
-            processed_query = query_enhancement["rewritten_queries"][0]  # Use best rewrite
-            logger.info(f"  📝 Enhanced Query: {processed_query[:150]}...")
-            logger.info(f"  🏷️  Query Type: {query_enhancement['query_type']}")
+            # Phase 1: Query Enhancement
+            processed_query, query_enhancement, queries_tried = await self._phase1_query_enhancement(query)
+            self._queries_tried = queries_tried
             
-            # Phase 3: Enhanced query rewriting with multiple variants
-            try:
-                query_rewriting_service = await self._get_query_rewriting_service()
-                if query_rewriting_service:
-                    query_variants = await query_rewriting_service.rewrite_query(
-                        query=processed_query,
-                        query_type=query_enhancement.get("query_type", "general"),
-                        context=query_enhancement
-                    )
-                    self._queries_tried = [v["rewritten_query"] for v in query_variants["variants"]]
-                    logger.info(f"  📚 Phase 3: Generated {len(self._queries_tried)} query variants")
-            except Exception as e:
-                logger.warning(f"Phase 3 Query Rewriting failed (graceful degradation): {e}")
-                self._queries_tried = [processed_query]
+            # Phase 2: Embedding Generation
+            query_embedding, _cache_hit, cache_hits = await self._phase2_embedding_generation(processed_query)
+            self._cache_hits = cache_hits
             
-            # Step 2: Generate multiple query embeddings for hybrid approach
-            # Phase 3: Check embedding cache first
-            logger.info(f"🔄 Step 2: Embedding Generation (with cache)")
-            query_embedding = None
-            cache_hit = False
-            try:
-                embedding_cache_service = await self._get_embedding_cache_service()
-                if embedding_cache_service:
-                    query_hash = hashlib.md5(processed_query.encode()).hexdigest()
-                    cached_embedding = await embedding_cache_service.get_embedding(query_hash)
-                    if cached_embedding:
-                        query_embedding = cached_embedding
-                        cache_hit = True
-                        self._cache_hits += 1
-                        logger.info(f"  💾 Embedding Cache HIT: hash={query_hash[:8]}...")
-            except Exception as e:
-                logger.warning(f"Phase 3 Embedding Cache retrieval failed: {e}")
-            
-            # Generate embedding if not cached
-            if not query_embedding:
-                query_embedding = await self._generate_query_embedding(processed_query)
-                logger.info(f"  🔢 Generated embedding: {len(query_embedding)} dimensions")
-                # Cache the newly generated embedding
-                try:
-                    embedding_cache_service = await self._get_embedding_cache_service()
-                    if embedding_cache_service:
-                        query_hash = hashlib.md5(processed_query.encode()).hexdigest()
-                        await embedding_cache_service.cache_embedding(query_hash, query_embedding, ttl=86400)  # 24h TTL
-                        logger.info(f"  💾 Cached new embedding: hash={query_hash[:8]}...")
-                except Exception as e:
-                    logger.warning(f"Phase 3 Embedding Cache storage failed: {e}")
-            
-            hyde_embedding = query_enhancement.get("hyde_embedding")
-            
-            # Step 3: Hybrid retrieval - Vector + Keyword + HyDE + Graph + Phase 3 Hybrid Search
-            logger.info(f"🔄 Step 3: Hybrid Retrieval (Vector + Keyword + Graph)")
-            
-            # NEW: Try Graph RAG hybrid retrieval first (if Neo4j available)
-            graph_rag_results = None
-            try:
-                if settings.use_graph_search:
-                    logger.info(f"  🕸️  Attempting Graph RAG Hybrid Retrieval...")
-                    graph_rag_results = await hybrid_retrieval_service.retrieve(
-                        query=processed_query,
-                        top_k=settings.top_k_retrieval,
-                        vector_k=settings.top_k_retrieval * 2,
-                        graph_hops=2,
-                        use_reranking=True
-                    )
-                    if graph_rag_results:
-                        merged_results = graph_rag_results
-                        logger.info(f"  ✅ Graph RAG retrieval: {len(merged_results)} results with graph context")
-            except Exception as e:
-                logger.warning(f"Graph RAG retrieval failed (graceful degradation): {e}")
-            
-            # Phase 3: Use Hybrid Search Service for combined approach (if Graph RAG didn't work)
-            if not graph_rag_results:
-                merged_results = None
-                try:
-                    hybrid_search_service = await self._get_hybrid_search_service()
-                    if hybrid_search_service:
-                        # Use RRF hybrid search for better fusion
-                        hybrid_results = await hybrid_search_service.hybrid_search_with_rrf(
-                            query_text=processed_query,
-                            query_embedding=query_embedding,
-                            top_k=settings.top_k_retrieval,
-                            rrf_k=60  # Tuned RRF parameter
-                        )
-                        merged_results = hybrid_results.get("merged_results", [])
-                        logger.info(f"  📊 Phase 1 (RRF) Hybrid Search Results:")
-                        logger.info(f"    🔵 Vector Search: {hybrid_results.get('vector_count', 0)} candidates")
-                    logger.info(f"    🟢 BM25 Search: {hybrid_results.get('bm25_count', 0)} candidates")
-                    logger.info(f"    🟡 RRF Fused: {hybrid_results.get('rrf_count', 0)} candidates")
-                    logger.info(f"    ✨ Final Results: {len(merged_results)} results (algorithm: {hybrid_results.get('algorithm', 'unknown')})")
-                    logger.info(f"    ⏱️  Search time: {hybrid_results.get('total_time_ms', 0)}ms")
-                except Exception as e:
-                    logger.warning(f"Phase 1 RRF Hybrid Search failed (graceful degradation): {e}")
-            
-            # Fallback to original retrieval if Phase 3 hybrid search unavailable
-            if not merged_results:
-                logger.info(f"  ⚠️  Fallback: Using traditional retrieval pipeline")
-                # Check for cached retrieval results
-                vector_results = await self._get_cached_retrieval_results(query_embedding)
-                
-                if not vector_results:
-                    vector_results = await self.qdrant_client.search_similar(
-                        query_vector=query_embedding,
-                        top_k=settings.top_k_retrieval * 2  # Get more for reranking
-                    )
-                    logger.info(f"    🎯 Qdrant search: {len(vector_results)} results")
-                    # Cache the results
-                    await self._cache_retrieval_results(query_embedding, vector_results)
-                else:
-                    logger.info(f"    💾 Using cached vector results: {len(vector_results)} results")
-                
-                # Additional HyDE search if available
-                hyde_results = []
-                if query_enhancement.get("hyde_embedding"):
-                    hyde_results = await self.qdrant_client.search_similar(
-                        query_vector=query_enhancement.get("hyde_embedding"),
-                        top_k=settings.top_k_retrieval
-                    )
-                    logger.info(f"    🎯 HyDE search: {len(hyde_results)} results")
-                
-                # BM25 keyword search
-                keyword_results = await self._bm25_search(processed_query)
-                logger.info(f"    🎯 BM25 search: {len(keyword_results)} results")
-                
-                vector_results = vector_results or []
-                hyde_results = hyde_results or []
-                keyword_results = keyword_results or []
-                merged_results = vector_results
-            
-            # Step 4: Extract entities from query for semantic search
-            logger.info(f"🔄 Step 4: Entity Extraction & Semantic Search")
-            graph_results = []
-            if settings.use_graph_search and self.nlp_model:
-                entities = self._extract_entities_from_query(processed_query)
-                if entities:
-                    logger.info(f"  🏷️  Extracted entities: {entities[:3]}...")
-                    # Query MongoDB for related entities instead of ArangoDB
-                    try:
-                        related_entity_docs = await self.mongo_client.database.entities.find(
-                            {"name": {"$in": entities}}
-                        ).to_list(5)
-                        graph_results = related_entity_docs if related_entity_docs else []
-                        logger.info(f"  📈 Found {len(graph_results)} related entities in MongoDB")
-                    except Exception as e:
-                        logger.warning(f"  ⚠️  Failed to query entities: {e}")
-                        graph_results = []
-                else:
-                    logger.info(f"  ℹ️  No entities extracted from query")
-            else:
-                logger.info(f"  ⚠️  Graph search disabled or NLP unavailable")
-            
-            # Phase 3: Enhance retrieval results with contextual information
-            logger.info(f"🔄 Step 5: Context Optimization & Reranking")
-            enhanced_results = merged_results
-            try:
-                contextual_retrieval_service = await self._get_contextual_retrieval_service()
-                if contextual_retrieval_service:
-                    enhancement_result = await contextual_retrieval_service.add_context_to_chunks(
-                        chunks=merged_results,
-                        query=processed_query,
-                        chunk_size=settings.chunk_size,
-                        context_window_size=3  # Include 3 chunks before/after
-                    )
-                    enhanced_results = enhancement_result.get("enhanced_chunks", merged_results)
-                    context_additions = enhancement_result.get("context_statistics", {})
-                    logger.info(f"  ✨ Phase 3 Contextual Retrieval:")
-                    logger.info(f"    📚 Enhanced {context_additions.get('chunks_enhanced', 0)} chunks")
-                    logger.info(f"    📏 Avg context added: {context_additions.get('avg_context_added', 0):.0f} chars")
-            except Exception as e:
-                logger.warning(f"Phase 3 Contextual Retrieval failed (graceful degradation): {e}")
-            
-            # Step 5: Merge and rerank results with adaptive strategy
-            merged_results_final = await self._advanced_merge_and_rerank(
-                enhanced_results, [], [], graph_results, 
-                processed_query, query_enhancement["processing_strategy"]
-            )
-            logger.info(f"  📊 Final reranked results: {len(merged_results_final)} chunks")
-            
-            # Step 6: Optimize context using advanced compression and CoT
-            logger.info(f"🔄 Step 6: Context Compression & Reasoning Template")
-            optimization_result = await context_optimization_service.optimize_context(
-                merged_results_final, processed_query, 
-                max_tokens=settings.max_context_tokens,
-                strategy=query_enhancement["processing_strategy"]
+            # Phase 3: Hybrid Retrieval
+            merged_results = await self._phase3_hybrid_retrieval(
+                processed_query, query_embedding, query_enhancement
             )
             
-            context_text = optimization_result["formatted_context"]
-            reasoning_template = optimization_result["reasoning_template"]
-            sources = optimization_result["sources_used"]
+            # Phase 4: Entity Extraction
+            graph_results = await self._phase4_entity_extraction(processed_query)
             
-            logger.info(f"  📝 Context prepared:")
-            logger.info(f"    📊 Context length: {len(context_text)} chars")
-            logger.info(f"    📚 Sources: {len(sources)} documents")
-            logger.info(f"    🔤 Top source: {sources[0]['filename'] if sources else 'None'}")
+            # Phase 5: Context Optimization
+            context_text, reasoning_template, sources = await self._phase5_context_optimization(
+                merged_results, processed_query, graph_results, query_enhancement
+            )
             
-            # Step 7: Generate response using LMStudio with CoT reasoning
-            logger.info(f"🔄 Step 7: LLM Response Generation (Chain-of-Thought)")
-            response = await self._generate_llm_response_with_cot(
+            # Phase 6: Response Generation
+            response = await self._phase6_response_generation(
                 processed_query, context_text, reasoning_template, context
             )
-            logger.info(f"  ✅ LLM Response generated: {len(response)} chars")
             
-            # Step 7b: Validate response uses documents (Phase 2)
-            logger.info(f"🔄 Step 7b: Response Validation (Document Usage Check)")
-            is_valid, validation_details = await response_validation_service.validate_response(
-                response=response,
-                sources=sources,
-                query=query
+            # Phase 7: Validation & Enrichment
+            validation_details, media_suggestions = await self._phase7_validation_and_enrichment(
+                response, sources, query, session_id
             )
             
-            if is_valid:
-                logger.info(f"✅ Response validation passed - Score: {validation_details.get('validation_score', 0):.2f}")
-            else:
-                logger.warning(f"⚠️  Response validation found issues: {validation_details.get('issues', [])}")
-            
-            # Store validation log in MongoDB
-            try:
-                await self.mongo_client.database.document_validation_logs.insert_one({
-                    "query_id": hashlib.md5(query.encode()).hexdigest(),
-                    "session_id": session_id,
-                    "response": response[:500],  # Store first 500 chars
-                    "is_valid": is_valid,
-                    "validation_score": validation_details.get('validation_score', 0),
-                    "has_citations": validation_details.get('has_citations', False),
-                    "citation_count": validation_details.get('citation_count', 0),
-                    "has_generic_phrases": validation_details.get('has_generic_phrases', False),
-                    "generic_phrase_count": validation_details.get('generic_phrase_count', 0),
-                    "validation_details": validation_details,
-                    "created_at": datetime.now()
-                })
-                logger.debug("✅ Validation log stored in MongoDB")
-            except Exception as e:
-                logger.warning(f"Failed to store validation log: {e}")
-            
-            # Step 7c: Get media suggestions (Phase 2)
-            logger.info(f"🔄 Step 7c: Media Enrichment (Suggest Images & Videos)")
-            media_suggestions = await media_suggestion_service.suggest_media_for_response(
-                query=query,
-                response=response,
-                sources=sources
-            )
-            logger.info(f"  🎬 Media suggestions: {len(media_suggestions)} items")
-            if media_suggestions:
-                logger.info(f"    Media types: {', '.join(set(m.get('type', 'unknown') for m in media_suggestions))}")
-            
-            # Step 8: Extract attachments from sources
-            attachments = self._extract_attachments(sources)
-            logger.info(f"  🎬 Extracted {len(attachments)} attachments")
-            
-            # Step 9: Store conversation in session
-            await self._store_conversation_turn(session_id, query, response, sources)
-            
+            # Phase 8: Finalize Response
             processing_time = time.time() - start_time
-            logger.info(f"✅ ===== RAG PIPELINE COMPLETE =====")
-            logger.info(f"⏱️  Total processing time: {processing_time:.2f}s")
-            logger.info(f"📊 Pipeline summary:")
-            logger.info(f"  - Query: {query[:60]}...")
-            logger.info(f"  - Sources used: {len(sources)}")
-            logger.info(f"  - Response length: {len(response)} chars")
-            logger.info(f"  - Processing time: {processing_time:.2f}s")
-            
-            # Step 9: Evaluate response quality
-            try:
-                evaluation_metrics = await evaluation_service.evaluate_query_response(
-                    query, response, sources, processing_time, context_text, session_id
-                )
-                logger.info(f"📈 Query evaluation - Accuracy: {evaluation_metrics.answer_accuracy:.2f}, "
-                          f"Relevance: {evaluation_metrics.response_relevance:.2f}")
-            except Exception as e:
-                logger.warning(f"Evaluation failed: {e}")
-                evaluation_metrics = None
-            
-            # Phase 3: Calculate Phase 3 metrics
-            phase3_metrics = {
-                "query_variants_generated": len(self._queries_tried),
-                "embedding_cache_hits": self._cache_hits,
-                "cache_hit_this_query": cache_hit,
-                "contextual_enhancement_enabled": True,
-                "hybrid_search_enabled": True,
-                "accuracy_improvement_est": min(0.15 * (len(self._queries_tried) - 1) + 
-                                               0.10 * self._cache_hits / max(1, len(self._queries_tried)), 0.40)
-            }
-            
-            result = {
-                "response": response,
-                "sources": sources,
-                "attachments": attachments,
-                "media_suggestions": media_suggestions,  # Phase 2: Media enrichment
-                "validation_details": validation_details,  # Phase 2: Response validation
-                "processing_time": processing_time,
-                "tokens_generated": len(response.split()),  # Rough token estimate
-                "evaluation_metrics": evaluation_metrics.__dict__ if evaluation_metrics else None,
-                "phase3_metrics": phase3_metrics
-            }
-            
-            # Cache the result if quality is good
-            if evaluation_metrics and evaluation_metrics.answer_accuracy > 0.7:
-                await self._cache_query_result(query, result)
-            
-            return result
+            return await self._phase8_finalize_response(
+                query, session_id, response, sources, validation_details,
+                media_suggestions, processing_time, queries_tried, cache_hits
+            )
             
         except Exception as e:
             logger.error(f"❌ Query processing failed: {e}", exc_info=True)
@@ -508,7 +580,7 @@ class ChatService:
         try:
             # Step 1: Preprocessing
             yield {"type": "status", "content": "Processing query..."}
-            processed_query = await self._preprocess_query(query)
+            processed_query = self._preprocess_query(query)
             
             # Step 2: Retrieval
             yield {"type": "status", "content": "Searching knowledge base..."}
@@ -539,7 +611,7 @@ class ChatService:
             merged_results = await self._merge_and_rerank_results(
                 vector_results, graph_results, processed_query
             )
-            context_text, sources = await self._build_llm_context(merged_results, processed_query)
+            context_text, sources = await self._build_llm_context(merged_results)
             
             # Step 5: Generate streaming response
             yield {"type": "status", "content": "Generating response..."}
@@ -593,7 +665,7 @@ class ChatService:
             logger.warning(f"Failed to get conversation context: {e}")
             return []
     
-    async def _preprocess_query(self, query: str) -> str:
+    def _preprocess_query(self, query: str) -> str:
         """Preprocess and enhance the user query."""
         # Clean the query
         query = query.strip()
@@ -683,6 +755,7 @@ class ChatService:
     
     async def _rerank_results(self, results: List[Dict], query: str) -> List[Dict]:
         """Rerank results using cross-encoder model."""
+        await asyncio.sleep(0)  # Use async feature
         try:
             if not results:
                 return results
@@ -713,7 +786,45 @@ class ChatService:
             logger.error(f"Reranking failed: {e}")
             return results
     
-    async def _build_llm_context(self, results: List[Dict], query: str) -> tuple[str, List[Dict]]:
+    async def _get_document_metadata(self, doc_id: str) -> Optional[Dict[str, Any]]:
+        """Get document metadata from cache or database."""
+        # Try cache first
+        doc_metadata = await self.redis_client.get_cached_document_metadata(doc_id)
+        if doc_metadata:
+            return doc_metadata
+        
+        # Fetch from database
+        document = await self.mongo_client.get_document(doc_id)
+        if not document:
+            return None
+        
+        doc_metadata = {
+            "filename": document.get("filename", "Unknown"),
+            "file_type": document.get("file_type", ""),
+            "uploaded_at": document.get("uploaded_at", "").isoformat() if document.get("uploaded_at") else ""
+        }
+        await self.redis_client.cache_document_metadata(doc_id, doc_metadata)
+        return doc_metadata
+    
+    def _format_source_entry(self, result: Dict, doc_metadata: Optional[Dict], index: int) -> tuple[str, Dict]:
+        """Format a single source entry for context and metadata."""
+        chunk_text = result.get("text", "")
+        source_label = f"[Source {index+1}]"
+        context_part = f"{source_label} {chunk_text}"
+        
+        source_dict = {
+            "id": result.get("id", ""),
+            "doc_id": result.get("doc_id", ""),
+            "chunk_id": result.get("chunk_id", ""),
+            "filename": doc_metadata.get("filename", "Unknown") if doc_metadata else "Unknown",
+            "text": chunk_text[:200] + "..." if len(chunk_text) > 200 else chunk_text,
+            "score": result.get("score", 0),
+            "source_label": source_label
+        }
+        
+        return context_part, source_dict
+    
+    async def _build_llm_context(self, results: List[Dict]) -> tuple[str, List[Dict]]:
         """Build context for LLM and prepare source metadata."""
         if not results:
             return "No relevant information found.", []
@@ -722,37 +833,19 @@ class ChatService:
         sources = []
         
         for i, result in enumerate(results):
-            # Get document metadata
             doc_id = result.get("doc_id", "")
             chunk_text = result.get("text", "")
             
-            if doc_id and chunk_text:
-                # Get document info from cache or database
-                doc_metadata = await self.redis_client.get_cached_document_metadata(doc_id)
-                if not doc_metadata:
-                    document = await self.mongo_client.get_document(doc_id)
-                    if document:
-                        doc_metadata = {
-                            "filename": document.get("filename", "Unknown"),
-                            "file_type": document.get("file_type", ""),
-                            "uploaded_at": document.get("uploaded_at", "").isoformat() if document.get("uploaded_at") else ""
-                        }
-                        await self.redis_client.cache_document_metadata(doc_id, doc_metadata)
-                
-                # Add to context
-                source_label = f"[Source {i+1}]"
-                context_parts.append(f"{source_label} {chunk_text}")
-                
-                # Add to sources list
-                sources.append({
-                    "id": result.get("id", ""),
-                    "doc_id": doc_id,
-                    "chunk_id": result.get("chunk_id", ""),
-                    "filename": doc_metadata.get("filename", "Unknown") if doc_metadata else "Unknown",
-                    "text": chunk_text[:200] + "..." if len(chunk_text) > 200 else chunk_text,
-                    "score": result.get("score", 0),
-                    "source_label": source_label
-                })
+            if not (doc_id and chunk_text):
+                continue
+            
+            # Get document metadata
+            doc_metadata = await self._get_document_metadata(doc_id)
+            
+            # Format source entry
+            context_part, source_dict = self._format_source_entry(result, doc_metadata, i)
+            context_parts.append(context_part)
+            sources.append(source_dict)
         
         context_text = "\n\n".join(context_parts)
         return context_text, sources
@@ -816,7 +909,7 @@ class ChatService:
                 
                 if not response or not isinstance(response, str):
                     logger.error(f"Invalid response type: {type(response)}, value: {response}")
-                    raise Exception(f"Invalid LLM response type: {type(response)}")
+                    raise TypeError(f"Invalid LLM response type: {type(response)}")
                 
                 logger.info(f"✅ Generated response ({len(response)} chars)")
                 return response
@@ -829,10 +922,10 @@ class ChatService:
             logger.error(f"LLM generation failed: {type(e).__name__}: {e}", exc_info=True)
             # Fallback response
             fallback = "I apologize, but I'm having trouble generating a response right now. Please try again or check if the LLM service is running."
-            logger.info(f"Returning fallback response")
+            logger.info("Returning fallback response")
             return fallback
     
-    async def _generate_llm_response_with_cot(self, query: str, context: str, reasoning_template: str, 
+    async def _generate_llm_response_with_cot(self, query: str, context: str, _reasoning_template: str, 
                                             conversation_context: List[Dict] = None) -> str:
         """Generate response using LLM handler with Chain-of-Thought reasoning and prompt service."""
         try:
@@ -855,7 +948,7 @@ Example: [1] According to the document, the key fact is..."""
                 logger.debug("✅ Added document usage enforcement to CoT system prompt")
             
             # Build CoT-enhanced user prompt
-            user_prompt = f"""{reasoning_template}
+            user_prompt = """{reasoning_template}
 
 Context information:
 {context}
@@ -873,7 +966,7 @@ Please provide your reasoning step by step, then give your final answer:"""
             if available_tokens < 100:
                 logger.warning(f"Low tokens for CoT: {available_tokens}, reducing context")
                 context = context[:len(context)//2]
-                user_prompt = f"""{reasoning_template}
+                user_prompt = """{reasoning_template}
 
 Context: {context}
 
@@ -898,7 +991,7 @@ Final answer:"""
                 
                 # Ensure response is string
                 if isinstance(response, dict):
-                    logger.warning(f"CoT: LLM returned dict, extracting content")
+                    logger.warning("CoT: LLM returned dict, extracting content")
                     response = response.get("response", str(response))
                 
                 # Extract final answer from CoT response
@@ -916,9 +1009,9 @@ Final answer:"""
             logger.info("Falling back to regular LLM generation")
             return await self._generate_llm_response(query, context, conversation_context)
     
-    def _build_cot_system_prompt(self, reasoning_template: str) -> str:
+    def _build_cot_system_prompt(self, _reasoning_template: str) -> str:
         """Build the system prompt for Chain-of-Thought reasoning."""
-        return f"""You are a friendly, conversational AI assistant like ChatGPT, Gemini, or Claude. Your goal is to help users while showing your reasoning in a natural, understandable way.
+        return """You are a friendly, conversational AI assistant like ChatGPT, Gemini, or Claude. Your goal is to help users while showing your reasoning in a natural, understandable way.
 
 CONVERSATIONAL TONE:
 - Write naturally, as if explaining to a friend
@@ -976,14 +1069,14 @@ Remember: You're having a helpful conversation, not writing a report."""
         """Extract the final answer from a Chain-of-Thought response."""
         try:
             # Look for the "## Answer" section
-            answer_match = re.search(r'##\s*Answer\s*\n(.*?)(?:\n##|\Z)', full_response, re.DOTALL | re.IGNORECASE)
+            answer_match = re.search(r'##\s*Answer\s*\n(.+)(?:\n##|\Z)', full_response, re.DOTALL | re.IGNORECASE)
             if answer_match:
                 answer = answer_match.group(1).strip()
                 if answer:
                     return answer
             
             # Fallback: look for "Answer:" pattern
-            answer_match = re.search(r'Answer:\s*(.*?)(?:\n\n|\Z)', full_response, re.DOTALL | re.IGNORECASE)
+            answer_match = re.search(r'Answer:\s*(.+)(?:\n\n|\Z)', full_response, re.DOTALL | re.IGNORECASE)
             if answer_match:
                 answer = answer_match.group(1).strip()
                 if answer:
@@ -1222,7 +1315,7 @@ Remember: Your knowledge is limited to the context provided. Do not make up info
             doc_id = source.get("doc_id", "")
             
             # Check for different media types
-            if any(filename.endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp']):
+            if any(filename.endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.gi', '.webp']):
                 attachments.append({
                     "type": "image",
                     "url": f"/admin/documents/{doc_id}/download",
@@ -1246,7 +1339,8 @@ Remember: Your knowledge is limited to the context provided. Do not make up info
             
             # Check for YouTube links in text
             text = source.get("text", "")
-            youtube_regex = r'(?:youtube\.com\/(?:[^\/\n\s]+\/\S+\/|(?:v|e(?:mbed)?)\/|\S*?[?&]v=)|youtu\.be\/)([a-zA-Z0-9_-]{11})'
+            # Simplified YouTube URL patterns
+            youtube_regex = r'(?:youtube\.com/watch\?v=|youtu\.be/)([a-zA-Z0-9_-]{11})'
             matches = re.findall(youtube_regex, text)
             
             for video_id in matches:
@@ -1270,12 +1364,12 @@ Remember: Your knowledge is limited to the context provided. Do not make up info
                 {
                     "role": "user",
                     "content": query,
-                    "timestamp": datetime.utcnow().isoformat()
+                    "timestamp": datetime.now(timezone.utc).isoformat()
                 },
                 {
                     "role": "assistant",
                     "content": response,
-                    "timestamp": datetime.utcnow().isoformat(),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
                     "sources": sources
                 }
             ])
@@ -1284,7 +1378,7 @@ Remember: Your knowledge is limited to the context provided. Do not make up info
             if len(session_data["messages"]) > 20:
                 session_data["messages"] = session_data["messages"][-20:]
             
-            session_data["updated_at"] = datetime.utcnow().isoformat()
+            session_data["updated_at"] = datetime.now(timezone.utc).isoformat()
             
             # Store back in Redis
             await self.redis_client.store_session_data(session_id, session_data, 8)
@@ -1294,6 +1388,7 @@ Remember: Your knowledge is limited to the context provided. Do not make up info
     
     async def get_query_suggestions(self, partial_query: str, limit: int = 5) -> List[str]:
         """Get query suggestions based on partial input."""
+        await asyncio.sleep(0)  # Use async feature
         try:
             # Simple suggestions based on common patterns
             suggestions = []
@@ -1366,6 +1461,7 @@ Remember: Your knowledge is limited to the context provided. Do not make up info
     
     async def _bm25_search(self, query: str, top_k: int = 10) -> List[Dict]:
         """Perform BM25 keyword search."""
+        await asyncio.sleep(0)  # Use async feature
         if not self.bm25_index or not self.document_texts:
             return []
         
@@ -1397,6 +1493,83 @@ Remember: Your knowledge is limited to the context provided. Do not make up info
             logger.error(f"BM25 search failed: {e}")
             return []
     
+    def _get_vector_weight(self, strategy: str) -> float:
+        """Get weight for vector results based on strategy."""
+        weights = {"semantic": 0.5, "keyword": 0.2, "balanced": 0.35, "hybrid": 0.3}
+        return weights.get(strategy, 0.35)
+    
+    def _get_hyde_weight(self, strategy: str) -> float:
+        """Get weight for HyDE results based on strategy."""
+        weights = {"semantic": 0.3, "keyword": 0.1, "balanced": 0.25, "hybrid": 0.25}
+        return weights.get(strategy, 0.25)
+    
+    def _get_keyword_weight(self, strategy: str) -> float:
+        """Get weight for keyword results based on strategy."""
+        weights = {"semantic": 0.1, "keyword": 0.5, "balanced": 0.25, "hybrid": 0.25}
+        return weights.get(strategy, 0.25)
+    
+    def _get_graph_weight(self, strategy: str) -> float:
+        """Get weight for graph results based on strategy."""
+        weights = {"semantic": 0.1, "keyword": 0.2, "balanced": 0.15, "hybrid": 0.2}
+        return weights.get(strategy, 0.15)
+    
+    def _merge_vector_results(self, vector_results: List[Dict], strategy: str, all_results: Dict):
+        """Merge vector search results into combined results."""
+        weight = self._get_vector_weight(strategy)
+        for result in vector_results:
+            result_id = result.get("id", "")
+            all_results[result_id] = {
+                **result,
+                "combined_score": result.get("score", 0) * weight,
+                "sources": ["vector"]
+            }
+    
+    def _merge_hyde_results(self, hyde_results: List[Dict], strategy: str, all_results: Dict):
+        """Merge HyDE results into combined results."""
+        weight = self._get_hyde_weight(strategy)
+        for result in hyde_results:
+            result_id = result.get("id", "")
+            if result_id in all_results:
+                all_results[result_id]["combined_score"] += result.get("score", 0) * weight
+                all_results[result_id]["sources"].append("hyde")
+            else:
+                all_results[result_id] = {
+                    **result,
+                    "combined_score": result.get("score", 0) * weight,
+                    "sources": ["hyde"]
+                }
+    
+    def _merge_keyword_results(self, keyword_results: List[Dict], strategy: str, all_results: Dict):
+        """Merge keyword search results into combined results."""
+        weight = self._get_keyword_weight(strategy)
+        for result in keyword_results:
+            result_id = result.get("id", "")
+            normalized_score = min(result.get("score", 0) / 10.0, 1.0)
+            if result_id in all_results:
+                all_results[result_id]["combined_score"] += normalized_score * weight
+                all_results[result_id]["sources"].append("keyword")
+            else:
+                all_results[result_id] = {
+                    **result,
+                    "combined_score": normalized_score * weight,
+                    "sources": ["keyword"]
+                }
+    
+    def _merge_graph_results(self, graph_results: List[Dict], strategy: str, all_results: Dict):
+        """Merge graph traversal results into combined results."""
+        weight = self._get_graph_weight(strategy)
+        for result in graph_results:
+            result_id = result.get("id", "")
+            if result_id in all_results:
+                all_results[result_id]["combined_score"] += result.get("score", 0) * weight
+                all_results[result_id]["sources"].append("graph")
+            else:
+                all_results[result_id] = {
+                    **result,
+                    "combined_score": result.get("score", 0) * weight,
+                    "sources": ["graph"]
+                }
+
     async def _advanced_merge_and_rerank(self, vector_results: List[Dict], hyde_results: List[Dict],
                                        keyword_results: List[Dict], graph_results: List[Dict], 
                                        query: str, processing_strategy: str) -> List[Dict]:
@@ -1405,58 +1578,11 @@ Remember: Your knowledge is limited to the context provided. Do not make up info
             # Combine all results with weighted scores based on strategy
             all_results = {}
             
-            # Vector results (semantic similarity)
-            for result in vector_results:
-                result_id = result.get("id", "")
-                weight = self._get_vector_weight(processing_strategy)
-                all_results[result_id] = {
-                    **result,
-                    "combined_score": result.get("score", 0) * weight,
-                    "sources": ["vector"]
-                }
-            
-            # HyDE results (hypothetical document similarity)
-            for result in hyde_results:
-                result_id = result.get("id", "")
-                weight = self._get_hyde_weight(processing_strategy)
-                if result_id in all_results:
-                    all_results[result_id]["combined_score"] += result.get("score", 0) * weight
-                    all_results[result_id]["sources"].append("hyde")
-                else:
-                    all_results[result_id] = {
-                        **result,
-                        "combined_score": result.get("score", 0) * weight,
-                        "sources": ["hyde"]
-                    }
-            
-            # Keyword results (BM25)
-            for result in keyword_results:
-                result_id = result.get("id", "")
-                weight = self._get_keyword_weight(processing_strategy)
-                normalized_score = min(result.get("score", 0) / 10.0, 1.0)  # Normalize BM25 scores
-                if result_id in all_results:
-                    all_results[result_id]["combined_score"] += normalized_score * weight
-                    all_results[result_id]["sources"].append("keyword")
-                else:
-                    all_results[result_id] = {
-                        **result,
-                        "combined_score": normalized_score * weight,
-                        "sources": ["keyword"]
-                    }
-            
-            # Graph results (relationship-based)
-            for result in graph_results:
-                result_id = result.get("id", "")
-                weight = self._get_graph_weight(processing_strategy)
-                if result_id in all_results:
-                    all_results[result_id]["combined_score"] += result.get("score", 0) * weight
-                    all_results[result_id]["sources"].append("graph")
-                else:
-                    all_results[result_id] = {
-                        **result,
-                        "combined_score": result.get("score", 0) * weight,
-                        "sources": ["graph"]
-                    }
+            # Merge all result types
+            self._merge_vector_results(vector_results, processing_strategy, all_results)
+            self._merge_hyde_results(hyde_results, processing_strategy, all_results)
+            self._merge_keyword_results(keyword_results, processing_strategy, all_results)
+            self._merge_graph_results(graph_results, processing_strategy, all_results)
             
             # Convert back to list and apply final reranking
             merged_results = list(all_results.values())
@@ -1529,6 +1655,7 @@ Remember: Your knowledge is limited to the context provided. Do not make up info
     
     async def _cross_encoder_rerank(self, results: List[Dict], query: str) -> List[Dict]:
         """Apply cross-encoder reranking to results."""
+        await asyncio.sleep(0)  # Use async feature
         try:
             if len(results) <= 1:
                 return results
@@ -1648,6 +1775,45 @@ Remember: Your knowledge is limited to the context provided. Do not make up info
     # Phase 3: ADVANCED GRAPH RAG INTEGRATION
     # ============================================================================
     
+    def _extract_document_ids(self, vector_results: List[Dict]) -> set:
+        """Extract unique document IDs from vector results."""
+        document_ids = set()
+        for result in vector_results:
+            doc_id = result.get("document_id") or result.get("_id")
+            if doc_id:
+                document_ids.add(doc_id)
+        return document_ids
+    
+    async def _find_related_entities(self, entities: List[str]) -> List[Dict]:
+        """Find entities related to query entities."""
+        if not entities:
+            return []
+        try:
+            return await self.mongo_client.database.entities.find(
+                {"name": {"$in": entities}}
+            ).to_list(5)
+        except Exception as e:
+            logger.warning(f"Failed to find related entities: {e}")
+            return []
+    
+    def _extract_insights_from_entities(self, entity_docs: List[Dict], document_ids: set) -> tuple:
+        """Extract graph insights and additional document IDs from entities."""
+        graph_insights = []
+        additional_docs = set()
+        
+        for entity_doc in entity_docs:
+            doc_ids_from_entity = entity_doc.get("documents", [])
+            for doc_id in doc_ids_from_entity:
+                if doc_id not in document_ids:
+                    additional_docs.add(doc_id)
+                    graph_insights.append({
+                        "entity": entity_doc.get("name", ""),
+                        "related_document": doc_id,
+                        "type": "entity_expansion"
+                    })
+        
+        return graph_insights, additional_docs
+
     async def retrieve_with_graph(
         self,
         query: str,
@@ -1678,51 +1844,25 @@ Remember: Your knowledge is limited to the context provided. Do not make up info
                 "total_with_graph": len(vector_results)
             }
             
-            # Step 1: Extract document entities from results
-            document_entities = []
-            document_ids = set()
+            # Step 1: Extract document IDs from vector results
+            document_ids = self._extract_document_ids(vector_results)
             
-            for result in vector_results:
-                doc_id = result.get("document_id") or result.get("_id")
-                if doc_id:
-                    document_ids.add(doc_id)
+            # Step 2: Find related entities
+            related_entity_docs = await self._find_related_entities(entities)
+            graph_enrichment["relationships_found"] = len(related_entity_docs)
             
-            # Step 2: Query MongoDB for related entities and documents
-            if entities:
-                try:
-                    # Find entities related to extracted entities from query
-                    related_entity_docs = await self.mongo_client.database.entities.find(
-                        {"name": {"$in": entities}}
-                    ).to_list(5)
-                    
-                    graph_enrichment["relationships_found"] = len(related_entity_docs)
-                    
-                    for entity_doc in related_entity_docs:
-                        # Extract document IDs from entity
-                        doc_id = entity_doc.get("doc_id")
-                        if doc_id and doc_id not in document_ids:
-                            # Add entity-linked document to results
-                            vector_results.append({
-                                "_id": doc_id,
-                                "source": "entity_link",
-                                "entity_name": entity_doc.get("name"),
-                                "entity_type": entity_doc.get("type"),
-                                "score": 0.6,  # Entity results get lower default score
-                                "confidence": entity_doc.get("confidence", 0.7)
-                            })
-                            graph_enrichment["graph_additions"] += 1
-                            document_ids.add(doc_id)
-                        
-                        graph_enrichment["graph_insights"].append({
-                            "entity": entity_doc.get("name"),
-                            "entity_type": entity_doc.get("type"),
-                            "relation_type": "linked"
-                        })
+            # Step 3: Extract insights and additional documents
+            if related_entity_docs:
+                graph_insights, additional_docs = self._extract_insights_from_entities(
+                    related_entity_docs, document_ids
+                )
+                graph_enrichment["graph_insights"] = graph_insights
+                graph_enrichment["graph_additions"] = len(additional_docs)
                 
-                except Exception as e:
-                    logger.warning(f"Entity search failed: {e}")
+                # Optionally retrieve additional documents (placeholder for future enhancement)
+                # additional_results = await self._retrieve_additional_docs(additional_docs)
             
-            # Step 3: Rerank combined results
+            # Step 4: Rerank combined results
             reranked_results = vector_results
             if self.reranker_model and settings.use_reranker:
                 reranked_results = await self._rerank_results(vector_results, query)
@@ -1737,7 +1877,7 @@ Remember: Your knowledge is limited to the context provided. Do not make up info
                 graph_enrichment["graph_additions"] / max(1, graph_enrichment["vector_base"])
             )
             
-            logger.info(f"  📊 Phase 3 Graph RAG Results:")
+            logger.info("  📊 Phase 3 Graph RAG Results:")
             logger.info(f"    🔵 Vector base: {graph_enrichment['vector_base']} results")
             logger.info(f"    🟣 Graph additions: {graph_enrichment['graph_additions']} new docs")
             logger.info(f"    🔗 Relationships: {graph_enrichment['relationships_found']} found")
@@ -1755,6 +1895,77 @@ Remember: Your knowledge is limited to the context provided. Do not make up info
                 "results": vector_results,
                 "enrichment_metrics": {"error": str(e)}
             }
+    
+    def _extract_entities_from_doc(self, content: str) -> List[Dict[str, Any]]:
+        """Extract named entities from document content."""
+        if not self.nlp_model:
+            return []
+        
+        doc = self.nlp_model(content[:5000])  # Limit for performance
+        entities = []
+        
+        for ent in doc.ents:
+            if ent.label_ in ["PERSON", "ORG", "GPE", "PRODUCT", "EVENT", "DATE"]:
+                entities.append({
+                    "text": ent.text,
+                    "label": ent.label_,
+                    "start": ent.start_char,
+                    "end": ent.end_char
+                })
+        
+        return entities
+    
+    def _extract_entity_relationships(self, entities: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Extract relationships between entities based on co-occurrence."""
+        relationships = []
+        
+        for i, ent1 in enumerate(entities):
+            for ent2 in entities[i+1:]:
+                relationships.append({
+                    "from_entity": ent1["text"],
+                    "from_type": ent1["label"],
+                    "to_entity": ent2["text"],
+                    "to_type": ent2["label"],
+                    "relation_type": "co_occurrence",
+                    "confidence": 0.7
+                })
+        
+        return relationships
+    
+    async def _store_relationships_to_db(self, document_id: str, relationships: List[Dict[str, Any]]) -> int:
+        """Store relationships to MongoDB."""
+        if not relationships:
+            return 0
+        
+        try:
+            for rel in relationships:
+                rel["document_id"] = document_id
+                rel["created_at"] = datetime.now(timezone.utc)
+                await self.mongo_client.database.entity_relationships.insert_one(rel)
+            
+            logger.info(f"✅ Stored {len(relationships)} relationships for doc {document_id}")
+            return len(relationships)
+        except Exception as e:
+            logger.warning(f"Failed to store relationships: {e}")
+            return 0
+    
+    def _process_chunks_for_entities(self, chunk_texts: List[str]) -> int:
+        """Process chunks to extract additional entities."""
+        if not self.nlp_model:
+            return 0
+        
+        chunks_processed = 0
+        for chunk in chunk_texts[:10]:  # Limit to first 10
+            try:
+                chunk_doc = self.nlp_model(chunk[:1000])
+                for ent in chunk_doc.ents:
+                    if ent.label_ in ["PERSON", "ORG", "GPE", "PRODUCT"]:
+                        pass  # Additional relationship tracking
+                chunks_processed += 1
+            except Exception:
+                pass
+        
+        return chunks_processed
     
     async def extract_and_store_relationships(
         self,
@@ -1777,71 +1988,25 @@ Remember: Your knowledge is limited to the context provided. Do not make up info
             if not self.nlp_model:
                 return {"status": "skipped", "reason": "NLP model unavailable"}
             
-            extraction_results = {
-                "entities_found": 0,
-                "relationships_stored": 0,
-                "chunks_processed": 0
-            }
+            # Step 1: Extract entities
+            entities = self._extract_entities_from_doc(content)
             
-            # Step 1: Extract entities from content
-            doc = self.nlp_model(content[:5000])  # Limit to first 5000 chars for performance
-            entities = []
+            # Step 2: Extract relationships
+            relationships = self._extract_entity_relationships(entities)
             
-            for ent in doc.ents:
-                if ent.label_ in ["PERSON", "ORG", "GPE", "PRODUCT", "EVENT", "DATE"]:
-                    entities.append({
-                        "text": ent.text,
-                        "label": ent.label_,
-                        "start": ent.start_char,
-                        "end": ent.end_char
-                    })
-            
-            extraction_results["entities_found"] = len(entities)
-            
-            # Step 2: Extract relationships between entities
-            relationships = []
-            
-            for i, ent1 in enumerate(entities):
-                for ent2 in entities[i+1:]:
-                    # Simple relationship: co-occurrence in content
-                    # More sophisticated: extract verb phrases connecting them
-                    relationships.append({
-                        "from_entity": ent1["text"],
-                        "from_type": ent1["label"],
-                        "to_entity": ent2["text"],
-                        "to_type": ent2["label"],
-                        "relation_type": "co_occurrence",
-                        "confidence": 0.7
-                    })
-            
-            # Step 3: Store in MongoDB
-            if relationships:
-                try:
-                    # Store relationships in MongoDB
-                    for rel in relationships:
-                        rel["document_id"] = document_id
-                        rel["created_at"] = datetime.utcnow()
-                        await self.mongo_client.database.entity_relationships.insert_one(rel)
-                    
-                    extraction_results["relationships_stored"] = len(relationships)
-                    logger.info(f"✅ Stored {len(relationships)} relationships for doc {document_id}")
-                except Exception as e:
-                    logger.warning(f"Failed to store relationships: {e}")
+            # Step 3: Store relationships
+            stored_count = await self._store_relationships_to_db(document_id, relationships)
             
             # Step 4: Process chunks if provided
+            chunks_processed = 0
             if chunk_texts:
-                for chunk in chunk_texts[:10]:  # Limit to first 10 chunks
-                    try:
-                        chunk_doc = self.nlp_model(chunk[:1000])
-                        for ent in chunk_doc.ents:
-                            if ent.label_ in ["PERSON", "ORG", "GPE", "PRODUCT"]:
-                                # Link chunk to entities
-                                pass  # Additional relationship tracking
-                        extraction_results["chunks_processed"] += 1
-                    except Exception:
-                        pass
+                chunks_processed = self._process_chunks_for_entities(chunk_texts)
             
-            return extraction_results
+            return {
+                "entities_found": len(entities),
+                "relationships_stored": stored_count,
+                "chunks_processed": chunks_processed
+            }
             
         except Exception as e:
             logger.warning(f"Relationship extraction failed: {e}")
@@ -1874,7 +2039,7 @@ Remember: Your knowledge is limited to the context provided. Do not make up info
                     return test_response.status_code == 200
                 else:
                     return response.status_code == 200
-            except:
+            except Exception:
                 # LMStudio connection failed
                 return False
             

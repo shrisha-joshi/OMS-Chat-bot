@@ -24,9 +24,9 @@ if __name__ == "__main__":
     print("=" * 80)
     print("Starting OMS Chatbot Backend Server")
     print("=" * 80)
-    print(f"Server: http://127.0.0.1:8000")
-    print(f"API Docs: http://127.0.0.1:8000/docs")
-    print(f"Press Ctrl+C to stop")
+    print("Server: http://127.0.0.1:8000")
+    print("API Docs: http://127.0.0.1:8000/docs")
+    print("Press Ctrl+C to stop")
     print("=" * 80)
     print()
     

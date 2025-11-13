@@ -11,7 +11,7 @@ import hashlib
 import mimetypes
 from pathlib import Path
 from typing import Dict, Any, List, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 import traceback
 import io
 import re
@@ -101,7 +101,7 @@ class IngestionWorker:
         Returns:
             Processing result with status and stats
         """
-        start_time = datetime.utcnow()
+        start_time = datetime.now(timezone.utc)
         
         try:
             # Mark as processing
@@ -164,8 +164,8 @@ class IngestionWorker:
                 "vectors_stored": len(vector_ids),
                 "entities_extracted": entities_extracted,
                 "relationships_extracted": relationships_extracted,
-                "processed_at": datetime.utcnow(),
-                "processing_time_seconds": (datetime.utcnow() - start_time).total_seconds(),
+                "processed_at": datetime.now(timezone.utc),
+                "processing_time_seconds": (datetime.now(timezone.utc) - start_time).total_seconds(),
                 "text_length": len(cleaned_text),
                 "vector_ids": vector_ids
             }
@@ -199,7 +199,7 @@ class IngestionWorker:
             
             # Update error status
             await self.mongo_client.update_document_processing_status(
-                doc_id, "failed", {"error": error_msg, "failed_at": datetime.utcnow()}
+                doc_id, "failed", {"error": error_msg, "failed_at": datetime.now(timezone.utc)}
             )
             
             await self._update_processing_status(doc_id, "failed", error_msg)
@@ -231,7 +231,7 @@ class IngestionWorker:
             raise ValueError("Could not retrieve file content")
         
         try:
-            if file_type == 'pdf':
+            if file_type == 'pd':
                 return await self._extract_pdf_text(file_content)
             elif file_type in ['doc', 'docx']:
                 return await self._extract_docx_text(file_content)
@@ -243,7 +243,7 @@ class IngestionWorker:
                 return await self._extract_excel_text(file_content)
             elif file_type in ['ppt', 'pptx']:
                 return await self._extract_pptx_text(file_content)
-            elif file_type in ['jpg', 'jpeg', 'png', 'tiff', 'bmp']:
+            elif file_type in ['jpg', 'jpeg', 'png', 'tif', 'bmp']:
                 return await self._extract_image_text(file_content)
             elif file_type == 'json':
                 return await self._extract_json_text(file_content)
@@ -548,7 +548,7 @@ class IngestionWorker:
                         "source_file": chunk["source_file"],
                         "word_count": chunk["word_count"],
                         "sentence_count": chunk["sentence_count"],
-                        "created_at": datetime.utcnow().isoformat()
+                        "created_at": datetime.now(timezone.utc).isoformat()
                     }
                 })
             
@@ -627,7 +627,7 @@ class IngestionWorker:
                 json.dumps({
                     "status": status,
                     "message": message,
-                    "updated_at": datetime.utcnow().isoformat()
+                    "updated_at": datetime.now(timezone.utc).isoformat()
                 }),
                 ex=3600  # Expire after 1 hour
             )

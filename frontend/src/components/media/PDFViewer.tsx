@@ -57,20 +57,20 @@ const ImageViewer: React.FC<ImageViewerProps> = ({
   const handleFullscreen = () => {
     if (!containerRef.current) return;
 
-    if (!isFullscreen) {
-      if (containerRef.current.requestFullscreen) {
-        containerRef.current.requestFullscreen();
-      } else if ((containerRef.current as any).webkitRequestFullscreen) {
-        (containerRef.current as any).webkitRequestFullscreen();
-      } else if ((containerRef.current as any).msRequestFullscreen) {
-        (containerRef.current as any).msRequestFullscreen();
-      }
-      setIsFullscreen(true);
-    } else {
+    if (isFullscreen) {
       if (document.fullscreenElement) {
         document.exitFullscreen();
       }
       setIsFullscreen(false);
+    } else if (containerRef.current.requestFullscreen) {
+      containerRef.current.requestFullscreen();
+      setIsFullscreen(true);
+    } else if ((containerRef.current as any).webkitRequestFullscreen) {
+      (containerRef.current as any).webkitRequestFullscreen();
+      setIsFullscreen(true);
+    } else if ((containerRef.current as any).msRequestFullscreen) {
+      (containerRef.current as any).msRequestFullscreen();
+      setIsFullscreen(true);
     }
   };
 
@@ -117,7 +117,7 @@ const ImageViewer: React.FC<ImageViewerProps> = ({
       style={{
         width: isFullscreen ? '100vw' : width,
         height: isFullscreen ? '100vh' : height,
-        maxWidth: !isFullscreen ? maxWidth : undefined
+        maxWidth: isFullscreen ? undefined : maxWidth
       }}
       onMouseDown={handleMouseDown}
       onMouseMove={handleMouseMove}
@@ -125,8 +125,11 @@ const ImageViewer: React.FC<ImageViewerProps> = ({
       onMouseLeave={handleMouseUp}
       onWheel={handleWheel}
     >
-      {/* Image Container */}
-      <div className="relative w-full h-full flex items-center justify-center overflow-hidden cursor-move">
+      <div
+        className="relative w-full h-full flex items-center justify-center overflow-hidden cursor-move"
+        role="img"
+        aria-label={alt}
+      >
         <img
           ref={imageRef}
           src={currentSrc}
@@ -230,11 +233,10 @@ const ImageViewer: React.FC<ImageViewerProps> = ({
             <ChevronRight className="w-6 h-6" />
           </button>
 
-          {/* Gallery Indicator */}
           <div className="absolute bottom-4 left-1/2 transform -translate-x-1/2 flex gap-2">
-            {gallery.map((_, index) => (
+            {gallery.map((imgSrc, index) => (
               <button
-                key={index}
+                key={imgSrc}
                 onClick={() => {
                   setCurrentImageIndex(index);
                   handleResetZoom();

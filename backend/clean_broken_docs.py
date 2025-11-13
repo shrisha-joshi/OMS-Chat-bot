@@ -38,8 +38,8 @@ async def clean_broken_documents():
                         deleted_count += 1
                     else:
                         logger.info(f"GridFS OK for {filename}")
-                except:
-                    logger.warning(f"Error checking GridFS for {filename} - DELETING")
+                except Exception as check_error:
+                    logger.warning(f"Error checking GridFS for {filename} - DELETING: {check_error}")
                     await mongo_client.db.documents.delete_one({"_id": doc_id})
                     deleted_count += 1
             else:

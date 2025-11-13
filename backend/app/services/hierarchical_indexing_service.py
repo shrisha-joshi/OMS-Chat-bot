@@ -8,7 +8,7 @@ import logging
 import re
 import asyncio
 from typing import List, Dict, Any, Optional, Tuple
-from datetime import datetime
+from datetime import datetime, timezone
 import hashlib
 
 import spacy
@@ -131,7 +131,7 @@ class HierarchicalIndexingService:
             "avg_sentence_length": avg_sentence_length,
             "complexity_score": complexity_score,
             "topics": topics,
-            "processing_date": datetime.utcnow().isoformat(),
+            "processing_date": datetime.now(timezone.utc).isoformat(),
             "chunk_strategy": self._determine_chunk_strategy(
                 document_type, has_headings, has_lists, has_code, complexity_score
             )
@@ -688,7 +688,7 @@ class HierarchicalIndexingService:
                     "metadata": {
                         "document_type": "unknown",
                         "chunk_type": "fallback",
-                        "processing_date": datetime.utcnow().isoformat()
+                        "processing_date": datetime.now(timezone.utc).isoformat()
                     }
                 })
             

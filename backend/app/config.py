@@ -65,13 +65,13 @@ class Settings(BaseSettings):
     max_llm_output_tokens: int = Field(default=1024, alias="MAX_LLM_OUTPUT_TOKENS")
     
     # Document Training & RAG Quality
-    force_document_usage: bool = Field(default=True, alias="FORCE_DOCUMENT_USAGE")
+    force_document_usage: bool = Field(default=False, alias="FORCE_DOCUMENT_USAGE")  # Allow responses without docs
     min_similarity_threshold: float = Field(default=0.3, alias="MIN_SIMILARITY_THRESHOLD")
     validate_document_usage: bool = Field(default=True, alias="VALIDATE_DOCUMENT_USAGE")
     fallback_on_no_documents: bool = Field(default=True, alias="FALLBACK_ON_NO_DOCUMENTS")
-    require_citations: bool = Field(default=True, alias="REQUIRE_CITATIONS")
-    reject_generic_responses: bool = Field(default=True, alias="REJECT_GENERIC_RESPONSES")
-    min_citation_count: int = Field(default=1, alias="MIN_CITATION_COUNT")
+    require_citations: bool = Field(default=False, alias="REQUIRE_CITATIONS")  # Allow responses without citations
+    reject_generic_responses: bool = Field(default=False, alias="REJECT_GENERIC_RESPONSES")  # Allow generic responses
+    min_citation_count: int = Field(default=0, alias="MIN_CITATION_COUNT")  # No minimum citations required
     
     # Media Extraction & Enrichment
     extract_images_from_pdf: bool = Field(default=True, alias="EXTRACT_IMAGES_FROM_PDF")

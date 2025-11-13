@@ -45,7 +45,9 @@ class TestContextualRetrievalService:
         
         assert len(enhanced) == 2
         assert all("confidence_boost" in chunk for chunk in enhanced)
-        assert all(chunk["confidence_boost"] == 1.0 for chunk in enhanced)  # Default when no context
+        # Default when no context
+        for chunk in enhanced:
+            assert chunk["confidence_boost"] == pytest.approx(1.0)
     
     @pytest.mark.asyncio
     async def test_enhance_chunks_structure(self, service):
@@ -58,7 +60,8 @@ class TestContextualRetrievalService:
         assert "contextual_content" in chunk
         assert "context_quality" in chunk
         assert "confidence_boost" in chunk
-        assert chunk["context_quality"] == 0.0  # No context available
+        # No context available
+        assert chunk["context_quality"] == pytest.approx(0.0)
 
 
 class TestHybridSearchService:
@@ -73,8 +76,8 @@ class TestHybridSearchService:
     def test_initialization(self, service):
         """Test service initialization."""
         assert service is not None
-        assert service.bm25_weight == 0.4
-        assert service.vector_weight == 0.6
+        assert service.bm25_weight == pytest.approx(0.4)
+        assert service.vector_weight == pytest.approx(0.6)
     
     @pytest.mark.asyncio
     async def test_hybrid_search_empty_results(self, service):
@@ -109,8 +112,7 @@ class TestHybridSearchService:
         assert len(merged) == 1
         assert merged[0]["_id"] == "1"
         assert "hybrid_score" in merged[0]
-        # hybrid_score = 0.8 * 0.6 + 0.6 * 0.4 = 0.48 + 0.24 = 0.72
-        assert abs(merged[0]["hybrid_score"] - 0.72) < 0.01
+        assert merged[0]["hybrid_score"] == pytest.approx(0.72, abs=0.01)
 
 
 class TestQueryRewritingService:
@@ -300,8 +302,8 @@ class TestServiceIntegration:
         
         assert len(enhanced) == 2
         # Scores should be preserved
-        assert enhanced[0]["hybrid_score"] == 0.9
-        assert enhanced[1]["hybrid_score"] == 0.7
+        assert enhanced[0]["hybrid_score"] == pytest.approx(0.9)
+        assert enhanced[1]["hybrid_score"] == pytest.approx(0.7)
 
 
 # Parametrized tests for robustness

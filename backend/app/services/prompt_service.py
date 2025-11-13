@@ -276,7 +276,7 @@ SUPPORTING DOCUMENTS:
             for i, chunk in enumerate(chunks, 1):
                 # Extract chunk content and metadata
                 text = chunk.get("text", "")
-                source = chunk.get("source", "Unknown")
+                _source = chunk.get("source", "Unknown")
                 doc_name = chunk.get("filename", "Unknown")
                 page = chunk.get("page", "")
                 chunk_id = chunk.get("chunk_id", "")
@@ -395,7 +395,7 @@ SUPPORTING DOCUMENTS:
         
         # Define keywords for each task type
         keywords = {
-            "summarize": ["summarize", "summary", "brief", "overview", "tldr", "condense"],
+            "summarize": ["summarize", "summary", "brie", "overview", "tldr", "condense"],
             "analyze": ["analyze", "analysis", "analyze", "examine", "breakdown", "deep dive"],
             "compare": ["compare", "difference", "contrast", "similar", "same as", "versus"],
             "extract": ["extract", "list", "find", "get", "what are", "identify", "find all"],

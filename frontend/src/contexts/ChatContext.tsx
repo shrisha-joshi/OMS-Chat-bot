@@ -41,11 +41,11 @@ interface ChatContextType {
 
 const ChatContext = createContext<ChatContextType | undefined>(undefined)
 
-const API_BASE_URL = typeof window !== 'undefined' 
-  ? (process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000')
+const API_BASE_URL = globalThis.window !== undefined
+  ? (process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000')
   : 'http://localhost:8000'
 
-export function ChatProvider({ children }: { children: ReactNode }) {
+export function ChatProvider({ children }: Readonly<{ children: ReactNode }>) {
   const [sessions, setSessions] = useState<ChatSession[]>([])
   const [currentSession, setCurrentSession] = useState<ChatSession | null>(null)
   const [isConnected] = useState(true)
@@ -53,7 +53,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
 
   // Load sessions from localStorage
   useEffect(() => {
-    if (typeof window === 'undefined') return
+    if (globalThis.window === undefined) return
     
     try {
       const savedSessions = localStorage.getItem('chat_sessions')
@@ -71,7 +71,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
 
   // Save sessions to localStorage
   useEffect(() => {
-    if (typeof window === 'undefined') return
+    if (globalThis.window === undefined) return
     
     try {
       localStorage.setItem('chat_sessions', JSON.stringify(sessions))
@@ -241,12 +241,12 @@ export function ChatProvider({ children }: { children: ReactNode }) {
   const clearSessions = () => {
     setSessions([])
     setCurrentSession(null)
-    if (typeof window !== 'undefined') {
+    if (globalThis.window !== undefined) {
       localStorage.removeItem('chat_sessions')
     }
   }
 
-  const value = {
+  const value = React.useMemo(() => ({
     sessions,
     currentSession,
     isConnected,
@@ -255,7 +255,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     switchSession,
     sendMessage,
     clearSessions
-  }
+  }), [sessions, currentSession, isConnected, isProcessing])
 
   return (
     <ChatContext.Provider value={value}>

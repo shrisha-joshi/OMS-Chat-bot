@@ -12,7 +12,7 @@ from contextlib import asynccontextmanager
 import logging
 import asyncio
 from typing import AsyncGenerator
-from datetime import datetime
+from datetime import datetime, timezone
 
 from .config import settings
 from .core.db_mongo import mongodb_client
@@ -31,60 +31,46 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-async def validate_required_services():
-    """
-    ROOT CAUSE FIX #1: STARTUP VALIDATION
-    
-    Validate that all required services are available and healthy BEFORE
-    starting the application.
-    
-    OLD (PATCH): Application starts even if databases unreachable, fails later
-    NEW (FIX): Fail fast at startup with clear error messages
-    
-    This prevents the "silent failure" pattern where the app appears to work
-    but data is never actually saved or retrieved.
-    """
-    logger.info("=" * 80)
-    logger.info("🔍 STARTUP VALIDATION: Checking all required services...")
-    logger.info("=" * 80)
-    
-    validation_results = {}
-    errors = []
-    
-    # Check MongoDB (REQUIRED for document storage)
+# ========== SERVICE VALIDATION HELPERS (Complexity Reduction) ==========
+
+async def _validate_mongodb() -> tuple[bool, str]:
+    """Validate MongoDB connection."""
     try:
         logger.info("Validating MongoDB...")
         await asyncio.wait_for(mongodb_client.connect(), timeout=5.0)
-        validation_results["mongodb"] = "✓ OK"
         logger.info("  ✓ MongoDB: Connected and healthy")
+        return True, "✓ OK"
     except asyncio.TimeoutError:
-        errors.append("MongoDB: Connection timeout - check if running on localhost:27017")
+        return False, "Connection timeout - check if running on localhost:27017"
     except Exception as e:
-        errors.append(f"MongoDB: Connection failed - {str(e)}")
-    
-    # Check Qdrant (REQUIRED for vector search)
+        return False, f"Connection failed - {str(e)}"
+
+async def _validate_qdrant() -> tuple[bool, str]:
+    """Validate Qdrant connection."""
     try:
         logger.info("Validating Qdrant...")
         await asyncio.wait_for(qdrant_client.connect(), timeout=5.0)
-        validation_results["qdrant"] = "✓ OK"
         logger.info("  ✓ Qdrant: Connected and healthy")
+        return True, "✓ OK"
     except asyncio.TimeoutError:
-        errors.append("Qdrant: Connection timeout - check if running on localhost:6333")
+        return False, "Connection timeout - check if running on localhost:6333"
     except Exception as e:
-        errors.append(f"Qdrant: Connection failed - {str(e)}")
-    
-    # Check Redis (REQUIRED for caching and session management)
+        return False, f"Connection failed - {str(e)}"
+
+async def _validate_redis() -> tuple[bool, str]:
+    """Validate Redis connection."""
     try:
         logger.info("Validating Redis...")
         await asyncio.wait_for(redis_client.connect(), timeout=5.0)
-        validation_results["redis"] = "✓ OK"
         logger.info("  ✓ Redis: Connected and healthy")
+        return True, "✓ OK"
     except asyncio.TimeoutError:
-        errors.append("Redis: Connection timeout - check if running on localhost:6379")
+        return False, "Connection timeout - check if running on localhost:6379"
     except Exception as e:
-        errors.append(f"Redis: Connection failed - {str(e)}")
-    
-    # Check Embedding Model (REQUIRED for semantic search)
+        return False, f"Connection failed - {str(e)}"
+
+def _validate_embedding_model() -> tuple[bool, str]:
+    """Validate embedding model loading."""
     try:
         logger.info("Validating Embedding Model...")
         from sentence_transformers import SentenceTransformer
@@ -93,12 +79,13 @@ async def validate_required_services():
         model = SentenceTransformer(model_name)
         test_embedding = model.encode("test")
         assert len(test_embedding) > 0, "Embedding generation failed"
-        validation_results["embedding_model"] = "✓ OK"
         logger.info(f"  ✓ Embedding Model: {model_name} (dimension: {len(test_embedding)})")
+        return True, "✓ OK"
     except Exception as e:
-        errors.append(f"Embedding Model: {str(e)}")
-    
-    # Check LLM Provider (REQUIRED for response generation)
+        return False, str(e)
+
+async def _validate_llm_provider() -> tuple[bool, str]:
+    """Validate LLM provider availability."""
     try:
         logger.info("Validating LLM Provider...")
         llm_url = settings.lmstudio_api_url or "http://localhost:1234/v1"
@@ -107,207 +94,273 @@ async def validate_required_services():
                 client.get(f"{llm_url}/models"),
                 timeout=3.0
             )
-            if response.status_code in [200, 404]:  # 404 OK if LMStudio not fully loaded yet
-                validation_results["llm_provider"] = "✓ OK"
+            if response.status_code in [200, 404]:  # 404 OK if LMStudio not fully loaded
                 logger.info(f"  ✓ LLM Provider: Available at {llm_url}")
-            else:
-                errors.append(f"LLM Provider: HTTP {response.status_code} from {llm_url}")
+                return True, "✓ OK"
+            return False, f"HTTP {response.status_code} from {llm_url}"
     except asyncio.TimeoutError:
-        errors.append(f"LLM Provider: Timeout connecting to {settings.lmstudio_api_url}")
+        return False, f"Timeout connecting to {settings.lmstudio_api_url}"
     except Exception as e:
-        errors.append(f"LLM Provider: {str(e)}")
-    
-    # Check spaCy Model (REQUIRED for NER)
+        return False, str(e)
+
+def _validate_spacy_model() -> tuple[bool, str]:
+    """Validate spaCy model loading."""
     try:
         logger.info("Validating spaCy Model...")
         import spacy
         try:
-            nlp = spacy.load("en_core_web_sm")
-            validation_results["spacy_model"] = "✓ OK"
+            spacy.load("en_core_web_sm")
             logger.info("  ✓ spaCy Model: en_core_web_sm loaded")
+            return True, "✓ OK"
         except OSError:
-            errors.append(
-                "spaCy: Model 'en_core_web_sm' not installed. "
-                "Install with: python -m spacy download en_core_web_sm"
-            )
+            return False, "Model 'en_core_web_sm' not installed. Install with: python -m spacy download en_core_web_sm"
     except Exception as e:
-        errors.append(f"spaCy: {str(e)}")
+        return False, str(e)
+
+def _log_validation_errors(errors: list[str]):
+    """Log validation errors with actionable checklist."""
+    logger.error("❌ STARTUP FAILED - Required services not available:\n")
+    for i, error in enumerate(errors, 1):
+        logger.error(f"  {i}. {error}")
     
-    # Report validation results
+    logger.error("\n" + "=" * 80)
+    logger.error("REQUIRED SERVICES CHECKLIST:")
+    logger.error("=" * 80)
+    logger.error("  [ ] MongoDB running on localhost:27017")
+    logger.error("  [ ] Qdrant running on localhost:6333")
+    logger.error("  [ ] Redis running on localhost:6379")
+    logger.error("  [ ] LMStudio running on localhost:1234")
+    logger.error("  [ ] spaCy model 'en_core_web_sm' installed")
+    logger.error("\nSee SETUP-GUIDE.md for installation instructions")
+    logger.error("=" * 80)
+
+async def validate_required_services():
+    """
+    Validate that all required services are available and healthy.
+    Fail fast at startup with clear error messages.
+    """
+    logger.info("=" * 80)
+    logger.info("🔍 STARTUP VALIDATION: Checking all required services...")
+    logger.info("=" * 80)
+    
+    # Run all validations
+    validations = {
+        "mongodb": await _validate_mongodb(),
+        "qdrant": await _validate_qdrant(),
+        "redis": await _validate_redis(),
+        "embedding_model": _validate_embedding_model(),
+        "llm_provider": await _validate_llm_provider(),
+        "spacy_model": _validate_spacy_model()
+    }
+    
+    # Collect errors
+    errors = [f"{name}: {msg}" for name, (success, msg) in validations.items() if not success]
+    
+    # Report results
     logger.info("=" * 80)
     logger.info("STARTUP VALIDATION SUMMARY")
     logger.info("=" * 80)
     
     if errors:
-        logger.error("❌ STARTUP FAILED - Required services not available:\n")
-        for i, error in enumerate(errors, 1):
-            logger.error(f"  {i}. {error}")
-        
-        logger.error("\n" + "=" * 80)
-        logger.error("REQUIRED SERVICES CHECKLIST:")
-        logger.error("=" * 80)
-        logger.error("  [ ] MongoDB running on localhost:27017")
-        logger.error("  [ ] Qdrant running on localhost:6333")
-        logger.error("  [ ] Redis running on localhost:6379")
-        logger.error("  [ ] LMStudio running on localhost:1234")
-        logger.error("  [ ] spaCy model: python -m spacy download en_core_web_sm")
-        logger.error("=" * 80)
-        
-        # Raise error to prevent application startup
-        raise RuntimeError(
-            f"Startup validation failed: {len(errors)} critical service(s) unavailable. "
-            f"Cannot proceed without all required services."
-        )
-    else:
-        logger.info("✅ ALL REQUIRED SERVICES VALIDATED AND HEALTHY")
-        logger.info("=" * 80)
-        for service, status in validation_results.items():
-            logger.info(f"  {status} - {service}")
-        logger.info("=" * 80)
-        return validation_results
+        _log_validation_errors(errors)
+        raise RuntimeError("Required services validation failed. See logs above.")
+    
+    logger.info("✅ All required services validated successfully!")
+    logger.info("=" * 80)
 
+
+# ========== LIFESPAN PHASE HELPERS (Complexity Reduction) ==========
+
+def _log_configuration():
+    """Log application configuration."""
+    logger.info("\nPhase 1: Configuration Check")
+    logger.info("-" * 80)
+    logger.info(f"  APP_ENV: {settings.app_env}")
+    logger.info(f"  DEBUG_MODE: {settings.debug_mode}")
+    logger.info(f"  MONGODB_URI configured: {bool(settings.mongodb_uri)}")
+    logger.info(f"  QDRANT_URL: {settings.qdrant_url if settings.qdrant_url else 'NOT SET'}")
+    logger.info(f"  REDIS_URL configured: {bool(settings.redis_url)}")
+    logger.info(f"  LMSTUDIO_API_URL: {settings.lmstudio_api_url}")
+
+async def _safe_connect(client_connect_coro, name: str, timeout_seconds: float = 5.0) -> bool:
+    """Safely connect to a service with timeout."""
+    try:
+        await asyncio.wait_for(client_connect_coro, timeout=timeout_seconds)
+        logger.info(f"  ✓ Connected: {name}")
+        return True
+    except asyncio.TimeoutError:
+        logger.warning(f"  ⚠️ {name} connection timeout (will retry later)")
+        return False
+    except Exception as e:
+        logger.warning(f"  ⚠️ {name} connection error: {type(e).__name__} (will retry later)")
+        return False
+
+async def _connect_databases_dev():
+    """Connect to databases in development mode (longer timeouts)."""
+    connect_tasks = [
+        _safe_connect(mongodb_client.connect(), "MongoDB", timeout_seconds=30.0),
+        _safe_connect(qdrant_client.connect(), "Qdrant", timeout_seconds=30.0),
+        _safe_connect(redis_client.connect(), "Redis", timeout_seconds=20.0)
+    ]
+    results = await asyncio.gather(*connect_tasks)
+    logger.info(f"  Connection attempts: MongoDB={results[0]}, Qdrant={results[1]}, Redis={results[2]}")
+    
+    # Try Neo4j (optional)
+    try:
+        from app.core.db_neo4j import neo4j_client
+        neo4j_result = await _safe_connect(neo4j_client.connect(), "Neo4j", timeout_seconds=10.0)
+        logger.info(f"  Neo4j connection: {neo4j_result}")
+    except Exception as e:
+        logger.warning(f"  Neo4j connection failed (optional): {e}")
+
+async def _connect_databases_prod():
+    """Connect to databases in production mode (strict timeouts)."""
+    connect_tasks = [
+        _safe_connect(mongodb_client.connect(), "MongoDB", timeout_seconds=8.0),
+        _safe_connect(qdrant_client.connect(), "Qdrant", timeout_seconds=6.0),
+        _safe_connect(redis_client.connect(), "Redis", timeout_seconds=4.0)
+    ]
+    results = await asyncio.gather(*connect_tasks)
+    
+    # Try Neo4j (optional)
+    try:
+        from app.core.db_neo4j import neo4j_client
+        await _safe_connect(neo4j_client.connect(), "Neo4j", timeout_seconds=5.0)
+    except Exception:
+        pass  # Neo4j is optional
+    
+    if not all(results):
+        raise RuntimeError("One or more critical services failed to connect")
+
+async def _run_database_migrations():
+    """Run database migrations."""
+    logger.info("\nPhase 4: Database Migrations")
+    logger.info("-" * 80)
+    try:
+        from .migrations.media_schema_migrations import run_all_migrations
+        await run_all_migrations(mongodb_client.database)
+        logger.info("  ✓ Database migrations completed successfully")
+    except Exception as e:
+        logger.error(f"  ERROR: Database migrations failed: {e}")
+        raise
+
+async def _initialize_media_services():
+    """Initialize media services."""
+    logger.info("\nPhase 5: Service Initialization")
+    logger.info("-" * 80)
+    try:
+        from .services.media_suggestion_service import media_suggestion_service
+        await media_suggestion_service.initialize()
+        logger.info("  ✓ Media suggestion service initialized")
+    except Exception as e:
+        logger.error(f"  ERROR: Failed to initialize media suggestion service: {e}")
+        raise
+
+def _configure_background_workers(app: FastAPI):
+    """Configure background workers for lazy initialization."""
+    logger.info("\nPhase 6: Background Workers Configuration")
+    logger.info("-" * 80)
+    app.state.ingest_worker_task = None
+    app.state.ingest_worker_started = False
+    logger.info("  ✓ Background workers configured for lazy initialization")
+
+async def _warmup_services():
+    """Warmup services to prevent first-request delays."""
+    logger.info("\nPhase 7: Service Warmup")
+    logger.info("-" * 80)
+    
+    try:
+        logger.info("🔥 Warming up chat service...")
+        from .services.chat_service import ChatService
+        
+        warmup_service = ChatService()
+        await warmup_service.initialize()
+        
+        logger.info("  ✅ Chat service warmed up and ready!")
+        logger.info("  First query will respond in <10 seconds instead of 60+ seconds")
+    except Exception as e:
+        logger.warning(f"  ⚠️  Chat service warmup failed: {e}")
+        logger.warning("  Services will initialize on first request (30-60s delay)")
+
+async def _shutdown_services():
+    """Shutdown all services gracefully."""
+    logger.info("=" * 80)
+    logger.info("SHUTDOWN: Disconnecting from all services...")
+    logger.info("=" * 80)
+    
+    disconnect_tasks = []
+    
+    # MongoDB
+    if mongodb_client.client:
+        logger.info("Disconnecting from MongoDB...")
+        disconnect_tasks.append(mongodb_client.disconnect())
+    
+    # Qdrant
+    if qdrant_client.client:
+        logger.info("Disconnecting from Qdrant...")
+        disconnect_tasks.append(qdrant_client.disconnect())
+    
+    # Redis
+    if redis_client.client:
+        logger.info("Disconnecting from Redis...")
+        disconnect_tasks.append(redis_client.disconnect())
+    
+    # Neo4j (if available)
+    try:
+        from app.core.db_neo4j import neo4j_client
+        if neo4j_client.driver:
+            logger.info("Disconnecting from Neo4j...")
+            disconnect_tasks.append(neo4j_client.disconnect())
+    except Exception:
+        pass
+    
+    if disconnect_tasks:
+        await asyncio.gather(*disconnect_tasks, return_exceptions=True)
+    
+    logger.info("✅ All services disconnected successfully")
+    logger.info("=" * 80)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator:
-    """Application lifespan manager for startup and shutdown events.
-    
-    ROOT CAUSE FIX: This now VALIDATES all required services before starting.
-    Old approach: Started regardless of database availability (patch work).
-    New approach: Fail fast if any required service unavailable (real fix).
-    """
+    """Application lifespan manager - orchestrates startup and shutdown."""
     # Startup
     logger.info("=" * 80)
     logger.info("🚀 APPLICATION STARTUP - OMS Chat Bot RAG System")
     logger.info("=" * 80)
     
     try:
-        # Phase 1: Validate configuration
-        logger.info("\nPhase 1: Configuration Check")
-        logger.info("-" * 80)
-        logger.info(f"  APP_ENV: {settings.app_env}")
-        logger.info(f"  DEBUG_MODE: {settings.debug_mode}")
-        logger.info(f"  MONGODB_URI configured: {bool(settings.mongodb_uri)}")
-        logger.info(f"  QDRANT_URL: {settings.qdrant_url if settings.qdrant_url else 'NOT SET'}")
-        logger.info(f"  REDIS_URL configured: {bool(settings.redis_url)}")
-        logger.info(f"  LMSTUDIO_API_URL: {settings.lmstudio_api_url}")
+        # Phase 1: Configuration
+        _log_configuration()
         
-        # Phase 2: ROOT CAUSE FIX - Validate all required services (FAIL FAST)
-        # But in development mode, skip validation to allow fast startup
-        logger.info("\nPhase 2: Service Validation (ROOT CAUSE FIX #1: FAIL FAST)")
+        # Phase 2: Service Validation (production only)
+        logger.info("\nPhase 2: Service Validation")
         logger.info("-" * 80)
-        
         if settings.app_env == "production":
             logger.info("Production mode: Validating all services...")
-            validation_results = await validate_required_services()
+            await validate_required_services()
         else:
-            logger.info("Development mode: Skipping startup validation (graceful degradation enabled)")
-            logger.info("  Services will connect/degrade as accessed, not at startup")
+            logger.info("Development mode: Skipping validation (graceful degradation enabled)")
         
-        # Phase 3: Connect to databases (now guaranteed to work)
+        # Phase 3: Database Connections
         logger.info("\nPhase 3: Connecting to Services")
         logger.info("-" * 80)
-        
-        async def _safe_connect(client_connect_coro, name: str, timeout: float = 5.0):
-            try:
-                result = await asyncio.wait_for(client_connect_coro, timeout=timeout)
-                logger.info(f"  ✓ Connected: {name}")
-                return True
-            except asyncio.TimeoutError:
-                logger.warning(f"  ⚠️ {name} connection timeout (will retry later)")
-                return False
-            except Exception as e:
-                logger.warning(f"  ⚠️ {name} connection error: {type(e).__name__} (will retry later)")
-                return False
-
-        # In dev mode, use longer timeouts and don't fail on errors
         if settings.app_env == "development":
-            connect_tasks = [
-                _safe_connect(mongodb_client.connect(), "MongoDB", timeout=30.0),
-                _safe_connect(qdrant_client.connect(), "Qdrant", timeout=30.0),
-                _safe_connect(redis_client.connect(), "Redis", timeout=20.0)
-            ]
-            results = await asyncio.gather(*connect_tasks)
-            logger.info(f"  Connection attempts: MongoDB={results[0]}, Qdrant={results[1]}, Redis={results[2]}")
-            
-            # Try Neo4j connection (non-blocking, optional)
-            try:
-                from app.core.db_neo4j import neo4j_client
-                neo4j_result = await _safe_connect(neo4j_client.connect(), "Neo4j", timeout=10.0)
-                logger.info(f"  Neo4j connection: {neo4j_result}")
-            except Exception as e:
-                logger.warning(f"  Neo4j connection failed (optional): {e}")
+            await _connect_databases_dev()
         else:
-            # Production: strict timeouts
-            connect_tasks = [
-                _safe_connect(mongodb_client.connect(), "MongoDB", timeout=8.0),
-                _safe_connect(qdrant_client.connect(), "Qdrant", timeout=6.0),
-                _safe_connect(redis_client.connect(), "Redis", timeout=4.0)
-            ]
-            results = await asyncio.gather(*connect_tasks)
-            
-            # Try Neo4j in production too (optional)
-            try:
-                from app.core.db_neo4j import neo4j_client
-                neo4j_result = await _safe_connect(neo4j_client.connect(), "Neo4j", timeout=5.0)
-                logger.info(f"  Neo4j connection: {neo4j_result}")
-            except Exception:
-                pass  # Neo4j is optional in production
-            
-            if not all(results):
-                raise RuntimeError("One or more critical services failed to connect")
+            await _connect_databases_prod()
+        logger.info("  ✓ Database connection phase completed")
         
-        logger.info(f"  ✓ Database connection phase completed")
+        # Phase 4: Migrations
+        await _run_database_migrations()
         
-        # Phase 4: Run database migrations for media features
-        logger.info("\nPhase 4: Database Migrations")
-        logger.info("-" * 80)
-        try:
-            from .migrations.media_schema_migrations import run_all_migrations
-            await run_all_migrations(mongodb_client.database)
-            logger.info("  ✓ Database migrations completed successfully")
-        except Exception as e:
-            logger.error(f"  ERROR: Database migrations failed: {e}")
-            raise  # Don't continue if migrations fail
+        # Phase 5: Initialize Services
+        await _initialize_media_services()
         
-        # Phase 5: Initialize media services
-        logger.info("\nPhase 5: Service Initialization")
-        logger.info("-" * 80)
-        try:
-            from .services.media_suggestion_service import media_suggestion_service
-            await media_suggestion_service.initialize()
-            logger.info("  ✓ Media suggestion service initialized")
-        except Exception as e:
-            logger.error(f"  ERROR: Failed to initialize media suggestion service: {e}")
-            raise  # Don't continue if service initialization fails
+        # Phase 6: Background Workers
+        _configure_background_workers(app)
         
-        # Phase 6: Background workers (lazy initialization)
-        logger.info("\nPhase 6: Background Workers Configuration")
-        logger.info("-" * 80)
-        app.state.ingest_worker_task = None
-        app.state.ingest_worker_started = False
-        logger.info("  ✓ Background workers configured for lazy initialization")
-        
-        # Phase 7: Warmup - ENABLE to speed up first request
-        logger.info("\nPhase 7: Service Warmup")
-        logger.info("-" * 80)
-        
-        try:
-            logger.info("🔥 Warming up chat service (prevents 60s delay on first request)...")
-            from .services.chat_service import ChatService
-            
-            # Create and initialize chat service
-            warmup_service = ChatService()
-            await warmup_service.initialize()
-            
-            logger.info("  ✅ Chat service warmed up and ready!")
-            logger.info("  ✓ Embedding model loaded")
-            logger.info("  ✓ LLM handler initialized")
-            logger.info("  ✓ Database connections ready")
-            logger.info("  First query will now respond in <10 seconds instead of 60+ seconds")
-        except Exception as e:
-            logger.warning(f"  ⚠️  Chat service warmup failed: {e}")
-            logger.warning("  Services will initialize on first request (may cause 30-60s delay)")
-            logger.warning("  This is not critical - app will still work")
+        # Phase 7: Warmup
+        await _warmup_services()
         
         logger.info("\n" + "=" * 80)
         logger.info("✅ APPLICATION STARTUP COMPLETED SUCCESSFULLY")
@@ -315,41 +368,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
         
         yield
         
-        logger.info("=" * 80)
-        logger.info("LIFESPAN: Returned from yield, entering shutdown phase")
-        logger.info("=" * 80)
-        
     except Exception as e:
-        logger.error(f"LIFESPAN: ❌ Application startup failed: {e}", exc_info=True)
+        logger.error(f"❌ Application startup failed: {e}", exc_info=True)
         raise
     
     # Shutdown
-    logger.info("=" * 80)
-    logger.info("LIFESPAN: Shutting down RAG Graph Chatbot application...")
-    logger.info("=" * 80)
-    
-    try:
-        # Cancel background tasks
-        if hasattr(app, 'state') and hasattr(app.state, 'ingest_worker_task') and app.state.ingest_worker_task:
-            logger.info("LIFESPAN: Cancelling ingest worker task...")
-            app.state.ingest_worker_task.cancel()
-            try:
-                await app.state.ingest_worker_task
-            except (asyncio.CancelledError, Exception):
-                logger.info("LIFESPAN: Ingest worker task cancelled successfully")
-        
-        logger.info("LIFESPAN: Disconnecting from databases...")
-        # Disconnect from databases
-        await mongodb_client.disconnect()
-        await qdrant_client.disconnect()
-        await redis_client.disconnect()
-        
-        logger.info("=" * 80)
-        logger.info("LIFESPAN: ✅ Application shutdown completed successfully")
-        logger.info("=" * 80)
-        
-    except Exception as e:
-        logger.error(f"LIFESPAN: ❌ Application shutdown failed: {e}", exc_info=True)
+    await _shutdown_services()
+
 
 # Create FastAPI application
 app = FastAPI(
@@ -424,7 +449,6 @@ async def health_check():
         qdrant_status = "connected" if qdrant_client.is_connected() else "disconnected"
         redis_status = "connected" if redis_client.is_connected() else "disconnected"
         
-        status_code = 200
         databases = {
             "mongodb": mongo_status,
             "qdrant": qdrant_status,
@@ -438,7 +462,7 @@ async def health_check():
             "environment": settings.app_env,
             "version": "1.0.0",
             "databases": databases,
-            "timestamp": datetime.utcnow().isoformat()
+            "timestamp": datetime.now(timezone.utc).isoformat()
         }
     except Exception as e:
         logger.error(f"Health check failed: {e}")
@@ -464,7 +488,7 @@ async def readiness_check():
         return {
             "status": "ready",
             "databases": databases,
-            "timestamp": datetime.utcnow().isoformat()
+            "timestamp": datetime.now(timezone.utc).isoformat()
         }
     except HTTPException:
         raise
@@ -499,7 +523,6 @@ async def system_info():
         # Get database statistics
         mongo_info = {}
         qdrant_info = {}
-        arango_info = {}
         redis_info = {}
         neo4j_info = {}
         

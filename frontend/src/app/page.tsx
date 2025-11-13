@@ -11,7 +11,7 @@ export default function HomePage() {
 
   useEffect(() => {
     // Initialize session
-    const newSessionId = `session-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`
+    const newSessionId = `session-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`
     setSessionId(newSessionId)
     setMounted(true)
   }, [])

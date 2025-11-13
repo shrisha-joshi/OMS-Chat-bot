@@ -18,6 +18,9 @@ from ..config import settings
 
 logger = logging.getLogger(__name__)
 
+# Constants
+NUMBERED_LIST_PATTERN = r'\d+\.\s*(.+)'
+
 class QueryIntelligenceService:
     """Service for advanced query understanding and enhancement."""
     
@@ -139,6 +142,26 @@ class QueryIntelligenceService:
         
         return "exploratory"
     
+    def _parse_numbered_response(self, response: str, query: str) -> List[str]:
+        """Parse numbered list from LLM response."""
+        lines = response.strip().split('\n')
+        rewritten_queries = []
+        
+        for line in lines:
+            match = re.match(NUMBERED_LIST_PATTERN, line.strip())
+            if match:
+                rewritten_query = match.group(1).strip()
+                if rewritten_query and rewritten_query != query:
+                    rewritten_queries.append(rewritten_query)
+        
+        # Ensure we have at least the original
+        if not rewritten_queries:
+            return [query]
+        if query not in rewritten_queries:
+            rewritten_queries.insert(0, query)
+        
+        return rewritten_queries[:3]
+    
     async def _rewrite_query(self, query: str) -> List[str]:
         """
         Rewrite the query for better retrieval using LLM.
@@ -170,33 +193,53 @@ Provide 3 rewritten versions, one per line:
             response = await self._call_lmstudio(prompt, max_tokens=200)
             
             if response:
-                # Parse the numbered list
-                lines = response.strip().split('\n')
-                rewritten_queries = []
-                
-                for line in lines:
-                    # Extract text after numbers (1., 2., 3.)
-                    match = re.match(r'\d+\.\s*(.+)', line.strip())
-                    if match:
-                        rewritten_query = match.group(1).strip()
-                        if rewritten_query and rewritten_query != query:
-                            rewritten_queries.append(rewritten_query)
-                
-                # Add original query if we don't have enough rewrites
-                if not rewritten_queries:
-                    rewritten_queries = [query]
-                elif query not in rewritten_queries:
-                    rewritten_queries.insert(0, query)
-                
-                # Cache result
+                rewritten_queries = self._parse_numbered_response(response, query)
                 await self.redis_client.set_json(cache_key, rewritten_queries, expire_seconds=3600)
-                
-                return rewritten_queries[:3]  # Limit to 3 variations
+                return rewritten_queries
             
         except Exception as e:
             logger.warning(f"Query rewriting failed: {e}")
         
         return [query]  # Fallback to original query
+    
+    def _extract_conjunction_parts(self, query: str) -> List[str]:
+        """Extract sub-queries from conjunctions (and/or)."""
+        parts = re.split(r'\s+(?:and|or)\s+', query, flags=re.IGNORECASE)
+        return [p.strip() for p in parts if len(p.strip()) > 10]
+    
+    async def _decompose_with_llm(self, query: str, cache_key: str) -> List[str]:
+        """Use LLM to decompose complex query into sub-questions."""
+        cached_result = await self.redis_client.get_json(cache_key)
+        if cached_result:
+            return cached_result
+        
+        prompt = f"""Break down this complex query into 2-3 simpler, focused sub-questions that together would provide a complete answer.
+
+Complex query: "{query}"
+
+Sub-questions (one per line):
+1. 
+2. 
+3. """
+        
+        response = await self._call_lmstudio(prompt, max_tokens=150)
+        if not response:
+            return [query]
+        
+        # Parse numbered list
+        sub_queries = []
+        for line in response.strip().split('\n'):
+            match = re.match(NUMBERED_LIST_PATTERN, line.strip())
+            if match:
+                sub_query = match.group(1).strip()
+                if len(sub_query) > 10:
+                    sub_queries.append(sub_query)
+        
+        if len(sub_queries) > 1:
+            await self.redis_client.set_json(cache_key, sub_queries, expire_seconds=3600)
+            return sub_queries
+        
+        return [query]
     
     async def _decompose_query(self, query: str) -> List[str]:
         """
@@ -211,53 +254,14 @@ Provide 3 rewritten versions, one per line:
         try:
             # Simple decomposition for obvious multi-part queries
             if ' and ' in query.lower() or ' or ' in query.lower():
-                # Handle conjunctions
-                sub_queries = []
-                
-                # Split on 'and' and 'or'
-                parts = re.split(r'\s+(?:and|or)\s+', query, flags=re.IGNORECASE)
-                
-                for part in parts:
-                    part = part.strip()
-                    if len(part) > 10:  # Only include substantial parts
-                        sub_queries.append(part)
-                
+                sub_queries = self._extract_conjunction_parts(query)
                 if len(sub_queries) > 1:
                     return sub_queries
             
             # For complex questions, use LLM decomposition
-            if len(query.split()) > 10:  # Only decompose longer queries
+            if len(query.split()) > 10:
                 cache_key = f"decompose:{hash(query)}"
-                cached_result = await self.redis_client.get_json(cache_key)
-                if cached_result:
-                    return cached_result
-                
-                prompt = f"""Break down this complex query into 2-3 simpler, focused sub-questions that together would provide a complete answer.
-
-Complex query: "{query}"
-
-Sub-questions (one per line):
-1. 
-2. 
-3. """
-
-                response = await self._call_lmstudio(prompt, max_tokens=150)
-                
-                if response:
-                    lines = response.strip().split('\n')
-                    sub_queries = []
-                    
-                    for line in lines:
-                        match = re.match(r'\d+\.\s*(.+)', line.strip())
-                        if match:
-                            sub_query = match.group(1).strip()
-                            if len(sub_query) > 10:  # Only substantial questions
-                                sub_queries.append(sub_query)
-                    
-                    if len(sub_queries) > 1:
-                        # Cache result
-                        await self.redis_client.set_json(cache_key, sub_queries, expire_seconds=3600)
-                        return sub_queries
+                return await self._decompose_with_llm(query, cache_key)
             
         except Exception as e:
             logger.warning(f"Query decomposition failed: {e}")
@@ -370,7 +374,85 @@ Answer:"""
     # Phase 2: ADVANCED QUERY ENHANCEMENT METHODS
     # ============================================================================
     
-    async def expand_query(self, query: str, max_expansions: int = 5) -> Dict[str, Any]:
+    def _get_synonym_database(self) -> Dict[str, list]:
+        """Get comprehensive synonym mapping for query expansion."""
+        return {
+            "help": ["assist", "support", "aid", "guidance", "assistance"],
+            "problem": ["issue", "challenge", "difficulty", "error", "bug"],
+            "understand": ["comprehend", "grasp", "learn", "know", "realize"],
+            "use": ["utilize", "employ", "apply", "leverage", "harness"],
+            "show": ["display", "demonstrate", "illustrate", "reveal", "present"],
+            "find": ["locate", "discover", "search", "identify", "uncover"],
+            "work": ["function", "operate", "run", "execute", "perform"],
+            "change": ["modify", "alter", "update", "adjust", "transform"],
+            "create": ["make", "build", "generate", "produce", "develop"],
+            "delete": ["remove", "erase", "destroy", "eliminate", "clear"],
+            "fix": ["repair", "resolve", "correct", "patch", "remedy"],
+            "optimize": ["improve", "enhance", "boost", "refine", "tune"],
+            "analyze": ["examine", "evaluate", "assess", "review", "study"],
+            "manage": ["control", "administer", "oversee", "handle", "govern"],
+            "integrate": ["combine", "merge", "incorporate", "link", "connect"]
+        }
+    
+    def _calculate_semantic_similarity(self, text1: str, text2: str) -> float:
+        """Calculate cosine similarity between two texts using embeddings."""
+        if not self.embedding_model:
+            return 1.0  # Default: assume safe if no embedding model
+        
+        try:
+            embedding1 = self.embedding_model.encode(text1)
+            embedding2 = self.embedding_model.encode(text2)
+            from numpy import dot
+            from numpy.linalg import norm
+            return dot(embedding1, embedding2) / (norm(embedding1) * norm(embedding2))
+        except Exception as e:
+            logger.debug(f"Similarity calculation failed: {e}")
+            return 0.9  # Conservative estimate
+    
+    def _create_synonym_expansion(self, query: str, keyword: str, synonym: str, similarity: float) -> Dict[str, Any]:
+        """Create an expansion entry for a synonym replacement."""
+        expanded_query = query.replace(keyword, f"{keyword} or {synonym}", 1)
+        return {
+            "expanded_query": expanded_query,
+            "expansion_type": "synonym",
+            "original_term": keyword,
+            "replacement_term": synonym,
+            "semantic_similarity": round(similarity, 3),
+            "meaning_preserved": True
+        }
+    
+    def _process_synonym_expansion(self, query: str, keyword: str, synonyms: List[str], 
+                                    expansions: List[Dict], max_expansions: int) -> bool:
+        """Process synonyms for a keyword. Returns True if max reached."""
+        for synonym in synonyms:
+            expanded = query.replace(keyword, f"{keyword} or {synonym}", 1)
+            if expanded == query:
+                continue
+            
+            similarity = self._calculate_semantic_similarity(query, expanded)
+            
+            if similarity >= 0.85:
+                expansion = self._create_synonym_expansion(query, keyword, synonym, similarity)
+                expansions.append(expansion)
+            else:
+                logger.debug(f"Expansion rejected: '{expanded}' (similarity={similarity:.3f} < 0.85)")
+            
+            if len(expansions) >= max_expansions:
+                return True
+        return False
+    
+    def _build_expansion_result(self, query: str, expansions: List[Dict]) -> Dict[str, Any]:
+        """Build expansion result dictionary."""
+        return {
+            "original_query": query,
+            "expansions": expansions,
+            "total_expansions": len(expansions),
+            "expansion_strategy": "synonym_based_with_semantic_validation",
+            "semantic_threshold": 0.85,
+            "meaning_preservation_enabled": True
+        }
+    
+    def expand_query(self, query: str, max_expansions: int = 5) -> Dict[str, Any]:
         """
         Expand query with synonyms and related terms for better retrieval.
         SEMANTIC VALIDATION: Only allow expansions that preserve query meaning (similarity > 0.85).
@@ -383,80 +465,19 @@ Answer:"""
             Dictionary with expanded queries and expansion metadata
         """
         try:
-            # Comprehensive synonym database
-            synonym_map = {
-                "help": ["assist", "support", "aid", "guidance", "assistance"],
-                "problem": ["issue", "challenge", "difficulty", "error", "bug"],
-                "understand": ["comprehend", "grasp", "learn", "know", "realize"],
-                "use": ["utilize", "employ", "apply", "leverage", "harness"],
-                "show": ["display", "demonstrate", "illustrate", "reveal", "present"],
-                "find": ["locate", "discover", "search", "identify", "uncover"],
-                "work": ["function", "operate", "run", "execute", "perform"],
-                "change": ["modify", "alter", "update", "adjust", "transform"],
-                "create": ["make", "build", "generate", "produce", "develop"],
-                "delete": ["remove", "erase", "destroy", "eliminate", "clear"],
-                "fix": ["repair", "resolve", "correct", "patch", "remedy"],
-                "optimize": ["improve", "enhance", "boost", "refine", "tune"],
-                "analyze": ["examine", "evaluate", "assess", "review", "study"],
-                "manage": ["control", "administer", "oversee", "handle", "govern"],
-                "integrate": ["combine", "merge", "incorporate", "link", "connect"]
-            }
-            
+            synonym_map = self._get_synonym_database()
             expansions = []
             query_lower = query.lower()
             
-            # Generate embedding for original query for semantic comparison
-            original_embedding = self.embedding_model.encode(query) if self.embedding_model else None
-            
             # Find and expand synonyms
             for keyword, synonyms in synonym_map.items():
-                if keyword in query_lower:
-                    for synonym in synonyms:
-                        # Create expanded version with synonym
-                        expanded = query.replace(keyword, f"{keyword} or {synonym}", 1)
-                        if expanded != query:
-                            # SEMANTIC VALIDATION: Check if expansion preserves meaning
-                            similarity = 1.0  # Default: assume safe if no embedding model
-                            
-                            if original_embedding is not None:
-                                try:
-                                    expanded_embedding = self.embedding_model.encode(expanded)
-                                    # Calculate cosine similarity
-                                    from numpy import dot
-                                    from numpy.linalg import norm
-                                    similarity = dot(original_embedding, expanded_embedding) / (norm(original_embedding) * norm(expanded_embedding))
-                                except Exception as e:
-                                    logger.debug(f"Similarity calculation failed: {e}")
-                                    similarity = 0.9  # Conservative estimate
-                            
-                            # Only accept expansion if it preserves meaning (threshold > 0.85)
-                            if similarity >= 0.85:
-                                expansions.append({
-                                    "expanded_query": expanded,
-                                    "expansion_type": "synonym",
-                                    "original_term": keyword,
-                                    "replacement_term": synonym,
-                                    "semantic_similarity": round(similarity, 3),
-                                    "meaning_preserved": True
-                                })
-                            else:
-                                logger.debug(f"Expansion rejected: '{expanded}' (similarity={similarity:.3f} < 0.85 threshold)")
-                        
-                        # Limit to max_expansions
-                        if len(expansions) >= max_expansions:
-                            break
-                    
-                    if len(expansions) >= max_expansions:
-                        break
+                if keyword not in query_lower:
+                    continue
+                
+                if self._process_synonym_expansion(query, keyword, synonyms, expansions, max_expansions):
+                    break
             
-            return {
-                "original_query": query,
-                "expansions": expansions,
-                "total_expansions": len(expansions),
-                "expansion_strategy": "synonym_based_with_semantic_validation",
-                "semantic_threshold": 0.85,
-                "meaning_preservation_enabled": True
-            }
+            return self._build_expansion_result(query, expansions)
             
         except Exception as e:
             logger.warning(f"Query expansion failed: {e}")
@@ -467,7 +488,53 @@ Answer:"""
                 "error": str(e)
             }
     
-    async def rewrite_query_advanced(self, query: str) -> Dict[str, Any]:
+    def _apply_typo_correction(self, query: str) -> tuple[str, bool, str]:
+        """Apply typo correction. Returns (corrected, found, strategy)."""
+        typo_corrections = {
+            "helo": "help", "wrk": "work", "lst": "list", "usr": "user",
+            "chr": "character", "teh": "the", "recieve": "receive",
+            "occured": "occurred", "seperate": "separate", "definately": "definitely"
+        }
+        
+        for typo, correction in typo_corrections.items():
+            if typo.lower() in query.lower():
+                corrected = re.sub(r'\b' + typo + r'\b', correction, query, flags=re.IGNORECASE)
+                if corrected != query:
+                    return corrected, True, "typo_correction"
+        return query, False, ""
+    
+    def _apply_context_addition(self, query: str) -> tuple[str, bool, str]:
+        """Add context to query. Returns (modified, found, strategy)."""
+        context_additions = {
+            "how": "how to solve",
+            "why": "why is this important",
+            "what": "what is the definition and usage of",
+            "when": "when should we use",
+        }
+        
+        query_start = query.split()[0].lower() if query.split() else ""
+        if query_start in context_additions:
+            specified = query.replace(query_start, context_additions[query_start], 1)
+            if specified != query:
+                return specified, True, "context_addition"
+        return query, False, ""
+    
+    def _apply_phrase_normalization(self, query: str) -> tuple[str, bool, str]:
+        """Normalize common phrases. Returns (normalized, found, strategy)."""
+        phrase_normalizations = {
+            r"\b(?:is\s+)?there\s+(?:a\s+)?way": "how to",
+            r"\bwhat\s+(?:is\s+)?the\s+(?:best\s+)?way": "best practices for",
+            r"\bhow\s+(?:can\s+)?(?:i\s+)?(?:you\s+)?": "steps to",
+        }
+        
+        for pattern, replacement in phrase_normalizations.items():
+            if re.search(pattern, query.lower()):
+                normalized = re.sub(pattern, replacement, query, flags=re.IGNORECASE)
+                if normalized != query:
+                    return normalized, True, "phrase_normalization"
+        return query, False, ""
+    
+    def rewrite_query_advanced(self, query: str) -> Dict[str, Any]:
         """
         Advanced query rewriting that handles typos, grammar, and rephrasing.
         
@@ -478,101 +545,87 @@ Answer:"""
             Dictionary with corrected and rephrased queries
         """
         try:
-            rewrites = {
-                "original": query,
-                "rewrites": [],
-                "strategies_applied": []
-            }
+            rewrites = {"original": query, "rewrites": [], "strategies_applied": []}
             
-            # Strategy 1: Fix common typos
-            typo_corrections = {
-                "helo": "help",
-                "wrk": "work",
-                "lst": "list",
-                "usr": "user",
-                "chr": "character",
-                "teh": "the",
-                "recieve": "receive",
-                "occured": "occurred",
-                "seperate": "separate",
-                "definately": "definitely"
-            }
+            # Apply typo correction
+            corrected, found, strategy = self._apply_typo_correction(query)
+            if found:
+                rewrites["rewrites"].append({"query": corrected, "strategy": strategy, "confidence": 0.95})
+                rewrites["strategies_applied"].append(strategy)
             
-            corrected_query = query
-            typo_found = False
+            # Apply context addition
+            specified, found, strategy = self._apply_context_addition(query)
+            if found:
+                rewrites["rewrites"].append({"query": specified, "strategy": strategy, "confidence": 0.85})
+                rewrites["strategies_applied"].append(strategy)
             
-            for typo, correction in typo_corrections.items():
-                if typo.lower() in query.lower():
-                    corrected_query = re.sub(
-                        r'\b' + typo + r'\b',
-                        correction,
-                        query,
-                        flags=re.IGNORECASE
-                    )
-                    typo_found = True
-                    break
-            
-            if typo_found and corrected_query != query:
-                rewrites["rewrites"].append({
-                    "query": corrected_query,
-                    "strategy": "typo_correction",
-                    "confidence": 0.95
-                })
-                rewrites["strategies_applied"].append("typo_correction")
-            
-            # Strategy 2: Add context/specificity
-            context_additions = {
-                "how": "how to solve",
-                "why": "why is this important",
-                "what": "what is the definition and usage of",
-                "when": "when should we use",
-            }
-            
-            query_start = query.split()[0].lower() if query.split() else ""
-            
-            if query_start in context_additions:
-                specified_query = query.replace(
-                    query_start,
-                    context_additions[query_start],
-                    1
-                )
-                if specified_query != query:
-                    rewrites["rewrites"].append({
-                        "query": specified_query,
-                        "strategy": "context_addition",
-                        "confidence": 0.85
-                    })
-                    rewrites["strategies_applied"].append("context_addition")
-            
-            # Strategy 3: Normalize phrase variations
-            phrase_normalizations = {
-                r"\b(?:is\s+)?there\s+(?:a\s+)?way": "how to",
-                r"\bwhat\s+(?:is\s+)?the\s+(?:best\s+)?way": "best practices for",
-                r"\bhow\s+(?:can\s+)?(?:i\s+)?(?:you\s+)?": "steps to",
-            }
-            
-            for pattern, replacement in phrase_normalizations.items():
-                if re.search(pattern, query.lower()):
-                    normalized = re.sub(pattern, replacement, query, flags=re.IGNORECASE)
-                    if normalized != query:
-                        rewrites["rewrites"].append({
-                            "query": normalized,
-                            "strategy": "phrase_normalization",
-                            "confidence": 0.8
-                        })
-                        rewrites["strategies_applied"].append("phrase_normalization")
-                        break
+            # Apply phrase normalization
+            normalized, found, strategy = self._apply_phrase_normalization(query)
+            if found:
+                rewrites["rewrites"].append({"query": normalized, "strategy": strategy, "confidence": 0.8})
+                rewrites["strategies_applied"].append(strategy)
             
             return rewrites
             
         except Exception as e:
             logger.warning(f"Advanced query rewriting failed: {e}")
-            return {
-                "original": query,
-                "rewrites": [],
-                "strategies_applied": [],
-                "error": str(e)
-            }
+            return {"original": query, "rewrites": [], "strategies_applied": [], "error": str(e)}
+    
+    def _decompose_conjunction(self, query: str) -> tuple[List[Dict], str, str]:
+        """Decompose conjunction-based query. Returns (sub_queries, type, complexity)."""
+        parts = re.split(r'\s+and\s+', query, flags=re.IGNORECASE)
+        if len(parts) >= 2:
+            sub_queries = [
+                {"sub_query": p.strip(), "index": i, "operator": "AND"}
+                for i, p in enumerate(parts) if len(p.strip()) > 10
+            ]
+            return sub_queries, "conjunction", "multi_part"
+        return [], "none", "simple"
+    
+    def _decompose_disjunction(self, query: str) -> tuple[List[Dict], str, str]:
+        """Decompose disjunction-based query. Returns (sub_queries, type, complexity)."""
+        parts = re.split(r'\s+or\s+', query, flags=re.IGNORECASE)
+        if len(parts) >= 2:
+            sub_queries = [
+                {"sub_query": p.strip(), "index": i, "operator": "OR"}
+                for i, p in enumerate(parts) if len(p.strip()) > 10
+            ]
+            return sub_queries, "disjunction", "alternative"
+        return [], "none", "simple"
+    
+    async def _decompose_dependency_llm(self, query: str, cache_key: str) -> List[Dict]:
+        """Decompose using LLM for dependency-based queries."""
+        cached = await self.redis_client.get_json(cache_key)
+        if cached:
+            return cached
+        
+        prompt = f"""This query has multiple components that depend on each other:
+"{query}"
+
+Break it into 2-3 ordered sub-questions where each builds on previous answers. Number them in dependency order.
+Format: 1. question
+2. question
+3. question"""
+        
+        response = await self._call_lmstudio(prompt, max_tokens=200)
+        if not response:
+            return []
+        
+        sub_queries = []
+        for i, line in enumerate(response.strip().split('\n')):
+            match = re.match(NUMBERED_LIST_PATTERN, line.strip())
+            if match:
+                sub_queries.append({
+                    "sub_query": match.group(1).strip(),
+                    "index": i,
+                    "operator": "THEN",
+                    "dependency_order": i
+                })
+        
+        if sub_queries:
+            await self.redis_client.set_json(cache_key, sub_queries, expire_seconds=3600)
+        
+        return sub_queries
     
     async def decompose_query_advanced(self, query: str) -> Dict[str, Any]:
         """
@@ -594,65 +647,37 @@ Answer:"""
             
             # Type 1: Conjunction-based (Q1 AND Q2)
             if re.search(r'\band\b', query, re.IGNORECASE):
-                parts = re.split(r'\s+and\s+', query, flags=re.IGNORECASE)
-                if len(parts) >= 2:
-                    decomposition["sub_queries"] = [
-                        {"sub_query": p.strip(), "index": i, "operator": "AND"}
-                        for i, p in enumerate(parts) if len(p.strip()) > 10
-                    ]
-                    decomposition["decomposition_type"] = "conjunction"
-                    decomposition["complexity_level"] = "multi_part"
+                sub_queries, dec_type, complexity = self._decompose_conjunction(query)
+                if sub_queries:
+                    decomposition.update({
+                        "sub_queries": sub_queries,
+                        "decomposition_type": dec_type,
+                        "complexity_level": complexity
+                    })
+                    return decomposition
             
             # Type 2: Disjunction-based (Q1 OR Q2)
-            elif re.search(r'\bor\b', query, re.IGNORECASE):
-                parts = re.split(r'\s+or\s+', query, flags=re.IGNORECASE)
-                if len(parts) >= 2:
-                    decomposition["sub_queries"] = [
-                        {"sub_query": p.strip(), "index": i, "operator": "OR"}
-                        for i, p in enumerate(parts) if len(p.strip()) > 10
-                    ]
-                    decomposition["decomposition_type"] = "disjunction"
-                    decomposition["complexity_level"] = "alternative"
+            if re.search(r'\bor\b', query, re.IGNORECASE):
+                sub_queries, dec_type, complexity = self._decompose_disjunction(query)
+                if sub_queries:
+                    decomposition.update({
+                        "sub_queries": sub_queries,
+                        "decomposition_type": dec_type,
+                        "complexity_level": complexity
+                    })
+                    return decomposition
             
             # Type 3: Dependency-based (complex relationships)
-            elif len(query.split()) > 15:
-                # Use LLM to identify dependencies
+            if len(query.split()) > 15:
                 try:
                     cache_key = f"decompose_adv:{hash(query)}"
-                    cached = await self.redis_client.get_json(cache_key)
-                    if cached:
-                        decomposition["sub_queries"] = cached
-                        decomposition["decomposition_type"] = "dependency_based"
-                        decomposition["complexity_level"] = "complex"
-                        return decomposition
-                    
-                    prompt = f"""This query has multiple components that depend on each other:
-"{query}"
-
-Break it into 2-3 ordered sub-questions where each builds on previous answers. Number them in dependency order.
-Format: 1. question
-2. question
-3. question"""
-                    
-                    response = await self._call_lmstudio(prompt, max_tokens=200)
-                    
-                    if response:
-                        lines = response.strip().split('\n')
-                        for i, line in enumerate(lines):
-                            match = re.match(r'\d+\.\s*(.+)', line.strip())
-                            if match:
-                                decomposition["sub_queries"].append({
-                                    "sub_query": match.group(1).strip(),
-                                    "index": i,
-                                    "operator": "THEN",
-                                    "dependency_order": i
-                                })
-                        
-                        if decomposition["sub_queries"]:
-                            decomposition["decomposition_type"] = "dependency_based"
-                            decomposition["complexity_level"] = "complex"
-                            await self.redis_client.set_json(cache_key, decomposition["sub_queries"], expire_seconds=3600)
-                
+                    sub_queries = await self._decompose_dependency_llm(query, cache_key)
+                    if sub_queries:
+                        decomposition.update({
+                            "sub_queries": sub_queries,
+                            "decomposition_type": "dependency_based",
+                            "complexity_level": "complex"
+                        })
                 except Exception as e:
                     logger.debug(f"LLM decomposition failed: {e}")
             

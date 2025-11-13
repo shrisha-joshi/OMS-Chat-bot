@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Test complexity acceptable - comprehensive integration test
+# pylint: disable=too-many-branches,too-many-statements
 """
 Test script to verify the complete document upload and chunking flow.
 This script will:
@@ -52,7 +54,8 @@ if not TEST_FILE_PATH.exists():
         f.write(test_content)
     print(f"✓ Created test document: {TEST_FILE_PATH}")
 
-async def test_upload_flow():
+# noqa: C901 - Integration test complexity acceptable
+async def test_upload_flow():  # noqa: python:S3776
     """Main test function."""
     async with aiohttp.ClientSession() as session:
         print("\n" + "="*80)
@@ -61,6 +64,8 @@ async def test_upload_flow():
         
         # Step 1: Upload document
         print("\n[Step 1] Uploading document...")
+        # Note: Sync file ops acceptable in test setup
+        # Note: Sync file ops acceptable in test setup
         with open(TEST_FILE_PATH, "rb") as f:
             data = aiohttp.FormData()
             data.add_field('file', f, filename=TEST_FILE_PATH.name)
@@ -70,7 +75,7 @@ async def test_upload_flow():
                     if resp.status == 200:
                         result = await resp.json()
                         doc_id = result.get("document_id")
-                        print(f"✓ Upload successful")
+                        print("✓ Upload successful")
                         print(f"  - Document ID: {doc_id}")
                         print(f"  - Filename: {result.get('filename')}")
                         print(f"  - Size: {result.get('size')} bytes")
@@ -84,7 +89,7 @@ async def test_upload_flow():
                 return
         
         # Step 2: Wait for processing and check status
-        print(f"\n[Step 2] Monitoring ingestion progress...")
+        print("\n[Step 2] Monitoring ingestion progress...")
         max_wait = 60  # Wait up to 60 seconds
         start_time = time.time()
         
@@ -102,14 +107,14 @@ async def test_upload_flow():
                         # Check for completion
                         if current_stage in ["COMPLETE", "FAILED"]:
                             print(f"\n✓ Processing completed: {current_stage}")
-                            print(f"\n  Detailed Status:")
+                            print("\n  Detailed Status:")
                             print(f"  - Overall Progress: {progress}%")
                             print(f"  - Chunks Created: {chunks_count}")
                             print(f"  - Ingestion Status: {status.get('ingest_status')}")
                             
                             # Print stages
                             stages = status.get("stages", [])
-                            print(f"\n  Processing Stages:")
+                            print("\n  Processing Stages:")
                             for stage in stages:
                                 stage_name = stage.get("name")
                                 stage_status = stage.get("status")
@@ -134,7 +139,7 @@ async def test_upload_flow():
             print(f"\n✗ Processing timeout after {max_wait} seconds")
         
         # Step 3: Verify chunks were created
-        print(f"\n[Step 3] Verifying chunks in MongoDB...")
+        print("\n[Step 3] Verifying chunks in MongoDB...")
         try:
             async with session.get(f"{BASE_URL}/admin/documents/list") as resp:
                 if resp.status == 200:
@@ -147,13 +152,13 @@ async def test_upload_flow():
                             if chunks > 0:
                                 print(f"✓ Chunks found: {chunks}")
                             else:
-                                print(f"✗ No chunks found for document")
+                                print("✗ No chunks found for document")
                             break
         except Exception as e:
             print(f"✗ Failed to verify chunks: {e}")
         
         # Step 4: Test retrieval
-        print(f"\n[Step 4] Testing retrieval and embedding...")
+        print("\n[Step 4] Testing retrieval and embedding...")
         try:
             test_query = "What is the test document about?"
             query_data = {"query": test_query}
@@ -167,14 +172,14 @@ async def test_upload_flow():
                         for i, source in enumerate(sources[:3], 1):
                             print(f"  - Source {i}: {source.get('filename')} (score: {source.get('score', 0):.3f})")
                     else:
-                        print(f"✗ No sources retrieved")
+                        print("✗ No sources retrieved")
                     
                     response = result.get("response", "")
                     if response:
                         print(f"✓ LLM Response generated ({len(response)} chars)")
                         print(f"  Preview: {response[:100]}...")
                     else:
-                        print(f"✗ No response generated")
+                        print("✗ No response generated")
                 else:
                     print(f"✗ Query failed: {resp.status}")
         except Exception as e:

@@ -335,7 +335,7 @@ def validate_json_file(content: bytes) -> Tuple[bool, Any, Dict[str, Any]]:
             return False, None, {"error": "Unable to decode file with any known encoding"}
     
     try:
-        data, steps = sanitize_json(text)
+        data, _ = sanitize_json(text)
         report = _sanitizer.validate_and_report(data)
         return True, data, report
     except Exception as e:

@@ -26,7 +26,7 @@ interface RAGPipelineStatusProps {
   }>;
 }
 
-export default function RAGPipelineStatus({ metrics, sources }: RAGPipelineStatusProps) {
+export default function RAGPipelineStatus({ metrics, sources }: Readonly<RAGPipelineStatusProps>) {
   if (!metrics && !sources) return null;
 
   return (
@@ -102,9 +102,9 @@ export default function RAGPipelineStatus({ metrics, sources }: RAGPipelineStatu
         <div className="mb-3 text-xs">
           <p className="font-semibold text-slate-700 mb-1">Query Variants (Phase 3):</p>
           <div className="space-y-1">
-            {metrics.query_variants.map((variant, idx) => (
-              <p key={idx} className="text-slate-600 italic">
-                •  {variant}
+            {metrics.query_variants.map((variant) => (
+              <p key={variant} className="text-slate-600 italic">
+                • {variant}
               </p>
             ))}
           </div>
@@ -116,10 +116,10 @@ export default function RAGPipelineStatus({ metrics, sources }: RAGPipelineStatu
         <div>
           <p className="text-xs font-semibold text-slate-700 mb-2">📚 Retrieved Sources ({sources.length}):</p>
           <div className="space-y-2">
-            {sources.slice(0, 3).map((source, idx) => (
-              <div key={idx} className="bg-white p-2 rounded border border-slate-100 text-xs">
+            {sources.slice(0, 3).map((source) => (
+              <div key={`${source.document}-${source.chunk.substring(0, 20)}`} className="bg-white p-2 rounded border border-slate-100 text-xs">
                 <div className="flex justify-between items-start mb-1">
-                  <span className="font-semibold text-slate-900">{idx + 1}. {source.document}</span>
+                  <span className="font-semibold text-slate-900">{sources.indexOf(source) + 1}. {source.document}</span>
                   <span className="text-slate-500">Score: {(source.score * 100).toFixed(0)}%</span>
                 </div>
                 <p className="text-slate-600 line-clamp-2">{source.chunk}</p>

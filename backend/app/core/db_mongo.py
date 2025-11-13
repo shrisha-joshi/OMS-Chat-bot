@@ -9,7 +9,7 @@ from pymongo.errors import DuplicateKeyError
 from bson import ObjectId
 from typing import Optional, Dict, Any, List
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 
 from ..config import settings
 
@@ -67,9 +67,9 @@ class MongoDBClient:
             self.available = False
             return False
     
-    async def disconnect(self):
+    def disconnect(self):
         """Close MongoDB connection."""
-        if self.client:
+        if self.client is not None:
             self.client.close()
             logger.info("Disconnected from MongoDB")
     
@@ -157,7 +157,7 @@ class MongoDBClient:
                 metadata={
                     "content_type": content_type,
                     "size": size,
-                    "uploaded_at": datetime.utcnow().isoformat()
+                    "uploaded_at": datetime.now(timezone.utc).isoformat()
                 }
             )
             
@@ -181,7 +181,7 @@ class MongoDBClient:
     async def create_document(self, document_data: Dict) -> str:
         """Create a new document record."""
         try:
-            document_data["uploaded_at"] = datetime.utcnow()
+            document_data["uploaded_at"] = datetime.now(timezone.utc)
             document_data["ingest_status"] = "PENDING"
             
             result = await self.database.documents.insert_one(document_data)
@@ -209,7 +209,7 @@ class MongoDBClient:
         try:
             update_data = {
                 "ingest_status": status,
-                "updated_at": datetime.utcnow()
+                "updated_at": datetime.now(timezone.utc)
             }
             if error_message:
                 update_data["error_message"] = error_message
@@ -248,7 +248,7 @@ class MongoDBClient:
                     "char_start": chunk.get("char_start", 0),
                     "char_end": chunk.get("char_end", len(chunk["text"])),
                     "tokens": chunk.get("tokens", 0),
-                    "created_at": datetime.utcnow()
+                    "created_at": datetime.now(timezone.utc)
                 }
                 
                 try:
@@ -297,7 +297,7 @@ class MongoDBClient:
                 "status": status,
                 "message": message,
                 "metadata": metadata or {},
-                "timestamp": datetime.utcnow()
+                "timestamp": datetime.now(timezone.utc)
             }
             await self.database.ingestion_logs.insert_one(log_entry)
         except Exception as e:
@@ -326,7 +326,7 @@ class MongoDBClient:
                 "response": response,
                 "rating": rating,
                 "correction": correction,
-                "created_at": datetime.utcnow()
+                "created_at": datetime.now(timezone.utc)
             }
             await self.database.feedback.insert_one(feedback_data)
             logger.info(f"Feedback stored for session {session_id}")
@@ -337,7 +337,7 @@ class MongoDBClient:
     
     async def get_all_documents(self) -> List[Dict[str, Any]]:
         """Get all documents for BM25 indexing."""
-        if not self.database:
+        if self.database is None:
             logger.warning("MongoDB not available, returning empty document list")
             return []
             
@@ -362,7 +362,7 @@ class MongoDBClient:
         - "similar": Documents have similar content
         """
         try:
-            if not self.database:
+            if self.database is None:
                 logger.warning("MongoDB not available for relationship storage")
                 return False
             
@@ -371,7 +371,7 @@ class MongoDBClient:
                 "to_doc_id": to_doc_id,
                 "type": relationship_type,
                 "metadata": metadata or {},
-                "created_at": datetime.utcnow()
+                "created_at": datetime.now(timezone.utc)
             }
             
             # Create composite index for fast lookups
@@ -409,7 +409,7 @@ class MongoDBClient:
         Returns: List of related document IDs
         """
         try:
-            if not self.database:
+            if self.database is None:
                 return []
             
             query = {"from_doc_id": doc_id}
@@ -437,7 +437,7 @@ class MongoDBClient:
         Returns: Number of relationships created
         """
         try:
-            if not self.database:
+            if self.database is None:
                 return 0
             
             relationships_created = 0
@@ -476,7 +476,7 @@ class MongoDBClient:
         Returns: Graph structure with nodes and edges
         """
         try:
-            if not self.database:
+            if self.database is None:
                 return {"nodes": [], "edges": []}
             
             nodes = set()
@@ -528,6 +528,6 @@ class MongoDBClient:
 mongodb_client = MongoDBClient()
 
 
-async def get_mongodb_client() -> MongoDBClient:
+def get_mongodb_client() -> MongoDBClient:
     """Dependency injection for MongoDB client."""
     return mongodb_client

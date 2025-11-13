@@ -5,6 +5,7 @@ Provides WebSocket endpoints for real-time updates on document ingestion and cha
 
 import asyncio
 import logging
+from typing import Dict, Any, List
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query, Depends
 from datetime import datetime
 import json
@@ -52,6 +53,49 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 
+def _create_progress_message(doc_id: str, log: Dict[str, Any]) -> Dict[str, Any]:
+    """Create progress message from log entry."""
+    return {
+        "type": "ingestion_progress",
+        "doc_id": doc_id,
+        "step": log.get("step"),
+        "status": log.get("status"),
+        "message": log.get("message"),
+        "metadata": log.get("metadata", {}),
+        "timestamp": log.get("timestamp").isoformat() if log.get("timestamp") else None
+    }
+
+
+def _create_completion_message(doc_id: str, status: str) -> Dict[str, Any]:
+    """Create completion message."""
+    return {
+        "type": "ingestion_complete",
+        "doc_id": doc_id,
+        "status": status
+    }
+
+
+async def _send_new_logs(websocket: WebSocket, doc_id: str, new_logs: List[Dict], last_timestamp):
+    """Send new log entries to websocket."""
+    for log in new_logs:
+        message = _create_progress_message(doc_id, log)
+        await websocket.send_json(message)
+        last_timestamp = log.get("timestamp")
+    return last_timestamp
+
+
+async def _check_completion_status(websocket: WebSocket, doc_id: str, document: Dict) -> bool:
+    """Check if ingestion is complete and send completion message. Returns True if complete."""
+    if not document:
+        return False
+    
+    status = document.get("ingest_status")
+    if status in ("SUCCESS", "FAILED"):
+        await websocket.send_json(_create_completion_message(doc_id, status))
+        return True
+    return False
+
+
 @router.websocket("/ws/ingestion/{doc_id}")
 async def websocket_ingestion_progress(
     websocket: WebSocket,
@@ -68,57 +112,28 @@ async def websocket_ingestion_progress(
         last_timestamp = None
         
         while True:
-            # Poll for new ingestion logs every 0.5 seconds
-            query = {"doc_id": doc_id}
-            if last_timestamp:
-                query["timestamp"] = {"$gt": last_timestamp}
-            
+            # Poll for new ingestion logs
             logs = await mongo_client.get_ingestion_logs(doc_id)
-            
-            # Find new logs since last check
             new_logs = [log for log in logs if not last_timestamp or log.get("timestamp") > last_timestamp]
             
-            for log in new_logs:
-                message = {
-                    "type": "ingestion_progress",
-                    "doc_id": doc_id,
-                    "step": log.get("step"),
-                    "status": log.get("status"),
-                    "message": log.get("message"),
-                    "metadata": log.get("metadata", {}),
-                    "timestamp": log.get("timestamp").isoformat() if log.get("timestamp") else None
-                }
-                
-                await websocket.send_json(message)
-                last_timestamp = log.get("timestamp")
+            # Send new logs
+            last_timestamp = await _send_new_logs(websocket, doc_id, new_logs, last_timestamp)
             
-            # Check if processing is complete
+            # Check completion status
             document = await mongo_client.get_document(doc_id)
-            if document and document.get("ingest_status") == "SUCCESS":
-                await websocket.send_json({
-                    "type": "ingestion_complete",
-                    "doc_id": doc_id,
-                    "status": "SUCCESS"
-                })
-                break
-            elif document and document.get("ingest_status") == "FAILED":
-                await websocket.send_json({
-                    "type": "ingestion_complete",
-                    "doc_id": doc_id,
-                    "status": "FAILED"
-                })
+            if await _check_completion_status(websocket, doc_id, document):
                 break
             
             # Wait before polling again
             await asyncio.sleep(0.5)
     
     except WebSocketDisconnect:
-        logger.info(f"Client disconnected from ingestion monitoring")
+        logger.info("Client disconnected from ingestion monitoring")
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
         try:
             await websocket.send_json({"type": "error", "message": str(e)})
-        except:
+        except Exception:
             pass
 
 

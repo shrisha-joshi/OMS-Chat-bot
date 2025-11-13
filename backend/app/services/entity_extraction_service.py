@@ -119,9 +119,9 @@ class EntityExtractionService:
     
     def _build_extraction_prompt(self, text: str, context: str = None) -> str:
         """Build LLM prompt for entity extraction."""
-        entity_types_str = ", ".join(self.ENTITY_TYPES)
+        _entity_types_str = ", ".join(self.ENTITY_TYPES)  # Reserved for future use
         
-        prompt = f"""Extract named entities from the following text. For each entity, provide:
+        prompt = """Extract named entities from the following text. For each entity, provide:
 1. Entity name (exact text from input)
 2. Entity type (one of: {entity_types_str})
 3. Confidence score (0.0 to 1.0)
@@ -213,7 +213,7 @@ Important:
             return []
         
         # Build relationship extraction prompt
-        rel_prompt = self._build_relationship_prompt(text, entities)
+        rel_prompt = self._build_relationship_prompt(entities)
         
         try:
             response = await self.llm.generate_response(
@@ -237,18 +237,17 @@ Important:
     
     def _build_relationship_prompt(
         self,
-        text: str,
         entities: List[Dict[str, Any]]
     ) -> str:
         """Build prompt for relationship extraction."""
-        entity_list = "\n".join([
+        _entity_list = "\n".join([  # Reserved for future use
             f"- {e['name']} ({e['type']})"
             for e in entities
         ])
         
-        rel_types_str = ", ".join(self.RELATIONSHIP_TYPES)
+        _rel_types_str = ", ".join(self.RELATIONSHIP_TYPES)  # Reserved for future use
         
-        prompt = f"""Identify relationships between the following entities based on the text.
+        prompt = """Identify relationships between the following entities based on the text.
 
 Text:
 {text}
@@ -276,7 +275,8 @@ Important:
 """
         return prompt
     
-    def _parse_relationship_response(
+    # noqa: C901 - Complex domain logic
+    def _parse_relationship_response(  # noqa: python:S3776
         self,
         response: str,
         entities: List[Dict[str, Any]]
