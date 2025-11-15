@@ -70,7 +70,7 @@ class ChatService:
             logger.info("Initializing chat service...")
             
             # Get database clients
-            self.mongo_client = await get_mongodb_client()
+            self.mongo_client = get_mongodb_client()
             self.qdrant_client = await get_qdrant_client()
             self.redis_client = await get_redis_client()
             
@@ -104,12 +104,13 @@ class ChatService:
             
             # Initialize LLM handler
             await llm_handler.initialize()
+            self.llm_handler = llm_handler
 
             # Prompt service is synchronous (templates loaded at import); do not await
             # Keep interface consistent: prompt_service is ready to use
 
             # Initialize response formatter
-            self.response_formatter = await get_response_formatter()
+            self.response_formatter = get_response_formatter()
             
             # Initialize media services (Phase 2)
             await media_suggestion_service.initialize()
@@ -387,7 +388,7 @@ class ChatService:
         """Phase 7: Validate response and enrich with media suggestions."""
         # Validation
         logger.info("🔄 Step 7b: Response Validation")
-        is_valid, validation_details = await response_validation_service.validate_response(
+        is_valid, validation_details = response_validation_service.validate_response(
             response=response, sources=sources, query=query
         )
         

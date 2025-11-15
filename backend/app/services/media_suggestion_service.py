@@ -27,7 +27,7 @@ class MediaSuggestionService:
     async def initialize(self):
         """Initialize the media suggestion service."""
         try:
-            self.mongo_client = await get_mongodb_client()
+            self.mongo_client = get_mongodb_client()
             logger.info("✅ Media suggestion service initialized")
         except Exception as e:
             logger.error(f"Failed to initialize media suggestion service: {e}")

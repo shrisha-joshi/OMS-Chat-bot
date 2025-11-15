@@ -44,9 +44,11 @@ class Settings(BaseSettings):
     access_token_expire_minutes: int = Field(default=60, alias="ACCESS_TOKEN_EXPIRE_MINUTES")
     
     # LLM Configuration  
-    lmstudio_api_url: str = Field(default="http://192.168.56.1:1234/v1", alias="LMSTUDIO_API_URL")
+    lmstudio_api_url: str = Field(default="http://localhost:1234/v1", alias="LMSTUDIO_API_URL")
     lmstudio_api_key: Optional[str] = Field(default="", alias="LMSTUDIO_API_KEY")
     lmstudio_model_name: str = Field(default="mistral-7b-instruct-v0.3", alias="LMSTUDIO_MODEL_NAME")
+    llm_fallback_mode: bool = Field(default=False, alias="LLM_FALLBACK_MODE")
+    huggingface_model_url: Optional[str] = Field(default="", alias="HUGGINGFACE_MODEL_URL")
     
     # RAG Configuration
     embedding_model_name: str = Field(default="all-MiniLM-L6-v2", alias="EMBEDDING_MODEL_NAME")

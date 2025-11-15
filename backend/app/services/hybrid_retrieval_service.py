@@ -88,7 +88,7 @@ class HybridRetrievalService:
                 return []
             
             # Search in Qdrant
-            results = await self.qdrant.search_similar(query, limit=k)
+            results = await self.qdrant.search_similar(query, top_k=k)
             
             # Format results
             formatted_results = []

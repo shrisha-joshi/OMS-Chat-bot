@@ -51,7 +51,7 @@ class IngestService:
             logger.info("Initializing ingest service...")
             
             # Get database clients
-            self.mongo_client = await get_mongodb_client()
+            self.mongo_client = get_mongodb_client()
             self.qdrant_client = await get_qdrant_client()
             self.redis_client = await get_redis_client()
             

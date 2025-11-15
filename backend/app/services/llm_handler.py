@@ -96,6 +96,17 @@ class LLMHandler:
             "priority": 2
         })
         
+        # Mock provider for testing when LLM is unavailable
+        if settings.llm_fallback_mode:
+            self.providers.append({
+                "name": "mock",
+                "url": "http://mock-provider",
+                "type": "mock",
+                "model": "mock-model",
+                "enabled": True,
+                "priority": 999
+            })
+        
         # Sort by priority
         self.providers.sort(key=lambda x: x.get("priority", 999))
     
@@ -226,6 +237,11 @@ class LLMHandler:
                         
                 except Exception as e:
                     logger.warning(f"Provider '{provider['name']}' failed (attempt {attempt + 1}/{self.max_retries}): {e}", exc_info=True)
+                    
+                    # Ensure provider_health entry exists before accessing it
+                    if provider["name"] not in self.provider_health:
+                        self.provider_health[provider["name"]] = {"healthy": True}
+                    
                     self.provider_health[provider["name"]]["healthy"] = False
                     logger.warning(f"Marked '{provider['name']}' as unhealthy")
                     
@@ -251,6 +267,14 @@ class LLMHandler:
         prompt_tokens: int
     ) -> str:
         """Get non-streaming response from provider. Returns response text directly."""
+        # Handle mock provider for testing
+        if provider.get("type") == "mock":
+            logger.info("🔄 Using mock provider for testing")
+            user_message = next((msg["content"] for msg in reversed(messages) if msg["role"] == "user"), "")
+            mock_response = f"This is a test response to: '{user_message[:100]}...'. The backend services are working correctly, but LMStudio is not available. Please start LMStudio to get AI-generated responses."
+            logger.info(f"📤 Mock response generated: {len(mock_response)} characters")
+            return mock_response
+        
         try:
             url = f"{provider['url']}/chat/completions"
             logger.info(f"🔗 Connecting to LMStudio at {url}")

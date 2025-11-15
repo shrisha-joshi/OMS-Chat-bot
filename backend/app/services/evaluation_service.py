@@ -47,7 +47,7 @@ class EvaluationService:
             logger.info("Initializing evaluation service...")
             
             # Get database clients
-            self.mongo_client = await get_mongodb_client()
+            self.mongo_client = get_mongodb_client()
             self.redis_client = await get_redis_client()
             
             # Only initialize MongoDB-dependent features if MongoDB is available

@@ -248,7 +248,7 @@ async def _process_document_with_retry(doc_id: str, filename: str, max_retries: 
     """
     from ..core.db_mongo import get_mongodb_client
     
-    mongo_client = await get_mongodb_client()
+    mongo_client = get_mongodb_client()
     
     for attempt in range(1, max_retries + 1):
         try:

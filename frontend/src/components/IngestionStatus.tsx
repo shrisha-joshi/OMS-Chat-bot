@@ -1,19 +1,36 @@
 'use client';
 
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { apiClient } from '@/lib/api';
 
 interface IngestionLog {
   step: string;
   status: 'PROCESSING' | 'SUCCESS' | 'FAILED';
   message: string;
-  metadata?: any;
+  metadata?: Record<string, unknown>;
   timestamp: string;
 }
 
 interface IngestionStatusProps {
   docId: string;
-  onComplete?: () => void;
+  onComplete: () => void;
+}
+
+interface WebSocketMessage {
+  type: string;
+  doc_id?: string;
+  stage?: string;
+  status?: string;
+  progress?: number;
+  message?: string;
+  timestamp?: number;
+}
+
+interface ApiResponse {
+  data?: {
+    logs: IngestionLog[];
+    ingest_status: string;
+  };
 }
 
 const stageIcons: Record<string, string> = {
@@ -45,25 +62,25 @@ export default function IngestionStatus({ docId, onComplete }: Readonly<Ingestio
   const wsRef = useRef<WebSocket | null>(null);
 
   // Helper: add a new ingestion log entry if it doesn't already exist
-  const addLogEntry = (data: any) => {
+  const addLogEntry = (data: WebSocketMessage) => {
     setLogs((prev) => {
-      const exists = prev.find((log) => log.step === data.step && log.timestamp === data.timestamp);
+      const exists = prev.find((log) => log.step === data.stage && log.timestamp === data.timestamp?.toString());
       if (exists) return prev;
       return [
         ...prev,
         {
-          step: data.step,
-          status: data.status,
-          message: data.message,
-          metadata: data.metadata,
-          timestamp: data.timestamp,
+          step: data.stage || '',
+          status: (data.status as 'PROCESSING' | 'SUCCESS' | 'FAILED') || 'PROCESSING',
+          message: data.message || '',
+          metadata: {},
+          timestamp: data.timestamp?.toString() || new Date().toISOString(),
         },
       ];
     });
   };
 
   // Helper: process parsed websocket message
-  const handleIngestionEvent = (data: any) => {
+  const handleIngestionEvent = useCallback((data: WebSocketMessage) => {
     if (data.type === 'ingestion_progress') {
       addLogEntry(data);
     } else if (data.type === 'ingestion_complete') {
@@ -74,13 +91,13 @@ export default function IngestionStatus({ docId, onComplete }: Readonly<Ingestio
         setError('Document ingestion failed');
       }
     }
-  };
+  }, [onComplete]);
 
   useEffect(() => {
     // Fetch initial status
     const fetchInitialStatus = async () => {
       try {
-        const response = await apiClient.get(`/monitoring/documents/${docId}/ingestion-status`) as any;
+        const response = await apiClient.get(`/monitoring/documents/${docId}/ingestion-status`) as ApiResponse;
         if (response.data?.logs) {
           setLogs(response.data.logs);
         }
@@ -99,7 +116,10 @@ export default function IngestionStatus({ docId, onComplete }: Readonly<Ingestio
 
     // Connect to WebSocket for real-time updates
     const protocol = globalThis.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${globalThis.location.host}/monitoring/ws/ingestion/${docId}`;
+    // Use API base URL for WebSocket connection (backend at port 8000)
+    const apiBaseUrl = process.env.NEXT_PUBLIC_API_BASE || 'http://localhost:8000';
+    const wsHost = apiBaseUrl.replace(/^https?:\/\//, ''); // Extract host:port
+    const wsUrl = `${protocol}//${wsHost}/monitoring/ws/ingestion/${docId}`;
     
     try {
       const websocket = new WebSocket(wsUrl);
@@ -126,7 +146,7 @@ export default function IngestionStatus({ docId, onComplete }: Readonly<Ingestio
       console.error('Failed to connect WebSocket:', error_);
       setError('Failed to connect to real-time updates');
     }
-  }, [docId, onComplete]);
+  }, [docId, onComplete, handleIngestionEvent]);
 
   const getStageStatus = (step: string) => {
     const log = logs.find((l) => l.step === step);
@@ -152,7 +172,7 @@ export default function IngestionStatus({ docId, onComplete }: Readonly<Ingestio
       )}
 
       <div className="space-y-3">
-        {stages.map((stage, index) => {
+        {stages.map((stage) => {
           const status = getStageStatus(stage);
           const log = logs.find((l) => l.step === stage);
           const icon = stageIcons[stage] || '⚙️';

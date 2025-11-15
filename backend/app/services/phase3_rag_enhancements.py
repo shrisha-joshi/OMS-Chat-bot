@@ -28,7 +28,7 @@ class ContextualRetrievalService:
         self,
         chunks: List[Dict[str, Any]],
         query: str,
-        __chunk_size: int = 750,  # Unused but kept for API compatibility
+        chunk_size: int = 750,  # Unused but kept for API compatibility
         context_window_size: int = 3
     ) -> Dict[str, Any]:
         """
@@ -462,7 +462,7 @@ class QueryRewritingService:
     def __init__(self, llm_handler=None):
         self.llm_handler = llm_handler
     
-    async def rewrite_query(self, query: str, _query_type: str = "general", context: Dict = None) -> Dict[str, Any]:  # noqa: ARG002
+    async def rewrite_query(self, query: str, query_type: str = "general", context: Dict = None) -> Dict[str, Any]:  # noqa: ARG002
         """
         Rewrite query using multiple strategies.
         
@@ -616,7 +616,7 @@ class EmbeddingCachingService:
         
         try:
             cache_key = f"embedding:{hash(text)}"
-            cached = await self.redis_client.get(cache_key)
+            cached = await self.redis_client.get_cache(cache_key)
             
             if cached:
                 logger.debug("Cache hit for embedding (will expire in ~30 days)")
@@ -649,14 +649,14 @@ class EmbeddingCachingService:
             cache_key = f"embedding:{hash(text)}"
             # Use extended TTL (30 days) instead of short 24-hour TTL
             effective_ttl = ttl if ttl is not None else self.embedding_cache_ttl
-            await self.redis_client.set(
+            await self.redis_client.set_cache(
                 cache_key,
                 {
                     "embedding": embedding,
                     "timestamp": datetime.now().isoformat(),
                     "ttl_days": round(effective_ttl / 86400, 2) if isinstance(effective_ttl, (int, float)) else 30
                 },
-                ttl=effective_ttl
+                expiry_seconds=effective_ttl
             )
             
             logger.debug("Embedding cached with 30-day TTL")
@@ -673,7 +673,7 @@ class EmbeddingCachingService:
         
         try:
             cache_key = f"chunks:{query_hash}"
-            cached = await self.redis_client.get(cache_key)
+            cached = await self.redis_client.get_cache(cache_key)
             
             if cached:
                 logger.debug("Cache hit for chunk retrieval")
@@ -692,10 +692,10 @@ class EmbeddingCachingService:
         
         try:
             cache_key = f"chunks:{query_hash}"
-            await self.redis_client.set(
+            await self.redis_client.set_cache(
                 cache_key,
                 {"chunks": chunks, "timestamp": datetime.now().isoformat()},
-                ttl=self.cache_ttl
+                expiry_seconds=self.cache_ttl
             )
             
             return True
