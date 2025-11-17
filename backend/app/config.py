@@ -80,11 +80,29 @@ class Settings(BaseSettings):
     max_suggested_media: int = Field(default=5, alias="MAX_SUGGESTED_MEDIA")
     
     # File Upload Settings
-    max_file_size_mb: int = Field(default=50, alias="MAX_FILE_SIZE_MB")
+    max_file_size_mb: int = Field(default=10, alias="MAX_FILE_SIZE_MB")  # Reduced for safety
     allowed_file_types: str = Field(default="pdf,docx,txt,html,json", alias="ALLOWED_FILE_TYPES")
+    max_concurrent_uploads: int = Field(default=5, alias="MAX_CONCURRENT_UPLOADS")
+    
+    # Retry Configuration
+    max_retry_attempts: int = Field(default=3, alias="MAX_RETRY_ATTEMPTS")
+    retry_delay_seconds: int = Field(default=5, alias="RETRY_DELAY_SECONDS")
+    retry_backoff_multiplier: float = Field(default=2.0, alias="RETRY_BACKOFF_MULTIPLIER")
+    
+    # Rate Limiting
+    rate_limit_enabled: bool = Field(default=True, alias="RATE_LIMIT_ENABLED")
+    rate_limit_requests: int = Field(default=10, alias="RATE_LIMIT_REQUESTS")
+    rate_limit_window_seconds: int = Field(default=60, alias="RATE_LIMIT_WINDOW_SECONDS")
+    
+    # Monitoring & Health
+    enable_metrics: bool = Field(default=True, alias="ENABLE_METRICS")
+    health_check_interval: int = Field(default=30, alias="HEALTH_CHECK_INTERVAL")
+    enable_performance_logging: bool = Field(default=True, alias="ENABLE_PERFORMANCE_LOGGING")
     
     # External APIs
     next_public_api_base: str = Field(default="http://localhost:8000", alias="NEXT_PUBLIC_API_BASE")
+    next_public_ws_base: str = Field(default="ws://localhost:8000", alias="NEXT_PUBLIC_WS_BASE")
+    frontend_url: str = Field(default="http://localhost:3000", alias="FRONTEND_URL")
     next_public_ai_sdk_key: Optional[str] = Field(default="", alias="NEXT_PUBLIC_AI_SDK_KEY")
     ai_sdk_key: Optional[str] = Field(default="", alias="AI_SDK_KEY")
     freeapi_key: Optional[str] = Field(default="", alias="FREEAPI_KEY")

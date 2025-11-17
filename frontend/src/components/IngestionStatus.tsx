@@ -98,12 +98,13 @@ export default function IngestionStatus({ docId, onComplete }: Readonly<Ingestio
     fetchInitialStatus();
 
     // Connect to WebSocket for real-time updates
-    const protocol = globalThis.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${globalThis.location.host}/monitoring/ws/ingestion/${docId}`;
+    // Use backend WebSocket URL from environment or default to 127.0.0.1:8000
+    const WS_BASE = process.env.NEXT_PUBLIC_WS_URL || 'ws://127.0.0.1:8000';
+    const wsUrl = `${WS_BASE}/monitoring/ws/ingestion/${docId}`;
     
     try {
       const websocket = new WebSocket(wsUrl);
-
+      console.log("I am here 0")
       websocket.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data);
@@ -112,11 +113,11 @@ export default function IngestionStatus({ docId, onComplete }: Readonly<Ingestio
           console.error('Failed to parse WebSocket message:', error_);
         }
       };
-
+      console.log("I am here")
       websocket.onerror = () => {
         setError('WebSocket connection error');
       };
-
+      console.log("I am here 2")
   wsRef.current = websocket;
 
       return () => {

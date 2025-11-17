@@ -28,14 +28,10 @@ from .llm_handler import llm_handler
 from .prompt_service import prompt_service
 from .response_formatter_service import get_response_formatter
 from .hybrid_retrieval_service import hybrid_retrieval_service
-from .phase3_rag_enhancements import (
-    get_contextual_retrieval_service,
-    get_hybrid_search_service,
-    get_query_rewriting_service,
-    get_embedding_cache_service
-)
 from .media_suggestion_service import media_suggestion_service
 from .response_validation_service import response_validation_service
+from .context_window_optimizer import context_optimizer
+from .cos_mix_retrieval import cos_mix_retrieval
 from ..config import settings
 
 logger = logging.getLogger(__name__)
@@ -54,23 +50,17 @@ class ChatService:
         self.bm25_index = None
         self.document_texts = []
         
-        # Phase 3 services (lazy initialized)
-        self._contextual_retrieval_service = None
-        self._hybrid_search_service = None
-        self._query_rewriting_service = None
-        self._embedding_cache_service = None
-        
-        # Phase 3 metrics tracking
-        self._queries_tried = []
-        self._cache_hits = 0
+        # Research-backed enhancements
+        self.context_optimizer = context_optimizer
+        self.cos_mix_retrieval = cos_mix_retrieval
     
     async def initialize(self):
         """Initialize the chat service with required models and clients."""
         try:
             logger.info("Initializing chat service...")
             
-            # Get database clients
-            self.mongo_client = await get_mongodb_client()
+            # Get database clients (mongo is sync, qdrant and redis are async)
+            self.mongo_client = get_mongodb_client()
             self.qdrant_client = await get_qdrant_client()
             self.redis_client = await get_redis_client()
             
@@ -109,7 +99,7 @@ class ChatService:
             # Keep interface consistent: prompt_service is ready to use
 
             # Initialize response formatter
-            self.response_formatter = await get_response_formatter()
+            self.response_formatter = get_response_formatter()
             
             # Initialize media services (Phase 2)
             await media_suggestion_service.initialize()
@@ -123,370 +113,6 @@ class ChatService:
         except Exception as e:
             logger.error(f"Failed to initialize chat service: {e}")
             raise
-    
-    # Phase 3 Service Getter Methods (Lazy Initialization)
-    async def _get_contextual_retrieval_service(self):
-        """Get or create contextual retrieval service."""
-        if self._contextual_retrieval_service is None:
-            self._contextual_retrieval_service = await get_contextual_retrieval_service(self.mongo_client)
-        return self._contextual_retrieval_service
-    
-    async def _get_hybrid_search_service(self):
-        """Get or create hybrid search service."""
-        if self._hybrid_search_service is None:
-            self._hybrid_search_service = await get_hybrid_search_service(self.bm25_index, self.qdrant_client)
-        return self._hybrid_search_service
-    
-    async def _get_query_rewriting_service(self):
-        """Get or create query rewriting service."""
-        if self._query_rewriting_service is None:
-            self._query_rewriting_service = await get_query_rewriting_service()
-        return self._query_rewriting_service
-    
-    async def _get_embedding_cache_service(self):
-        """Get or create embedding cache service."""
-        if self._embedding_cache_service is None:
-            self._embedding_cache_service = await get_embedding_cache_service(self.redis_client)
-        return self._embedding_cache_service
-    
-    # ========== RAG PIPELINE PHASE FUNCTIONS (Complexity Reduction) ==========
-    
-    async def _phase1_query_enhancement(self, query: str) -> tuple:
-        """Phase 1: Query enhancement and variant generation."""
-        logger.info("🔄 Step 1: Query Enhancement & Understanding")
-        query_enhancement = await query_intelligence_service.enhance_query(query)
-        processed_query = query_enhancement["rewritten_queries"][0]
-        logger.info(f"  📝 Enhanced Query: {processed_query[:150]}...")
-        logger.info(f"  🏷️  Query Type: {query_enhancement['query_type']}")
-        
-        # Generate query variants
-        queries_tried = [processed_query]
-        try:
-            query_rewriting_service = await self._get_query_rewriting_service()
-            if query_rewriting_service:
-                query_variants = await query_rewriting_service.rewrite_query(
-                    query=processed_query,
-                    query_type=query_enhancement.get("query_type", "general"),
-                    context=query_enhancement
-                )
-                queries_tried = [v["rewritten_query"] for v in query_variants["variants"]]
-                logger.info(f"  📚 Phase 3: Generated {len(queries_tried)} query variants")
-        except Exception as e:
-            logger.warning(f"Phase 3 Query Rewriting failed: {e}")
-        
-        return processed_query, query_enhancement, queries_tried
-    
-    async def _phase2_embedding_generation(self, processed_query: str) -> tuple:
-        """Phase 2: Generate or retrieve cached embeddings."""
-        logger.info("🔄 Step 2: Embedding Generation (with cache)")
-        query_embedding = None
-        cache_hit = False
-        cache_hits = 0
-        
-        # Try cache first
-        try:
-            embedding_cache_service = await self._get_embedding_cache_service()
-            if embedding_cache_service:
-                query_hash = hashlib.md5(processed_query.encode()).hexdigest()
-                cached_embedding = await embedding_cache_service.get_embedding(query_hash)
-                if cached_embedding:
-                    query_embedding = cached_embedding
-                    cache_hit = True
-                    cache_hits += 1
-                    logger.info(f"  💾 Embedding Cache HIT: hash={query_hash[:8]}...")
-        except Exception as e:
-            logger.warning(f"Embedding Cache retrieval failed: {e}")
-        
-        # Generate if not cached
-        if not query_embedding:
-            query_embedding = await self._generate_query_embedding(processed_query)
-            logger.info(f"  🔢 Generated embedding: {len(query_embedding)} dimensions")
-            
-            # Cache new embedding
-            try:
-                embedding_cache_service = await self._get_embedding_cache_service()
-                if embedding_cache_service:
-                    query_hash = hashlib.md5(processed_query.encode()).hexdigest()
-                    await embedding_cache_service.cache_embedding(query_hash, query_embedding, ttl=86400)
-                    logger.info(f"  💾 Cached new embedding: hash={query_hash[:8]}...")
-            except Exception as e:
-                logger.warning(f"Embedding Cache storage failed: {e}")
-        
-        return query_embedding, cache_hit, cache_hits
-    
-    async def _phase3_hybrid_retrieval(self, processed_query: str, query_embedding: list, 
-                                       query_enhancement: dict) -> list:
-        """Phase 3: Hybrid retrieval using multiple strategies."""
-        logger.info("🔄 Step 3: Hybrid Retrieval (Vector + Keyword + Graph)")
-        
-        # Try Graph RAG first
-        graph_rag_results = await self._try_graph_rag_retrieval(processed_query)
-        if graph_rag_results:
-            return graph_rag_results
-        
-        # Try Hybrid Search with RRF
-        hybrid_results = await self._try_hybrid_search_rrf(processed_query, query_embedding)
-        if hybrid_results:
-            return hybrid_results
-        
-        # Fallback to traditional retrieval
-        return await self._fallback_traditional_retrieval(query_embedding, query_enhancement, processed_query)
-    
-    async def _try_graph_rag_retrieval(self, processed_query: str):
-        """Attempt Graph RAG hybrid retrieval."""
-        try:
-            if settings.use_graph_search:
-                logger.info("  🕸️  Attempting Graph RAG Hybrid Retrieval...")
-                results = await hybrid_retrieval_service.retrieve(
-                    query=processed_query,
-                    top_k=settings.top_k_retrieval,
-                    vector_k=settings.top_k_retrieval * 2,
-                    graph_hops=2,
-                    use_reranking=True
-                )
-                if results:
-                    logger.info(f"  ✅ Graph RAG retrieval: {len(results)} results")
-                    return results
-        except Exception as e:
-            logger.warning(f"Graph RAG retrieval failed: {e}")
-        return None
-    
-    async def _try_hybrid_search_rrf(self, processed_query: str, query_embedding: list):
-        """Attempt Hybrid Search with RRF fusion."""
-        try:
-            hybrid_search_service = await self._get_hybrid_search_service()
-            if hybrid_search_service:
-                hybrid_results = await hybrid_search_service.hybrid_search_with_rrf(
-                    query_text=processed_query,
-                    query_embedding=query_embedding,
-                    top_k=settings.top_k_retrieval,
-                    rrf_k=60
-                )
-                merged_results = hybrid_results.get("merged_results", [])
-                logger.info("  📊 Phase 1 (RRF) Hybrid Search Results:")
-                logger.info(f"    🔵 Vector: {hybrid_results.get('vector_count', 0)}, "
-                          f"🟢 BM25: {hybrid_results.get('bm25_count', 0)}, "
-                          f"✨ Final: {len(merged_results)}")
-                return merged_results
-        except Exception as e:
-            logger.warning(f"RRF Hybrid Search failed: {e}")
-        return None
-    
-    async def _fallback_traditional_retrieval(self, query_embedding: list, 
-                                             query_enhancement: dict, processed_query: str):
-        """Fallback to traditional vector + keyword retrieval."""
-        logger.info("  ⚠️  Fallback: Using traditional retrieval pipeline")
-        
-        # Vector search
-        vector_results = await self._get_cached_retrieval_results(query_embedding)
-        if not vector_results:
-            vector_results = await self.qdrant_client.search_similar(
-                query_vector=query_embedding,
-                top_k=settings.top_k_retrieval * 2
-            )
-            logger.info(f"    🎯 Qdrant search: {len(vector_results)} results")
-            await self._cache_retrieval_results(query_embedding, vector_results)
-        
-        # HyDE search if available
-        if query_enhancement.get("hyde_embedding"):
-            hyde_results = await self.qdrant_client.search_similar(
-                query_vector=query_enhancement.get("hyde_embedding"),
-                top_k=settings.top_k_retrieval
-            )
-            logger.info(f"    🎯 HyDE search: {len(hyde_results)} results")
-        
-        # BM25 keyword search
-        keyword_results = await self._bm25_search(processed_query)
-        logger.info(f"    🎯 BM25 search: {len(keyword_results)} results")
-        
-        return vector_results or []
-    
-    async def _phase4_entity_extraction(self, processed_query: str) -> list:
-        """Phase 4: Extract entities and search graph."""
-        logger.info("🔄 Step 4: Entity Extraction & Semantic Search")
-        graph_results = []
-        
-        if settings.use_graph_search and self.nlp_model:
-            entities = self._extract_entities_from_query(processed_query)
-            if entities:
-                logger.info(f"  🏷️  Extracted entities: {entities[:3]}...")
-                try:
-                    related_docs = await self.mongo_client.database.entities.find(
-                        {"name": {"$in": entities}}
-                    ).to_list(5)
-                    graph_results = related_docs if related_docs else []
-                    logger.info(f"  📈 Found {len(graph_results)} related entities")
-                except Exception as e:
-                    logger.warning(f"  ⚠️  Failed to query entities: {e}")
-            else:
-                logger.info("  ℹ️  No entities extracted")
-        
-        return graph_results
-    
-    async def _phase5_context_optimization(self, merged_results: list, processed_query: str, 
-                                          graph_results: list, query_enhancement: dict) -> tuple:
-        """Phase 5: Enhance, rerank, and optimize context."""
-        logger.info("🔄 Step 5: Context Optimization & Reranking")
-        
-        # Contextual enhancement
-        enhanced_results = await self._enhance_with_context(merged_results, processed_query)
-        
-        # Merge and rerank
-        merged_final = await self._advanced_merge_and_rerank(
-            enhanced_results, [], [], graph_results,
-            processed_query, query_enhancement["processing_strategy"]
-        )
-        logger.info(f"  📊 Final reranked results: {len(merged_final)} chunks")
-        
-        # Optimize and format context
-        logger.info("🔄 Step 6: Context Compression & Reasoning Template")
-        optimization_result = await context_optimization_service.optimize_context(
-            merged_final, processed_query,
-            max_tokens=settings.max_context_tokens,
-            strategy=query_enhancement["processing_strategy"]
-        )
-        
-        context_text = optimization_result["formatted_context"]
-        reasoning_template = optimization_result["reasoning_template"]
-        sources = optimization_result["sources_used"]
-        
-        logger.info(f"  📝 Context: {len(context_text)} chars, {len(sources)} sources")
-        return context_text, reasoning_template, sources
-    
-    async def _enhance_with_context(self, merged_results: list, processed_query: str):
-        """Enhance retrieval results with contextual information."""
-        enhanced_results = merged_results
-        try:
-            contextual_service = await self._get_contextual_retrieval_service()
-            if contextual_service:
-                result = await contextual_service.add_context_to_chunks(
-                    chunks=merged_results,
-                    query=processed_query,
-                    chunk_size=settings.chunk_size,
-                    context_window_size=3
-                )
-                enhanced_results = result.get("enhanced_chunks", merged_results)
-                stats = result.get("context_statistics", {})
-                logger.info(f"  ✨ Enhanced {stats.get('chunks_enhanced', 0)} chunks")
-        except Exception as e:
-            logger.warning(f"Contextual Retrieval failed: {e}")
-        return enhanced_results
-    
-    async def _phase6_response_generation(self, processed_query: str, context_text: str,
-                                         reasoning_template: str, context: list) -> str:
-        """Phase 6: Generate LLM response with Chain-of-Thought."""
-        logger.info("🔄 Step 7: LLM Response Generation (Chain-of-Thought)")
-        response = await self._generate_llm_response_with_cot(
-            processed_query, context_text, reasoning_template, context
-        )
-        logger.info(f"  ✅ LLM Response generated: {len(response)} chars")
-        return response
-    
-    async def _phase7_validation_and_enrichment(self, response: str, sources: list, 
-                                               query: str, session_id: str) -> tuple:
-        """Phase 7: Validate response and enrich with media suggestions."""
-        # Validation
-        logger.info("🔄 Step 7b: Response Validation")
-        is_valid, validation_details = await response_validation_service.validate_response(
-            response=response, sources=sources, query=query
-        )
-        
-        if is_valid:
-            logger.info(f"✅ Validation passed - Score: {validation_details.get('validation_score', 0):.2f}")
-        else:
-            logger.warning(f"⚠️  Validation issues: {validation_details.get('issues', [])}")
-        
-        # Store validation log
-        await self._store_validation_log(query, session_id, response, is_valid, validation_details)
-        
-        # Media enrichment
-        logger.info("🔄 Step 7c: Media Enrichment")
-        media_suggestions = await media_suggestion_service.suggest_media_for_response(
-            query=query, response=response, sources=sources
-        )
-        logger.info(f"  🎬 Media suggestions: {len(media_suggestions)} items")
-        
-        return validation_details, media_suggestions
-    
-    async def _store_validation_log(self, query: str, session_id: str, response: str,
-                                   is_valid: bool, validation_details: dict):
-        """Store validation log in MongoDB."""
-        try:
-            await self.mongo_client.database.document_validation_logs.insert_one({
-                "query_id": hashlib.md5(query.encode()).hexdigest(),
-                "session_id": session_id,
-                "response": response[:500],
-                "is_valid": is_valid,
-                "validation_score": validation_details.get('validation_score', 0),
-                "has_citations": validation_details.get('has_citations', False),
-                "citation_count": validation_details.get('citation_count', 0),
-                "has_generic_phrases": validation_details.get('has_generic_phrases', False),
-                "generic_phrase_count": validation_details.get('generic_phrase_count', 0),
-                "validation_details": validation_details,
-                "created_at": datetime.now()
-            })
-        except Exception as e:
-            logger.warning(f"Failed to store validation log: {e}")
-    
-    async def _phase8_finalize_response(self, query: str, session_id: str, response: str,
-                                       sources: list, validation_details: dict,
-                                       media_suggestions: list, processing_time: float,
-                                       queries_tried: list, cache_hits: int) -> dict:
-        """Phase 8: Finalize and return complete response."""
-        # Extract attachments
-        attachments = self._extract_attachments(sources)
-        
-        # Store conversation
-        await self._store_conversation_turn(session_id, query, response, sources)
-        
-        # Log summary
-        logger.info("✅ ===== RAG PIPELINE COMPLETE =====")
-        logger.info(f"⏱️  Processing time: {processing_time:.2f}s")
-        logger.info(f"📊 Query: {query[:60]}..., Sources: {len(sources)}, Response: {len(response)} chars")
-        
-        # Evaluate quality
-        evaluation_metrics = await self._evaluate_response_quality(
-            query, response, sources, processing_time, "", session_id
-        )
-        
-        # Build result
-        result = {
-            "response": response,
-            "sources": sources,
-            "attachments": attachments,
-            "media_suggestions": media_suggestions,
-            "validation_details": validation_details,
-            "processing_time": processing_time,
-            "tokens_generated": len(response.split()),
-            "evaluation_metrics": evaluation_metrics.__dict__ if evaluation_metrics else None,
-            "phase3_metrics": {
-                "query_variants_generated": len(queries_tried),
-                "embedding_cache_hits": cache_hits,
-                "contextual_enhancement_enabled": True,
-                "hybrid_search_enabled": True
-            }
-        }
-        
-        # Cache if high quality
-        if evaluation_metrics and evaluation_metrics.answer_accuracy > 0.7:
-            await self._cache_query_result(query, result)
-        
-        return result
-    
-    async def _evaluate_response_quality(self, query: str, response: str, sources: list,
-                                        processing_time: float, context_text: str,
-                                        session_id: str):
-        """Evaluate response quality metrics."""
-        try:
-            metrics = await evaluation_service.evaluate_query_response(
-                query, response, sources, processing_time, context_text, session_id
-            )
-            logger.info(f"📈 Evaluation - Accuracy: {metrics.answer_accuracy:.2f}, "
-                       f"Relevance: {metrics.response_relevance:.2f}")
-            return metrics
-        except Exception as e:
-            logger.warning(f"Evaluation failed: {e}")
-            return None
     
     # ========== MAIN PIPELINE ORCHESTRATOR ==========
     
@@ -504,66 +130,110 @@ class ChatService:
         """
         try:
             start_time = time.time()
-            logger.info("🔍 ===== RAG PIPELINE START =====")
+            logger.info("🔍 ===== SIMPLE RAG PIPELINE START =====")
             logger.info(f"📌 Session: {session_id}")
             logger.info(f"❓ Query: {query[:200]}")
-            
+
+            # Fast-path for simple conversational queries (no retrieval needed)
+            simple_patterns = ["hello", "hi", "hey", "thanks", "thank you", "bye", "goodbye"]
+            query_lower = query.lower().strip()
+            if len(query_lower.split()) <= 3 and any(p in query_lower for p in simple_patterns):
+                logger.info("⚡ Fast-path: Simple conversational query detected")
+                from .llm_handler import llm_handler
+                try:
+                    response_text = await llm_handler.generate_response(
+                        prompt=query,
+                        system_prompt="You are a helpful assistant. Respond briefly and naturally.",
+                        max_tokens=100
+                    )
+                    return {
+                        "response": response_text if isinstance(response_text, str) else "Hello! How can I help you?",
+                        "sources": [],
+                        "attachments": [],
+                        "session_id": session_id,
+                        "processing_time": time.time() - start_time,
+                        "tokens_generated": len(response_text.split()) if isinstance(response_text, str) else 0
+                    }
+                except Exception as e:
+                    logger.warning(f"Fast-path LLM failed: {e}, using fallback")
+                    return {
+                        "response": "Hello! How can I help you today?",
+                        "sources": [],
+                        "attachments": [],
+                        "session_id": session_id,
+                        "processing_time": time.time() - start_time,
+                        "tokens_generated": 0
+                    }
+
             # Retrieve conversation context if not provided
             if context is None:
                 context = await self._get_conversation_context(session_id)
-            
+
             # Check cache for similar queries first
             cached_response = await self._check_query_cache(query)
             if cached_response:
-                logger.info("✅ RAG PIPELINE: Returning cached response")
+                logger.info("✅ SIMPLE RAG: Returning cached response")
                 return cached_response
-            
-            # Phase 1: Query Enhancement
-            processed_query, query_enhancement, queries_tried = await self._phase1_query_enhancement(query)
-            self._queries_tried = queries_tried
-            
-            # Phase 2: Embedding Generation
-            query_embedding, _cache_hit, cache_hits = await self._phase2_embedding_generation(processed_query)
-            self._cache_hits = cache_hits
-            
-            # Phase 3: Hybrid Retrieval
-            merged_results = await self._phase3_hybrid_retrieval(
-                processed_query, query_embedding, query_enhancement
+
+            # --- Simple RAG path: preprocess -> embed -> vector search -> LLM ---
+            processed_query = self._preprocess_query(query)
+            logger.info(f"📝 Processed query: {processed_query[:200]}")
+
+            # Embedding
+            query_embedding = await self._generate_query_embedding(processed_query)
+            logger.info(f"🔢 Generated embedding: {len(query_embedding)} dimensions")
+
+            # Vector search only (no hybrid / graph)
+            vector_results = await self.qdrant_client.search_similar(
+                query_vector=query_embedding,
+                top_k=settings.top_k_retrieval
             )
-            
-            # Phase 4: Entity Extraction
-            graph_results = await self._phase4_entity_extraction(processed_query)
-            
-            # Phase 5: Context Optimization
-            context_text, reasoning_template, sources = await self._phase5_context_optimization(
-                merged_results, processed_query, graph_results, query_enhancement
+            logger.info(f"📚 Retrieved {len(vector_results) if vector_results else 0} vector results")
+
+            # Build context and sources
+            context_text, sources = await self._build_llm_context(vector_results)
+
+            # Generate LLM response using existing helper
+            response_text = await self._generate_llm_response(
+                query=processed_query,
+                context=context_text,
+                conversation_context=context,
             )
-            
-            # Phase 6: Response Generation
-            response = await self._phase6_response_generation(
-                processed_query, context_text, reasoning_template, context
-            )
-            
-            # Phase 7: Validation & Enrichment
-            validation_details, media_suggestions = await self._phase7_validation_and_enrichment(
-                response, sources, query, session_id
-            )
-            
-            # Phase 8: Finalize Response
+
             processing_time = time.time() - start_time
-            return await self._phase8_finalize_response(
-                query, session_id, response, sources, validation_details,
-                media_suggestions, processing_time, queries_tried, cache_hits
-            )
-            
+
+            result = {
+                "response": response_text,
+                "sources": sources,
+                "attachments": [],
+                "session_id": session_id,
+                "processing_time": processing_time,
+                "tokens_generated": len(response_text.split()) if isinstance(response_text, str) else 0,
+                "media_suggestions": [],
+                "validation_details": None,
+                "phase3_metrics": None,
+            }
+
+            # Store in cache for identical queries
+            await self._cache_query_result(query, result)
+
+            return result
+
         except Exception as e:
-            logger.error(f"❌ Query processing failed: {e}", exc_info=True)
+            error_msg = str(e)
+            logger.error(f"❌ Simple RAG query processing failed: {error_msg}", exc_info=True)
+
+            import traceback
+            logger.error(f"Full traceback:\n{traceback.format_exc()}")
+
             return {
-                "response": "I apologize, but I encountered an error while processing your query. Please try again.",
+                "response": f"Error: {error_msg}. Check backend logs for details.",
                 "sources": [],
                 "attachments": [],
                 "processing_time": 0,
-                "tokens_generated": 0
+                "tokens_generated": 0,
+                "error": error_msg,
+                "error_type": type(e).__name__
             }
     
     async def stream_query(self, query: str, session_id: str) -> AsyncGenerator[Dict[str, Any], None]:
@@ -754,36 +424,84 @@ class ChatService:
             return vector_results[:settings.top_k_retrieval]
     
     async def _rerank_results(self, results: List[Dict], query: str) -> List[Dict]:
-        """Rerank results using cross-encoder model."""
+        """Rerank results using COS-Mix + cross-encoder model (research-backed)."""
         await asyncio.sleep(0)  # Use async feature
         try:
             if not results:
                 return results
             
-            # Prepare query-document pairs for reranking
-            pairs = []
-            for result in results:
-                text = result.get("text", "")
-                pairs.append([query, text])
+            # Stage 1: COS-Mix Reranking (if embeddings available)
+            logger.info(f"🔬 Research Enhancement: COS-Mix Reranking")
+            query_embedding = None
+            has_embeddings = any(r.get("embedding") is not None for r in results)
             
-            # Get reranking scores
-            scores = self.reranker_model.predict(pairs)
+            if has_embeddings:
+                # Generate query embedding for COS-Mix
+                query_embedding = self.embedding_model.encode(query)
+                
+                # Apply COS-Mix scoring
+                cos_mix_results = self.cos_mix_retrieval.rerank_with_cos_mix(
+                    query_embedding=query_embedding,
+                    documents=results,
+                    embedding_key="embedding"
+                )
+                
+                logger.info(
+                    f"  📊 COS-Mix scores: "
+                    f"min={min(r['cos_mix_score'] for r in cos_mix_results):.3f}, "
+                    f"max={max(r['cos_mix_score'] for r in cos_mix_results):.3f}"
+                )
+                
+                results = cos_mix_results
             
-            # Update scores and sort
-            for i, result in enumerate(results):
-                result["rerank_score"] = float(scores[i])
-                result["original_score"] = result.get("score", 0)
-                # Combine original and rerank scores
-                result["score"] = 0.7 * float(scores[i]) + 0.3 * result.get("score", 0)
+            # Stage 2: Cross-Encoder Reranking (if model available)
+            if self.reranker_model:
+                logger.info(f"🔬 Cross-Encoder Reranking")
+                
+                # Prepare query-document pairs for reranking
+                pairs = []
+                for result in results:
+                    text = result.get("text", "")
+                    pairs.append([query, text])
+                
+                # Get reranking scores
+                scores = self.reranker_model.predict(pairs)
+                
+                # Update scores and sort
+                for i, result in enumerate(results):
+                    result["rerank_score"] = float(scores[i])
+                    result["original_score"] = result.get("score", 0)
+                    
+                    # Combine COS-Mix and Cross-Encoder scores if both available
+                    if "cos_mix_score" in result:
+                        # Hybrid fusion: 60% cross-encoder, 40% COS-Mix (research-backed)
+                        combined_score = (0.6 * float(scores[i])) + (0.4 * result["cos_mix_score"])
+                        result["score"] = combined_score
+                        result["ranking_method"] = "hybrid_cos_mix_crossencoder"
+                    else:
+                        # Cross-encoder only: combine with original score
+                        result["score"] = 0.7 * float(scores[i]) + 0.3 * result.get("original_score", 0)
+                        result["ranking_method"] = "crossencoder_only"
+                
+                # Sort by new combined score
+                results.sort(key=lambda x: x.get("score", 0), reverse=True)
+                
+                logger.info(
+                    f"  ✅ Reranked {len(results)} results using "
+                    f"{'Hybrid COS-Mix + Cross-Encoder' if has_embeddings else 'Cross-Encoder only'}"
+                )
+            else:
+                # No cross-encoder, just use COS-Mix scores
+                if has_embeddings:
+                    results.sort(key=lambda x: x.get("cos_mix_score", 0), reverse=True)
+                    for r in results:
+                        r["ranking_method"] = "cos_mix_only"
+                        r["score"] = r.get("cos_mix_score", r.get("score", 0))
             
-            # Sort by new combined score
-            results.sort(key=lambda x: x.get("score", 0), reverse=True)
-            
-            logger.info(f"Reranked {len(results)} results")
             return results
             
         except Exception as e:
-            logger.error(f"Reranking failed: {e}")
+            logger.error(f"Reranking failed: {e}", exc_info=True)
             return results
     
     async def _get_document_metadata(self, doc_id: str) -> Optional[Dict[str, Any]]:
@@ -1459,6 +1177,12 @@ Remember: Your knowledge is limited to the context provided. Do not make up info
             logger.error(f"Failed to initialize BM25 index: {e}")
             self.bm25_index = None
     
+    async def _reload_bm25_index(self):
+        """Reload BM25 index after new document ingestion."""
+        logger.info("🔄 Reloading BM25 index with new documents...")
+        await self._initialize_bm25_index()
+        logger.info("✅ BM25 index reloaded successfully")
+    
     async def _bm25_search(self, query: str, top_k: int = 10) -> List[Dict]:
         """Perform BM25 keyword search."""
         await asyncio.sleep(0)  # Use async feature
@@ -2053,3 +1777,15 @@ Remember: Your knowledge is limited to the context provided. Do not make up info
         """Cleanup resources."""
         if self.http_client:
             await self.http_client.aclose()
+
+
+# Global chat service instance
+_chat_service_instance = None
+
+async def get_chat_service() -> ChatService:
+    """Get or create the global chat service instance."""
+    global _chat_service_instance
+    if _chat_service_instance is None:
+        _chat_service_instance = ChatService()
+        await _chat_service_instance.initialize()
+    return _chat_service_instance

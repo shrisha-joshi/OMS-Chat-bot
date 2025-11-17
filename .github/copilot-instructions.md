@@ -3,8 +3,8 @@
 ## Quick Links
 
 ### Documentation Files (START HERE)
-1. **`PROJECT_FIXES_SUMMARY.md`** - Overview of all fixes and improvements made
-2. **`QUICK_FIX_AND_STATUS.md`** - Project status, what was fixed, quick start options
+1. **`FINAL_SUCCESS_STATUS.md`** - Complete system overview and status
+2. **`CLEANUP_COMPLETE.md`** - Latest cleanup report (21.1% code reduction)
 3. **`TESTING_PLAYBOOK.md`** - Step-by-step end-to-end testing guide (9 phases)
 4. **`DEBUG_AND_FIX_GUIDE.md`** - Comprehensive troubleshooting (8 parts, error reference)
 5. **`INGEST_WORKER_SETUP.md`** - Worker configuration, monitoring, performance tuning
@@ -18,10 +18,18 @@
 
 ## Architecture Overview
 
-**RAG Pipeline**: Documents → Chunks → Embeddings (Qdrant) → Retrieval → LLM Response
-**Data Flow**: Frontend → FastAPI `/chat/query` → ChatService → Embeddings/LLM → Response + Sources
-**Admin Upload**: Frontend → FastAPI `/admin/documents/upload` → MongoDB/GridFS → Ingest Worker Queue (Redis)
-**Graph Reasoning**: ArangoDB stores document relationships; enabled via `USE_GRAPH_SEARCH=true`
+**RAG Pipeline** (Simplified - Nov 2025): Documents → Chunks → Embeddings (Qdrant) → Retrieval → LLM Response
+**Query Flow**: Frontend → FastAPI `/chat/query` → ChatService.process_query() → Direct pipeline:
+  1. Fast-path check (greetings → direct LLM)
+  2. Check Redis cache
+  3. Preprocess query
+  4. Generate embedding (SentenceTransformer)
+  5. Qdrant vector search (TOP_K=10)
+  6. Build context
+  7. LLM generation
+  8. Cache result
+**Admin Upload**: Frontend → FastAPI `/admin/documents/upload` → MongoDB/GridFS → IngestService
+**Code Cleanup**: Phase 1-8 complex pipeline removed (Nov 2025), simplified to direct flow
 
 ## Backend Patterns (Python FastAPI)
 

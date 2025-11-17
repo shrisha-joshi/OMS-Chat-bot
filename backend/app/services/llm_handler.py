@@ -79,7 +79,7 @@ class LLMHandler:
         # LMStudio (primary)
         self.providers.append({
             "name": "lmstudio",
-            "url": settings.lmstudio_api_url or "http://localhost:1234/v1",
+            "url": settings.lmstudio_api_url or "http://localhost:1234/v1" or "http://192.168.56.1:1234",
             "type": "openai_compatible",
             "model": settings.lmstudio_model_name or "mistral-7b-instruct-v0.3",
             "enabled": True,

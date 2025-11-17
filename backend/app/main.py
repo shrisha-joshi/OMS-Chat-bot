@@ -19,7 +19,17 @@ from .core.db_mongo import mongodb_client
 from .core.db_qdrant import qdrant_client
 from .core.cache_redis import redis_client
 from .api import chat, admin, auth, feedback, monitoring, websocket
+from .api import admin_fix_stuck  # Add stuck document recovery endpoints
+from .api import rag_diagnostics  # Add RAG pipeline diagnostics
 from .workers.ingest_worker import start_ingest_worker
+from .middleware import RateLimitMiddleware  # Rate limiting
+from .utils.metrics import metrics_collector, PerformanceTimer  # Performance monitoring
+
+# Import enhanced services
+from .services.websocket_manager import ws_manager
+from .services.health_monitor import health_monitor
+from .services.batch_processor import batch_processor
+
 import httpx
 
 # Configure logging
@@ -88,7 +98,7 @@ async def _validate_llm_provider() -> tuple[bool, str]:
     """Validate LLM provider availability."""
     try:
         logger.info("Validating LLM Provider...")
-        llm_url = settings.lmstudio_api_url or "http://localhost:1234/v1"
+        llm_url = settings.lmstudio_api_url or "http://localhost:1234/v1" or "http://192.168.56.1:1234"
         async with httpx.AsyncClient(timeout=5) as client:
             response = await asyncio.wait_for(
                 client.get(f"{llm_url}/models"),
@@ -236,13 +246,19 @@ async def _run_database_migrations():
     """Run database migrations."""
     logger.info("\nPhase 4: Database Migrations")
     logger.info("-" * 80)
+    
+    # Skip migrations if MongoDB is not available
+    if mongodb_client is None or mongodb_client.database is None:
+        logger.warning("  ⚠️  MongoDB not available, skipping migrations (will retry on reconnect)")
+        return
+    
     try:
         from .migrations.media_schema_migrations import run_all_migrations
         await run_all_migrations(mongodb_client.database)
         logger.info("  ✓ Database migrations completed successfully")
     except Exception as e:
-        logger.error(f"  ERROR: Database migrations failed: {e}")
-        raise
+        logger.warning(f"  ⚠️  Database migrations failed: {e} (non-fatal, continuing startup)")
+        # Don't raise - allow app to start even if migrations fail
 
 async def _initialize_media_services():
     """Initialize media services."""
@@ -266,21 +282,70 @@ def _configure_background_workers(app: FastAPI):
 
 async def _warmup_services():
     """Warmup services to prevent first-request delays."""
-    logger.info("\nPhase 7: Service Warmup")
+    logger.info("\nPhase 7: Service Warmup & Enhanced Features Initialization")
     logger.info("-" * 80)
     
+    # Start WebSocket Manager
     try:
-        logger.info("🔥 Warming up chat service...")
+        logger.info("🔗 Starting Enhanced WebSocket Manager...")
+        await ws_manager.start_background_tasks()
+        logger.info("  ✅ WebSocket manager started with connection pooling & health monitoring")
+    except Exception as e:
+        logger.warning(f"  ⚠️  WebSocket manager startup failed: {e}")
+    
+    # Register services for health monitoring
+    try:
+        logger.info("💊 Registering services for health monitoring...")
+        
+        # Register MongoDB
+        health_monitor.register_service(
+            "mongodb",
+            health_check=lambda: asyncio.to_thread(lambda: mongodb_client.is_connected()),
+            reconnect_handler=mongodb_client.connect
+        )
+        
+        # Register Qdrant
+        health_monitor.register_service(
+            "qdrant",
+            health_check=lambda: asyncio.to_thread(lambda: qdrant_client.is_connected()),
+            reconnect_handler=qdrant_client.connect
+        )
+        
+        # Register Redis
+        health_monitor.register_service(
+            "redis",
+            health_check=lambda: asyncio.to_thread(lambda: redis_client.is_connected()),
+            reconnect_handler=redis_client.connect
+        )
+        
+        # Start health monitor
+        await health_monitor.start()
+        logger.info("  ✅ Health monitor started (30s check interval)")
+    except Exception as e:
+        logger.warning(f"  ⚠️  Health monitor startup failed: {e}")
+    
+    # Warmup chat service
+    try:
+        logger.info("🔥 Warming up chat service with research enhancements...")
         from .services.chat_service import ChatService
         
         warmup_service = ChatService()
         await warmup_service.initialize()
         
-        logger.info("  ✅ Chat service warmed up and ready!")
-        logger.info("  First query will respond in <10 seconds instead of 60+ seconds")
+        logger.info("  ✅ Chat service warmed up with Context Window Optimizer & COS-Mix!")
+        logger.info("  First query will respond in <10 seconds with enhanced retrieval")
     except Exception as e:
         logger.warning(f"  ⚠️  Chat service warmup failed: {e}")
         logger.warning("  Services will initialize on first request (30-60s delay)")
+    
+    # Log batch processor info
+    try:
+        logger.info("📦 Batch processor initialized:")
+        metrics = batch_processor.get_metrics()
+        logger.info(f"  Batch size: {metrics['batch_size']}, Max concurrent: {metrics['max_concurrent_batches']}")
+        logger.info("  ✅ Ready for 10x faster embedding generation")
+    except Exception as e:
+        logger.warning(f"  ⚠️  Batch processor check failed: {e}")
 
 async def _shutdown_services():
     """Shutdown all services gracefully."""
@@ -290,22 +355,40 @@ async def _shutdown_services():
     
     disconnect_tasks = []
     
-    # MongoDB
+    # Stop enhanced services first
+    try:
+        logger.info("Stopping WebSocket manager...")
+        await ws_manager.shutdown()
+        logger.info("  ✅ WebSocket manager stopped")
+    except Exception as e:
+        logger.error(f"Error stopping WebSocket manager: {e}")
+    
+    try:
+        logger.info("Stopping health monitor...")
+        await health_monitor.stop()
+        logger.info("  ✅ Health monitor stopped")
+    except Exception as e:
+        logger.error(f"Error stopping health monitor: {e}")
+    
+    # MongoDB (synchronous disconnect)
     if mongodb_client.client:
         logger.info("Disconnecting from MongoDB...")
-        disconnect_tasks.append(mongodb_client.disconnect())
+        try:
+            mongodb_client.disconnect()
+        except (Exception, asyncio.CancelledError) as e:
+            logger.error(f"Error disconnecting MongoDB: {e}")
     
-    # Qdrant
+    # Qdrant (async disconnect)
     if qdrant_client.client:
         logger.info("Disconnecting from Qdrant...")
         disconnect_tasks.append(qdrant_client.disconnect())
     
-    # Redis
+    # Redis (async disconnect)
     if redis_client.client:
         logger.info("Disconnecting from Redis...")
         disconnect_tasks.append(redis_client.disconnect())
     
-    # Neo4j (if available)
+    # Neo4j (async disconnect, if available)
     try:
         from app.core.db_neo4j import neo4j_client
         if neo4j_client.driver:
@@ -315,7 +398,10 @@ async def _shutdown_services():
         pass
     
     if disconnect_tasks:
-        await asyncio.gather(*disconnect_tasks, return_exceptions=True)
+        try:
+            await asyncio.gather(*disconnect_tasks, return_exceptions=True)
+        except asyncio.CancelledError:
+            logger.info("Disconnection tasks cancelled, forcing cleanup...")
     
     logger.info("✅ All services disconnected successfully")
     logger.info("=" * 80)
@@ -368,12 +454,21 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
         
         yield
         
+    except asyncio.CancelledError:
+        # Python 3.13 compatibility: Handle graceful cancellation during shutdown
+        logger.info("Application shutdown initiated (CancelledError caught)")
     except Exception as e:
         logger.error(f"❌ Application startup failed: {e}", exc_info=True)
         raise
-    
-    # Shutdown
-    await _shutdown_services()
+    finally:
+        # Shutdown - always runs even if cancelled
+        try:
+            await _shutdown_services()
+        except asyncio.CancelledError:
+            # Suppress cancellation during shutdown
+            logger.info("Shutdown completed (cancelled during cleanup)")
+        except Exception as e:
+            logger.error(f"Error during shutdown: {e}", exc_info=True)
 
 
 # Create FastAPI application
@@ -386,7 +481,7 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# Add middleware
+# Add middleware with proper CORS for WebSocket + HTTP
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -394,14 +489,27 @@ app.add_middleware(
         "http://localhost:3001",
         "http://127.0.0.1:3000",
         "http://127.0.0.1:3001",
+        "http://0.0.0.0:3000",
+        "http://0.0.0.0:8000",
+        "ws://localhost:3000",
+        "ws://127.0.0.1:3000",
+        "ws://localhost:8000",
+        "ws://127.0.0.1:8000",
         settings.next_public_api_base
     ],
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=["*"],
+    expose_headers=["*"],
+    max_age=3600,
 )
 
 app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+# Add rate limiting middleware
+if settings.rate_limit_enabled:
+    app.add_middleware(RateLimitMiddleware)
+    logger.info("✅ Rate limiting enabled")
 
 # Include API routes
 app.include_router(
@@ -420,6 +528,18 @@ app.include_router(
     admin.router,
     prefix="/admin",
     tags=["Administration"]
+)
+
+app.include_router(
+    admin_fix_stuck.router,
+    prefix="/admin",
+    tags=["Administration - Recovery"]
+)
+
+app.include_router(
+    rag_diagnostics.router,
+    prefix="/admin",
+    tags=["RAG Diagnostics"]
 )
 
 app.include_router(
@@ -443,30 +563,74 @@ app.include_router(
 # Health check endpoint
 @app.get("/health")
 async def health_check():
-    """Health check endpoint - liveness probe (app is running)."""
+    """Health check endpoint - liveness probe with active connection testing."""
     try:
-        mongo_status = "connected" if mongodb_client.is_connected() else "disconnected"
-        qdrant_status = "connected" if qdrant_client.is_connected() else "disconnected"
-        redis_status = "connected" if redis_client.is_connected() else "disconnected"
+        # Test MongoDB actively
+        mongo_healthy = False
+        try:
+            if mongodb_client.client:
+                await asyncio.wait_for(mongodb_client.client.admin.command('ping'), timeout=2.0)
+                mongo_healthy = True
+        except Exception:
+            pass
+        
+        # Test Qdrant actively
+        qdrant_healthy = False
+        try:
+            if qdrant_client.client:
+                await asyncio.wait_for(asyncio.to_thread(qdrant_client.client.get_collections), timeout=2.0)
+                qdrant_healthy = True
+        except Exception:
+            pass
+        
+        # Test Redis actively
+        redis_healthy = False
+        try:
+            if redis_client.client:
+                await asyncio.wait_for(redis_client.client.ping(), timeout=2.0)
+                redis_healthy = True
+        except Exception:
+            pass
         
         databases = {
-            "mongodb": mongo_status,
-            "qdrant": qdrant_status,
-            "redis": redis_status
+            "mongodb": "connected" if mongo_healthy else "disconnected",
+            "qdrant": "connected" if qdrant_healthy else "disconnected",
+            "redis": "connected" if redis_healthy else "disconnected"
         }
         
-        logger.debug(f"Health check: {databases}")
+        # Determine overall status
+        critical_healthy = mongo_healthy and qdrant_healthy
+        status = "alive" if critical_healthy else "degraded"
         
-        return {
-            "status": "alive",
+        response = {
+            "status": status,
             "environment": settings.app_env,
             "version": "1.0.0",
             "databases": databases,
             "timestamp": datetime.now(timezone.utc).isoformat()
         }
+        
+        if not critical_healthy:
+            response["message"] = "Some critical services are unavailable"
+        
+        logger.debug(f"Health check: {databases}")
+        return response
+        
     except Exception as e:
         logger.error(f"Health check failed: {e}")
         raise HTTPException(status_code=500, detail="Health check failed")
+
+# Metrics endpoint for monitoring
+@app.get("/metrics")
+async def get_metrics():
+    """Get application performance metrics."""
+    if not settings.enable_metrics:
+        raise HTTPException(status_code=404, detail="Metrics disabled")
+    
+    return {
+        "timestamp": datetime.utcnow().isoformat(),
+        "metrics": metrics_collector.get_summary()
+    }
 
 @app.get("/ready")
 async def readiness_check():

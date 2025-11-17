@@ -260,6 +260,18 @@ class MongoDBClient:
                         {"$set": chunk_doc}
                     )
             
+            # UPDATE DOCUMENT WITH CHUNK COUNT (CRITICAL FIX)
+            from bson import ObjectId
+            await self.database.documents.update_one(
+                {"_id": ObjectId(doc_id)},
+                {
+                    "$set": {
+                        "chunks_count": len(chunks),
+                        "chunks": [{"_id": f"{doc_id}_chunk_{i}", "index": i} for i in range(len(chunks))]
+                    }
+                }
+            )
+            
             logger.info(f"Stored {len(chunks)} chunks for document {doc_id}")
             return True
         except Exception as e:

@@ -185,14 +185,36 @@ async def chat_query(
             logger.info(f"✅ Returning cached response for query: {request.query[:50]}...")
             return ChatResponse(**cached_response)
         
-        # Process the query
+        # Process the query with timeout
         logger.info(f"🔄 Processing chat query: {request.query[:100]}...")
         
-        result = await service.process_query(
-            query=request.query,
-            session_id=request.session_id,
-            context=request.context or []
-        )
+        try:
+            # Set timeout based on query complexity
+            timeout = 120  # 2 minutes for RAG queries
+            result = await asyncio.wait_for(
+                service.process_query(
+                    query=request.query,
+                    session_id=request.session_id,
+                    context=request.context or []
+                ),
+                timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f"⏱️ Query timeout after {timeout}s, returning fast response")
+            # Return fast LLM-only response without RAG
+            from ..services.llm_handler import llm_handler
+            fast_response = await llm_handler.generate_response(
+                prompt=request.query,
+                system_prompt="You are a helpful assistant. Answer concisely.",
+                max_tokens=500
+            )
+            result = {
+                "response": fast_response.get("response", "I apologize, but I'm taking longer than expected. Please try again."),
+                "sources": [],
+                "attachments": [],
+                "processing_time": timeout,
+                "tokens_generated": fast_response.get("tokens_generated", 0)
+            }
         
         processing_time = time.time() - start_time
         

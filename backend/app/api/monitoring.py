@@ -12,6 +12,12 @@ import json
 
 from ..core.db_mongo import get_mongodb_client, MongoDBClient
 
+# Import enhanced services
+from ..services.websocket_manager import get_websocket_manager, EnhancedWebSocketManager
+from ..services.health_monitor import get_health_monitor, ConnectionHealthMonitor
+from ..services.batch_processor import get_batch_processor, BatchProcessor
+from ..utils.resilience import get_all_circuit_breaker_metrics
+
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
@@ -168,4 +174,97 @@ async def get_ingestion_status(
         }
     except Exception as e:
         logger.error(f"Failed to get ingestion status: {e}")
+        return {"error": str(e)}
+
+
+# ========== Enhanced Monitoring Endpoints ==========
+
+@router.get("/websocket/metrics")
+async def get_websocket_metrics(
+    ws_manager: EnhancedWebSocketManager = Depends(get_websocket_manager)
+):
+    """Get WebSocket connection metrics."""
+    try:
+        return {
+            "overall": ws_manager.get_metrics(),
+            "connections": ws_manager.get_all_connection_metrics()
+        }
+    except Exception as e:
+        logger.error(f"Failed to get WebSocket metrics: {e}")
+        return {"error": str(e)}
+
+
+@router.get("/health/services")
+async def get_services_health(
+    health_monitor: ConnectionHealthMonitor = Depends(get_health_monitor)
+):
+    """Get health status of all registered services."""
+    try:
+        return health_monitor.get_overall_health()
+    except Exception as e:
+        logger.error(f"Failed to get service health: {e}")
+        return {"error": str(e)}
+
+
+@router.get("/health/service/{service_name}")
+async def get_service_health(
+    service_name: str,
+    health_monitor: ConnectionHealthMonitor = Depends(get_health_monitor)
+):
+    """Get health status for specific service."""
+    try:
+        health = health_monitor.get_service_health(service_name)
+        if not health:
+            return {"error": f"Service '{service_name}' not registered"}
+        return health
+    except Exception as e:
+        logger.error(f"Failed to get health for {service_name}: {e}")
+        return {"error": str(e)}
+
+
+@router.get("/circuit-breakers")
+async def get_circuit_breaker_status():
+    """Get status of all circuit breakers."""
+    try:
+        return {
+            "circuit_breakers": get_all_circuit_breaker_metrics(),
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Failed to get circuit breaker status: {e}")
+        return {"error": str(e)}
+
+
+@router.get("/batch-processor/metrics")
+async def get_batch_processor_metrics(
+    batch_processor: BatchProcessor = Depends(get_batch_processor)
+):
+    """Get batch processing metrics."""
+    try:
+        return batch_processor.get_metrics()
+    except Exception as e:
+        logger.error(f"Failed to get batch processor metrics: {e}")
+        return {"error": str(e)}
+
+
+@router.get("/system/comprehensive")
+async def get_comprehensive_system_status(
+    ws_manager: EnhancedWebSocketManager = Depends(get_websocket_manager),
+    health_monitor: ConnectionHealthMonitor = Depends(get_health_monitor),
+    batch_processor: BatchProcessor = Depends(get_batch_processor)
+):
+    """Get comprehensive system status including all enhanced services."""
+    try:
+        return {
+            "timestamp": datetime.now().isoformat(),
+            "websocket": {
+                "metrics": ws_manager.get_metrics(),
+                "active_connections": ws_manager.get_connection_count()
+            },
+            "health": health_monitor.get_overall_health(),
+            "circuit_breakers": get_all_circuit_breaker_metrics(),
+            "batch_processor": batch_processor.get_metrics()
+        }
+    except Exception as e:
+        logger.error(f"Failed to get comprehensive status: {e}")
         return {"error": str(e)}

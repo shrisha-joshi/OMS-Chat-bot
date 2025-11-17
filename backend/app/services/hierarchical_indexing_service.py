@@ -26,7 +26,12 @@ class HierarchicalIndexingService:
     
     def __init__(self):
         self.nlp_model = None
-        self.tokenizer = None
+        # Initialize tokenizer immediately (synchronous, always works)
+        try:
+            self.tokenizer = tiktoken.get_encoding("cl100k_base")
+        except Exception as e:
+            logger.error(f"Failed to initialize tokenizer: {e}")
+            self.tokenizer = None
         self.redis_client = None
     
     async def initialize(self):
@@ -44,8 +49,14 @@ class HierarchicalIndexingService:
                 logger.warning("spaCy model not found. Using fallback methods.")
                 self.nlp_model = None
             
-            # Initialize tokenizer
-            self.tokenizer = tiktoken.get_encoding("cl100k_base")
+            # Tokenizer already initialized in __init__, but verify it worked
+            if self.tokenizer is None:
+                logger.warning("Tokenizer was not initialized in __init__, trying again...")
+                try:
+                    self.tokenizer = tiktoken.get_encoding("cl100k_base")
+                except Exception as e:
+                    logger.error(f"Failed to initialize tokenizer: {e}")
+                    raise RuntimeError("Tokenizer initialization failed - cannot proceed")
             
             logger.info("Hierarchical indexing service initialized successfully")
             
@@ -74,13 +85,28 @@ class HierarchicalIndexingService:
             # Step 2: Extract hierarchical structure
             hierarchy = await self._extract_document_hierarchy(text, document_type)
             
+            # DEBUG: Log hierarchy extraction
+            logger.info(f"🔍 DEBUG - Hierarchy extraction:")
+            logger.info(f"  Document type: {document_type}")
+            logger.info(f"  Sections found: {len(hierarchy) if hierarchy else 0}")
+            if hierarchy:
+                for idx, section in enumerate(hierarchy[:3]):  # Log first 3
+                    logger.info(f"  Section {idx}: '{section.get('title', 'NO TITLE')[:50]}' ({len(section.get('text', ''))} chars)")
+            
+            # SAFETY CHECK: Ensure we have sections to process
+            if not hierarchy or len(hierarchy) == 0:
+                logger.warning(f"No hierarchy extracted, falling back to direct chunking ({len(text)} chars)")
+                return self._fallback_chunking(text, doc_id)
+            
             # Step 3: Create multi-level chunks
             hierarchical_chunks = []
             
+            logger.info(f"🔍 DEBUG - Processing {len(hierarchy)} sections into chunks...")
             for section_idx, section in enumerate(hierarchy):
                 section_chunks = await self._process_section(
                     section, doc_id, section_idx, doc_metadata
                 )
+                logger.info(f"  Section {section_idx} produced {len(section_chunks) if section_chunks else 0} chunks")
                 hierarchical_chunks.extend(section_chunks)
             
             # Step 4: Add document-level summary chunks
@@ -90,13 +116,22 @@ class HierarchicalIndexingService:
                 )
                 hierarchical_chunks.extend(summary_chunks)
             
+            # FINAL SAFETY CHECK: Ensure we never return empty chunks
+            if not hierarchical_chunks or len(hierarchical_chunks) == 0:
+                logger.error(f"Hierarchical chunking produced 0 chunks! Falling back to simple chunking.")
+                logger.error(f"  Text length: {len(text)}, Sections: {len(hierarchy)}")
+                return self._fallback_chunking(text, doc_id)
+            
             logger.info(f"Created {len(hierarchical_chunks)} hierarchical chunks from {len(hierarchy)} sections")
             return hierarchical_chunks
             
         except Exception as e:
             logger.error(f"Hierarchical chunking failed: {e}")
+            logger.error(f"  Exception type: {type(e).__name__}")
+            logger.error(f"  Text length: {len(text) if text else 0}")
+            logger.error(f"  Doc ID: {doc_id}")
             # Fallback to simple chunking
-            return await self._fallback_chunking(text, doc_id)
+            return self._fallback_chunking(text, doc_id)
     
     async def _analyze_document_structure(self, text: str, filename: str, 
                                         document_type: str) -> Dict[str, Any]:
@@ -257,7 +292,13 @@ class HierarchicalIndexingService:
                 return self._split_by_pattern_matches(text, matches)
         
         # Fallback: split by double newlines (paragraphs)
-        paragraphs = [p.strip() for p in text.split('\n\n') if len(p.strip()) > 100]
+        # ROOT CAUSE FIX: Changed from >100 to >20 to avoid filtering out smaller paragraphs
+        paragraphs = [p.strip() for p in text.split('\n\n') if len(p.strip()) > 20]
+        
+        # If still no paragraphs, treat entire text as one section
+        if not paragraphs and len(text.strip()) > 20:
+            logger.warning(f"No paragraph breaks found, treating entire text as single section ({len(text)} chars)")
+            paragraphs = [text.strip()]
         
         sections = []
         for i, paragraph in enumerate(paragraphs):
@@ -273,6 +314,7 @@ class HierarchicalIndexingService:
                 "position": i
             })
         
+        logger.info(f"_extract_text_hierarchy: Created {len(sections)} sections from {len(paragraphs)} paragraphs")
         return sections
     
     def _split_by_pattern_matches(self, text: str, matches: List) -> List[Dict[str, Any]]:
@@ -324,21 +366,37 @@ class HierarchicalIndexingService:
         section_text = section["text"]
         section_title = section["title"]
         
+        # DEBUG: Log section processing
+        logger.info(f"🔍 _create_balanced_chunks: Processing section '{section_title[:30]}'")
+        logger.info(f"  Section text length: {len(section_text)} chars")
+        
         # Split into paragraphs first
         paragraphs = [p.strip() for p in section_text.split('\n\n') if len(p.strip()) > 20]
+        
+        logger.info(f"  Paragraphs found: {len(paragraphs)}")
         
         paragraph_idx = 0
         for paragraph in paragraphs:
             # Check if paragraph is small enough to be one chunk
             token_count = len(self.tokenizer.encode(paragraph))
             
+            logger.info(f"  📝 Paragraph {paragraph_idx}: {len(paragraph)} chars, {token_count} tokens")
+            logger.info(f"     Chunk size limit: {settings.chunk_size}")
+            logger.info(f"     Will create chunk: {token_count <= settings.chunk_size}")
+            
             if token_count <= settings.chunk_size:
                 # Single paragraph chunk
-                chunk_metadata = self._create_chunk_metadata(
-                    doc_metadata, section, paragraph_idx, "paragraph", paragraph
-                )
+                logger.info(f"     Creating metadata...")
+                try:
+                    chunk_metadata = self._create_chunk_metadata(
+                        doc_metadata, section, paragraph_idx, "paragraph", paragraph
+                    )
+                    logger.info(f"     ✅ Metadata created")
+                except Exception as e:
+                    logger.error(f"     ❌ Metadata creation failed: {e}")
+                    chunk_metadata = {}
                 
-                chunks.append({
+                chunk = {
                     "text": paragraph,
                     "tokens": token_count,
                     "chunk_index": len(chunks),
@@ -346,7 +404,9 @@ class HierarchicalIndexingService:
                     "paragraph_index": paragraph_idx,
                     "chunk_type": "paragraph",
                     "metadata": chunk_metadata
-                })
+                }
+                chunks.append(chunk)
+                logger.info(f"     ✅ Chunk appended! Total chunks now: {len(chunks)}")
             else:
                 # Split paragraph into sentences
                 sentences = self._split_into_sentences(paragraph)
@@ -357,6 +417,7 @@ class HierarchicalIndexingService:
             
             paragraph_idx += 1
         
+        logger.info(f"  Chunks created from section: {len(chunks)}")
         return chunks
     
     async def _create_semantic_chunks(self, section: Dict[str, Any], doc_id: str,
@@ -666,12 +727,25 @@ class HierarchicalIndexingService:
         
         return summary_chunks
     
-    async def _fallback_chunking(self, text: str, doc_id: str) -> List[Dict[str, Any]]:
+    def _fallback_chunking(self, text: str, doc_id: str) -> List[Dict[str, Any]]:
         """Simple fallback chunking when hierarchical processing fails."""
+        
+        logger.info(f"🔍 FALLBACK CHUNKING CALLED!")
+        logger.info(f"  Text length: {len(text)} chars")
+        logger.info(f"  Doc ID: {doc_id}")
+        
+        # CRITICAL: Verify tokenizer is available
+        if self.tokenizer is None:
+            logger.error("❌ CRITICAL: Tokenizer is None in fallback chunking!")
+            logger.error("  Cannot chunk without tokenizer - returning empty list")
+            return []
         
         chunks = []
         chunk_size = settings.chunk_size
         tokens = self.tokenizer.encode(text)
+        
+        logger.info(f"  Token count: {len(tokens)}")
+        logger.info(f"  Chunk size setting: {chunk_size}")
         
         start_idx = 0
         while start_idx < len(tokens):
@@ -694,6 +768,7 @@ class HierarchicalIndexingService:
             
             start_idx = end_idx - settings.chunk_overlap
         
+        logger.info(f"  ✅ Fallback created {len(chunks)} chunks")
         return chunks
 
 # Global instance

@@ -50,8 +50,8 @@ class IngestService:
         try:
             logger.info("Initializing ingest service...")
             
-            # Get database clients
-            self.mongo_client = await get_mongodb_client()
+            # Get database clients (these are sync functions returning singletons)
+            self.mongo_client = get_mongodb_client()
             self.qdrant_client = await get_qdrant_client()
             self.redis_client = await get_redis_client()
             
@@ -92,13 +92,22 @@ class IngestService:
             bool: Success status
         """
         try:
+            # Import WebSocket notifier
+            from ..api.websocket import notify_progress
+            
+            # Notify: Starting extraction
+            await notify_progress(doc_id, "EXTRACT", "PROCESSING", 5, "Starting document processing...")
+            
             # Get document metadata
             document = await self.mongo_client.get_document(doc_id)
             if not document:
+                await notify_progress(doc_id, "EXTRACT", "FAILED", 0, "Document not found")
                 raise ValueError(f"Document {doc_id} not found")
             
             filename = document.get("filename", "")
             gridfs_id = document.get("gridfs_id")
+            
+            await notify_progress(doc_id, "EXTRACT", "PROCESSING", 10, f"Extracting content from {filename}...")
             
             logger.info(f"Processing document: {filename}")
             
@@ -120,7 +129,14 @@ class IngestService:
             
             text_content = await self._extract_text(file_content, filename)
             
+            # DEBUG: Log extracted text details
+            logger.info(f"🔍 DEBUG - Text Extraction:")
+            logger.info(f"  📄 File: {filename}")
+            logger.info(f"  📏 Extracted text length: {len(text_content) if text_content else 0} characters")
+            logger.info(f"  📝 First 200 chars: {text_content[:200] if text_content else 'EMPTY'}")
+            
             if not text_content or len(text_content.strip()) < 10:
+                logger.error(f"❌ EXTRACTION FAILED: Text too short ({len(text_content) if text_content else 0} chars)")
                 raise ValueError("No meaningful text content extracted from file")
             
             await self.mongo_client.log_ingestion_step(
@@ -144,7 +160,10 @@ class IngestService:
                     )
                     logger.info(f"✅ Extracted {len(extracted_images)} images from PDF")
             
+            await notify_progress(doc_id, "EXTRACT", "SUCCESS", 20, f"Extracted {len(text_content)} characters")
+            
             # Step 2: Create hierarchical chunks with enhanced metadata
+            await notify_progress(doc_id, "CHUNK", "PROCESSING", 25, "Creating text chunks...")
             await self.mongo_client.log_ingestion_step(
                 doc_id, "CHUNK", "PROCESSING", "Creating hierarchical chunks with metadata enrichment"
             )
@@ -157,13 +176,26 @@ class IngestService:
                 text_content, doc_id, filename, document_type
             )
             
+            # DEBUG: Log chunking results
+            logger.info(f"🔍 DEBUG - Chunking Results:")
+            logger.info(f"  📦 Chunks created: {len(chunks) if chunks else 0}")
+            if chunks and len(chunks) > 0:
+                logger.info(f"  📝 First chunk preview: {chunks[0].get('text', 'NO TEXT')[:100]}...")
+                logger.info(f"  🔑 Chunk keys: {list(chunks[0].keys()) if chunks else 'NONE'}")
+            else:
+                logger.error(f"❌ CHUNKING FAILED: No chunks created from {len(text_content)} chars of text!")
+                logger.error(f"  Document type: {document_type}")
+                logger.error(f"  Filename: {filename}")
+            
             await self.mongo_client.log_ingestion_step(
                 doc_id, "CHUNK", "SUCCESS", 
                 f"Created {len(chunks)} chunks",
                 {"chunk_count": len(chunks)}
             )
+            await notify_progress(doc_id, "CHUNK", "SUCCESS", 40, f"Created {len(chunks)} chunks")
             
             # Step 3: Generate embeddings
+            await notify_progress(doc_id, "EMBED", "PROCESSING", 50, "Generating embeddings...")
             await self.mongo_client.log_ingestion_step(
                 doc_id, "EMBED", "PROCESSING", "Generating embeddings for chunks"
             )
@@ -175,21 +207,46 @@ class IngestService:
                 f"Generated embeddings for {len(embeddings)} chunks",
                 {"embedding_count": len(embeddings)}
             )
+            await notify_progress(doc_id, "EMBED", "SUCCESS", 65, f"Generated {len(embeddings)} embeddings")
             
             # Step 4: Store chunks in MongoDB
+            await notify_progress(doc_id, "STORE_CHUNKS", "PROCESSING", 70, "Storing chunks in database...")
             await self.mongo_client.log_ingestion_step(
                 doc_id, "STORE_CHUNKS", "PROCESSING", "Storing chunks in database"
             )
             
+            # DEBUG: Log before storing
+            logger.info(f"🔍 DEBUG - Before store_chunks:")
+            logger.info(f"  📦 Chunks to store: {len(chunks)}")
+            logger.info(f"  🆔 Document ID: {doc_id}")
+            
             chunk_success = await self.mongo_client.store_chunks(doc_id, chunks)
+            
+            # DEBUG: Log after storing
+            logger.info(f"🔍 DEBUG - After store_chunks:")
+            logger.info(f"  ✅ store_chunks returned: {chunk_success}")
+            logger.info(f"  📦 Chunks stored: {len(chunks)}")
+            
+            # Verify chunks were actually stored
+            doc_verify = await self.mongo_client.get_document(doc_id)
+            chunks_in_db = doc_verify.get('chunks', []) if doc_verify else []
+            logger.info(f"  🔍 Verification - Chunks in DB after store: {len(chunks_in_db)}")
+            
             if not chunk_success:
+                logger.error(f"❌ STORE FAILED: store_chunks returned False!")
                 raise ValueError("Failed to store chunks in database")
+            
+            if len(chunks_in_db) == 0:
+                logger.error(f"❌ STORE VERIFICATION FAILED: store_chunks returned True but DB has 0 chunks!")
+                logger.error(f"  This suggests store_chunks() is not actually persisting data!")
             
             await self.mongo_client.log_ingestion_step(
                 doc_id, "STORE_CHUNKS", "SUCCESS", "Chunks stored successfully"
             )
+            await notify_progress(doc_id, "STORE_CHUNKS", "SUCCESS", 80, f"Stored {len(chunks)} chunks")
             
             # Step 5: Index vectors in Qdrant
+            await notify_progress(doc_id, "INDEX_VECTORS", "PROCESSING", 85, "Indexing vectors...")
             await self.mongo_client.log_ingestion_step(
                 doc_id, "INDEX_VECTORS", "PROCESSING", "Indexing vectors in Qdrant"
             )
@@ -201,9 +258,11 @@ class IngestService:
             await self.mongo_client.log_ingestion_step(
                 doc_id, "INDEX_VECTORS", "SUCCESS", "Vectors indexed successfully"
             )
+            await notify_progress(doc_id, "INDEX_VECTORS", "SUCCESS", 90, "Vectors indexed successfully")
             
             # Step 6: Extract entities and build graph (if enabled)
             if settings.use_graph_search:
+                await notify_progress(doc_id, "EXTRACT_ENTITIES", "PROCESSING", 92, "Extracting entities...")
                 await self.mongo_client.log_ingestion_step(
                     doc_id, "EXTRACT_ENTITIES", "PROCESSING", "Extracting entities for knowledge graph"
                 )
@@ -223,6 +282,7 @@ class IngestService:
                         f"Extracted {entity_count} entities and {relationship_count} relationships",
                         {"entity_count": entity_count, "relationship_count": relationship_count}
                     )
+                    await notify_progress(doc_id, "EXTRACT_ENTITIES", "SUCCESS", 95, f"Extracted {entity_count} entities")
                 except Exception as e:
                     logger.warning(f"Graph extraction failed (non-critical): {e}")
                     await self.mongo_client.log_ingestion_step(
@@ -233,11 +293,20 @@ class IngestService:
             # Step 7: Cache document for faster retrieval
             await self._cache_document_metadata(doc_id, document, len(chunks))
             
+            # Final success notification
+            await notify_progress(doc_id, "COMPLETE", "SUCCESS", 100, "✅ Processing complete!")
+            
             logger.info(f"Document {doc_id} processed successfully")
             return True
             
         except Exception as e:
             logger.error(f"Failed to process document {doc_id}: {e}")
+            # Notify failure
+            try:
+                from ..api.websocket import notify_progress
+                await notify_progress(doc_id, "FAILED", "FAILED", 0, f"❌ Error: {str(e)[:100]}")
+            except:
+                pass
             return False
     
     async def _process_json_document(self, doc_id: str, file_content: bytes, filename: str) -> bool:

@@ -22,6 +22,10 @@ async def create_collections_and_indexes(db: AsyncIOMotorDatabase):
     Args:
         db: Motor AsyncIOMotorDatabase instance
     """
+    if db is None:
+        logger.warning("⚠️  Database is None, skipping collection/index creation")
+        return
+    
     try:
         # Check if collections exist
         existing_collections = await db.list_collection_names()
