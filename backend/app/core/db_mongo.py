@@ -34,24 +34,28 @@ class MongoDBClient:
         return self.available and self.client is not None
     
     async def connect(self):
-        """Establish connection to MongoDB and initialize GridFS."""
+        """Establish connection to MongoDB with intelligent fallback."""
         try:
             if not settings.mongodb_uri:
                 logger.warning("MongoDB URI not configured, running without MongoDB")
                 self.available = False
                 return False
-                
-            logger.info("Attempting to connect to MongoDB Atlas...")
+            
+            # Determine connection type
+            is_atlas = "mongodb+srv" in settings.mongodb_uri
+            conn_type = "MongoDB Atlas" if is_atlas else "Local MongoDB"
+            
+            logger.info(f"Attempting to connect to {conn_type}...")
             self.client = AsyncIOMotorClient(
                 settings.mongodb_uri,
-                serverSelectionTimeoutMS=5000
+                serverSelectionTimeoutMS=8000 if is_atlas else 3000
             )
             self.database = self.client[settings.mongodb_db]
             self.fs_bucket = AsyncIOMotorGridFSBucket(self.database, bucket_name="fs")
             
             # Test connection
             await self.client.admin.command('ping')
-            logger.info(f"✅ Successfully connected to MongoDB: {settings.mongodb_db}")
+            logger.info(f"✅ Successfully connected to {conn_type}: {settings.mongodb_db}")
             self.available = True
             
             # Create indexes
@@ -60,6 +64,7 @@ class MongoDBClient:
             
         except Exception as e:
             logger.error(f"❌ Failed to connect to MongoDB: {e}")
+            logger.warning("💡 TIP: Ensure MongoDB is running locally (mongod) or Atlas credentials are correct")
             # Clean up failed connection
             self.client = None
             self.database = None
@@ -102,8 +107,35 @@ class MongoDBClient:
             logger.error(f"Failed to create indexes: {e}")
     
     async def store_file(self, filename: str, content: bytes, metadata: Dict = None) -> ObjectId:
-        """Store a file in GridFS and return the file ID."""
+        """Store a file in GridFS with compression and quota management."""
+        if not self.available or not self.fs_bucket:
+            logger.warning("MongoDB not available, cannot store file")
+            raise RuntimeError("Database service unavailable")
+
         try:
+            import gzip
+            
+            # Check storage quota (Atlas free = 512MB)
+            try:
+                stats = await self.database.command("dbStats")
+                storage_mb = stats.get("dataSize", 0) / (1024 * 1024)
+                
+                if storage_mb > 450:  # 90% full
+                    logger.warning(f"⚠️ Storage: {storage_mb:.1f}MB / 512MB - Running cleanup...")
+                    await self._cleanup_failed_documents()
+            except Exception as check_err:
+                logger.debug(f"Storage check skipped: {check_err}")
+            
+            # Compress large files (>1MB)
+            original_size = len(content)
+            if original_size > 1_000_000:
+                content = gzip.compress(content, compresslevel=6)
+                if not metadata:
+                    metadata = {}
+                metadata["compressed"] = True
+                metadata["original_size"] = original_size
+                logger.info(f"✓ Compressed {filename}: {original_size/1024/1024:.1f}MB -> {len(content)/1024/1024:.1f}MB")
+            
             file_id = await self.fs_bucket.upload_from_stream(
                 filename=filename,
                 source=content,
@@ -112,18 +144,36 @@ class MongoDBClient:
             logger.info(f"File stored in GridFS: {filename} -> {file_id}")
             return file_id
         except Exception as e:
+            error_msg = str(e)
+            # Atlas quota error handling
+            if "space quota" in error_msg.lower() or "8000" in error_msg or "AtlasError" in error_msg:
+                logger.error("❌ MongoDB Atlas QUOTA EXCEEDED")
+                logger.error(f"   Error: {error_msg}")
+                raise ValueError(f"MongoDB storage full. Delete old documents or upgrade Atlas tier. {error_msg}")
             logger.error(f"Failed to store file {filename}: {e}")
             raise
     
     async def retrieve_file(self, file_id: ObjectId) -> bytes:
-        """Retrieve a file from GridFS by file ID."""
+        """Retrieve a file from GridFS, decompressing if needed."""
+        if not self.available or not self.fs_bucket:
+            logger.warning("MongoDB not available, cannot retrieve file")
+            raise RuntimeError("Database service unavailable")
+
         try:
+            import gzip
             # Handle both ObjectId and string file_id
             if isinstance(file_id, str):
                 file_id = ObjectId(file_id)
             
             stream = await self.fs_bucket.open_download_stream(file_id)
             content = await stream.read()
+            
+            # Decompress if file was compressed
+            metadata = getattr(stream, 'metadata', {}) or {}
+            if metadata.get("compressed"):
+                content = gzip.decompress(content)
+                logger.debug(f"Decompressed file {file_id}")
+            
             return content
         except Exception as e:
             logger.error(f"Failed to retrieve file {file_id}: {e}")
@@ -131,12 +181,38 @@ class MongoDBClient:
     
     async def delete_file(self, file_id: ObjectId):
         """Delete a file from GridFS."""
+        if not self.available or not self.fs_bucket:
+            logger.warning("MongoDB not available, cannot delete file")
+            return
+
         try:
             await self.fs_bucket.delete(file_id)
             logger.info(f"File deleted from GridFS: {file_id}")
         except Exception as e:
             logger.error(f"Failed to delete file {file_id}: {e}")
             raise
+    
+    async def _cleanup_failed_documents(self, max_age_days: int = 7):
+        """Auto-cleanup failed documents to free storage."""
+        if not self.available or self.database is None:
+            return
+
+        try:
+            from datetime import timedelta
+            cutoff_date = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+            
+            failed_docs = await self.database.documents.find({
+                "ingest_status": "FAILED",
+                "uploaded_at": {"$lt": cutoff_date}
+            }).to_list(length=50)
+            
+            for doc in failed_docs:
+                await self.delete_document(str(doc["_id"]))
+            
+            if failed_docs:
+                logger.info(f"✅ Cleaned up {len(failed_docs)} failed documents")
+        except Exception as e:
+            logger.warning(f"Cleanup error: {e}")
     
     async def save_document(
         self, 
@@ -149,6 +225,10 @@ class MongoDBClient:
         Save a document: store file in GridFS and create metadata record.
         Returns the document ID for tracking.
         """
+        if not self.available:
+            logger.warning("MongoDB not available, cannot save document")
+            raise RuntimeError("Database service unavailable")
+
         try:
             # Step 1: Store file in GridFS
             file_id = await self.store_file(
@@ -180,6 +260,9 @@ class MongoDBClient:
     
     async def create_document(self, document_data: Dict) -> str:
         """Create a new document record."""
+        if not self.available or self.database is None:
+            raise RuntimeError("Database service unavailable")
+
         try:
             document_data["uploaded_at"] = datetime.now(timezone.utc)
             document_data["ingest_status"] = "PENDING"
@@ -194,6 +277,9 @@ class MongoDBClient:
     
     async def get_document(self, doc_id: str) -> Optional[Dict]:
         """Get document by ID."""
+        if not self.available or self.database is None:
+            return None
+
         try:
             document = await self.database.documents.find_one({"_id": ObjectId(doc_id)})
             if document:
@@ -206,6 +292,9 @@ class MongoDBClient:
     
     async def update_document_status(self, doc_id: str, status: str, error_message: str = None):
         """Update document ingestion status."""
+        if not self.available or self.database is None:
+            return
+
         try:
             update_data = {
                 "ingest_status": status,
@@ -224,6 +313,9 @@ class MongoDBClient:
     
     async def list_documents(self, skip: int = 0, limit: int = 50) -> List[Dict]:
         """List documents with pagination."""
+        if not self.available or self.database is None:
+            return []
+
         try:
             cursor = self.database.documents.find().sort("uploaded_at", -1).skip(skip).limit(limit)
             documents = []
@@ -237,16 +329,19 @@ class MongoDBClient:
             return []
     
     async def store_chunks(self, doc_id: str, chunks: List[Dict]) -> bool:
-        """Store document chunks in the database."""
+        """Store document chunks OPTIMIZED - reduced storage footprint."""
+        if not self.available or self.database is None:
+            logger.warning("MongoDB not available, skipping chunk storage")
+            return False
+
         try:
+            # OPTIMIZATION: Store only essential chunk data
             for i, chunk in enumerate(chunks):
                 chunk_doc = {
                     "_id": f"{doc_id}_chunk_{i}",
                     "doc_id": doc_id,
                     "chunk_index": i,
                     "text": chunk["text"],
-                    "char_start": chunk.get("char_start", 0),
-                    "char_end": chunk.get("char_end", len(chunk["text"])),
                     "tokens": chunk.get("tokens", 0),
                     "created_at": datetime.now(timezone.utc)
                 }
@@ -272,7 +367,7 @@ class MongoDBClient:
                 }
             )
             
-            logger.info(f"Stored {len(chunks)} chunks for document {doc_id}")
+            logger.info(f"✅ Stored {len(chunks)} chunks for document {doc_id} (optimized storage)")
             return True
         except Exception as e:
             logger.error(f"Failed to store chunks: {e}")
@@ -280,6 +375,9 @@ class MongoDBClient:
     
     async def get_chunks(self, doc_id: str) -> List[Dict]:
         """Get all chunks for a document."""
+        if not self.available or self.database is None:
+            return []
+
         try:
             cursor = self.database.chunks.find({"doc_id": doc_id}).sort("chunk_index", 1)
             chunks = []
@@ -292,6 +390,9 @@ class MongoDBClient:
     
     async def delete_chunks(self, doc_id: str) -> bool:
         """Delete all chunks for a document."""
+        if not self.available or self.database is None:
+            return False
+
         try:
             result = await self.database.chunks.delete_many({"doc_id": doc_id})
             logger.info(f"Deleted {result.deleted_count} chunks for document {doc_id}")
@@ -302,6 +403,9 @@ class MongoDBClient:
     
     async def log_ingestion_step(self, doc_id: str, step: str, status: str, message: str = "", metadata: Dict = None):
         """Log an ingestion step."""
+        if not self.available or self.database is None:
+            return
+
         try:
             log_entry = {
                 "doc_id": doc_id,
@@ -317,6 +421,9 @@ class MongoDBClient:
     
     async def get_ingestion_logs(self, doc_id: str) -> List[Dict]:
         """Get ingestion logs for a document."""
+        if not self.available or self.database is None:
+            return []
+
         try:
             cursor = self.database.ingestion_logs.find({"doc_id": doc_id}).sort("timestamp", 1)
             logs = []
@@ -331,6 +438,9 @@ class MongoDBClient:
     async def store_feedback(self, session_id: str, query: str, response: str, 
                            rating: str, correction: str = None) -> bool:
         """Store user feedback."""
+        if not self.available or self.database is None:
+            return False
+
         try:
             feedback_data = {
                 "session_id": session_id,
@@ -349,14 +459,20 @@ class MongoDBClient:
     
     async def get_all_documents(self) -> List[Dict[str, Any]]:
         """Get all documents for BM25 indexing."""
-        if self.database is None:
+        if not self.available or self.database is None:
             logger.warning("MongoDB not available, returning empty document list")
             return []
             
         try:
+            # Return _id and filename, content is in chunks
             documents = await self.database.documents.find({
                 "ingest_status": "completed"
-            }, {"title": 1, "content": 1, "chunk_id": 1}).to_list(None)
+            }, {"filename": 1}).to_list(None)
+            
+            # Convert ObjectId to string
+            for doc in documents:
+                doc["_id"] = str(doc["_id"])
+                
             return documents
         except Exception as e:
             logger.error(f"Failed to get all documents: {e}")
@@ -373,11 +489,11 @@ class MongoDBClient:
         - "child": Document A is a subsection of Document B
         - "similar": Documents have similar content
         """
+        if not self.available or self.database is None:
+            logger.warning("MongoDB not available for relationship storage")
+            return False
+
         try:
-            if self.database is None:
-                logger.warning("MongoDB not available for relationship storage")
-                return False
-            
             relationship = {
                 "from_doc_id": from_doc_id,
                 "to_doc_id": to_doc_id,
@@ -420,10 +536,10 @@ class MongoDBClient:
         
         Returns: List of related document IDs
         """
+        if not self.available or self.database is None:
+            return []
+
         try:
-            if self.database is None:
-                return []
-            
             query = {"from_doc_id": doc_id}
             if relationship_type:
                 query["type"] = relationship_type
@@ -448,10 +564,10 @@ class MongoDBClient:
         
         Returns: Number of relationships created
         """
+        if not self.available or self.database is None:
+            return 0
+
         try:
-            if self.database is None:
-                return 0
-            
             relationships_created = 0
             
             # For each extracted topic, find other documents with same topic
@@ -487,10 +603,10 @@ class MongoDBClient:
         
         Returns: Graph structure with nodes and edges
         """
+        if not self.available or self.database is None:
+            return {"nodes": [], "edges": []}
+
         try:
-            if self.database is None:
-                return {"nodes": [], "edges": []}
-            
             nodes = set()
             edges = []
             visited = set()

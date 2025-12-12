@@ -181,13 +181,14 @@ class ArangoDBClient:
             _relations_col = self.database.collection(self.relations_collection)
 
             # Entity indexes
-            entities_col.add_hash_index(fields=["name"], unique=False)
-            entities_col.add_hash_index(fields=["type"], unique=False)
-            entities_col.add_hash_index(fields=["doc_id"], unique=False)
+
+            _entities_col.add_hash_index(fields=["name"], unique=False)
+            _entities_col.add_hash_index(fields=["type"], unique=False)
+            _entities_col.add_hash_index(fields=["doc_id"], unique=False)
 
             # Relation indexes
-            relations_col.add_hash_index(fields=["relation_type"], unique=False)
-            relations_col.add_hash_index(fields=["confidence"], unique=False)
+            _relations_col.add_hash_index(fields=["relation_type"], unique=False)
+            _relations_col.add_hash_index(fields=["confidence"], unique=False)
 
             logger.info("Created ArangoDB indexes")
 
@@ -232,11 +233,11 @@ class ArangoDBClient:
             
             # Try to insert, if exists then update
             try:
-                entities_col.insert(entity_data)
+                _entities_col.insert(entity_data)
                 logger.debug(f"Created new entity: {name} ({entity_type})")
             except Exception:
                 # Entity exists, update it
-                existing = entities_col.get(entity_key)
+                existing = _entities_col.get(entity_key)
                 if existing:
                     # Merge doc_ids and chunk_ids
                     if doc_id and doc_id not in existing.get("doc_ids", []):
@@ -247,7 +248,7 @@ class ArangoDBClient:
                     existing["mention_count"] = existing.get("mention_count", 1) + 1
                     existing["updated_at"] = datetime.now(timezone.utc).isoformat()
                     
-                    entities_col.update(entity_key, existing)
+                    _entities_col.update(entity_key, existing)
                     logger.debug(f"Updated existing entity: {name} ({entity_type})")
             
             return entity_key
@@ -294,15 +295,15 @@ class ArangoDBClient:
             
             # Insert or update relation
             try:
-                relations_col.insert(relation_data)
+                _relations_col.insert(relation_data)
                 logger.debug(f"Created relation: {from_entity_key} -{relation_type}-> {to_entity_key}")
             except Exception:
                 # Relation exists, update confidence if higher
-                existing = relations_col.get(relation_key)
+                existing = _relations_col.get(relation_key)
                 if existing and confidence > existing.get("confidence", 0):
                     existing["confidence"] = confidence
                     existing["updated_at"] = datetime.now(timezone.utc).isoformat()
-                    relations_col.update(relation_key, existing)
+                    _relations_col.update(relation_key, existing)
             
             return True
             
@@ -334,7 +335,7 @@ class ArangoDBClient:
                 RETURN entity._key
                 """
                 cursor = self.database.aql.execute(query, bind_vars={"name": name})
-                entity_keys.extend([doc for doc in cursor])
+                entity_keys.extend(list(cursor))
             
             if not entity_keys:
                 return []
@@ -382,7 +383,7 @@ class ArangoDBClient:
             logger.error(f"Failed to find related entities: {e}")
             return []
     
-    async def get_entity_context(self, entity_names: List[str]) -> Dict[str, Any]:
+    def get_entity_context(self, entity_names: List[str]) -> Dict[str, Any]:
         """
         Get contextual information about entities including their relationships.
         
@@ -408,7 +409,7 @@ class ArangoDBClient:
                 RETURN entity
                 """
                 cursor = self.database.aql.execute(query, bind_vars={"name": name})
-                entities = [doc for doc in cursor]
+                entities = list(cursor)
                 
                 for entity in entities:
                     context["entities"].append({
@@ -452,7 +453,7 @@ class ArangoDBClient:
             logger.error(f"Failed to get entity context: {e}")
             return {"entities": [], "relationships": [], "related_documents": [], "entity_types": []}
     
-    async def delete_document_graph_data(self, doc_id: str) -> bool:
+    def delete_document_graph_data(self, doc_id: str) -> bool:
         """Delete all graph data associated with a document."""
         try:
             # Delete relations associated with the document
@@ -464,7 +465,7 @@ class ArangoDBClient:
             """
             
             rel_cursor = self.database.aql.execute(rel_query, bind_vars={"doc_id": doc_id})
-            deleted_relations = len([doc for doc in rel_cursor])
+            deleted_relations = len(list(rel_cursor))
             
             # Update entities to remove doc_id references
             entity_query = f"""
@@ -482,7 +483,7 @@ class ArangoDBClient:
             """
             
             entity_cursor = self.database.aql.execute(entity_query, bind_vars={"doc_id": doc_id})
-            updated_entities = len([doc for doc in entity_cursor])
+            updated_entities = len(list(entity_cursor))
             
             logger.info(f"Deleted {deleted_relations} relations and updated {updated_entities} entities for document {doc_id}")
             return True
@@ -491,15 +492,15 @@ class ArangoDBClient:
             logger.error(f"Failed to delete graph data for document {doc_id}: {e}")
             return False
     
-    async def get_graph_statistics(self) -> Dict[str, Any]:
+    def get_graph_statistics(self) -> Dict[str, Any]:
         """Get statistics about the knowledge graph."""
         try:
             _entities_col = self.database.collection(self.entities_collection)
             _relations_col = self.database.collection(self.relations_collection)
             
             # Basic counts
-            entity_count = entities_col.count()
-            relation_count = relations_col.count()
+            entity_count = _entities_col.count()
+            relation_count = _relations_col.count()
             
             # Entity type distribution
             type_query = f"""
@@ -536,6 +537,6 @@ class ArangoDBClient:
 arango_client = ArangoDBClient()
 
 
-async def get_arango_client() -> ArangoDBClient:
+def get_arango_client() -> ArangoDBClient:
     """Dependency injection for ArangoDB client."""
     return arango_client

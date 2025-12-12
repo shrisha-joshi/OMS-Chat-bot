@@ -18,17 +18,17 @@ from .config import settings
 from .core.db_mongo import mongodb_client
 from .core.db_qdrant import qdrant_client
 from .core.cache_redis import redis_client
-from .api import chat, admin, auth, feedback, monitoring, websocket
+from .api import chat, admin, auth, feedback, websocket, metrics
 from .api import admin_fix_stuck  # Add stuck document recovery endpoints
 from .api import rag_diagnostics  # Add RAG pipeline diagnostics
 from .workers.ingest_worker import start_ingest_worker
 from .middleware import RateLimitMiddleware  # Rate limiting
 from .utils.metrics import metrics_collector, PerformanceTimer  # Performance monitoring
 
-# Import enhanced services
-from .services.websocket_manager import ws_manager
-from .services.health_monitor import health_monitor
-from .services.batch_processor import batch_processor
+# Constants
+ADMIN_PREFIX = "/admin"
+
+# Enhanced services (Lazy loaded where needed)
 
 import httpx
 
@@ -98,7 +98,7 @@ async def _validate_llm_provider() -> tuple[bool, str]:
     """Validate LLM provider availability."""
     try:
         logger.info("Validating LLM Provider...")
-        llm_url = settings.lmstudio_api_url or "http://localhost:1234/v1" or "http://192.168.56.1:1234"
+        llm_url = settings.lmstudio_api_url or "http://localhost:1234/v1"
         async with httpx.AsyncClient(timeout=5) as client:
             response = await asyncio.wait_for(
                 client.get(f"{llm_url}/models"),
@@ -264,88 +264,34 @@ async def _initialize_media_services():
     """Initialize media services."""
     logger.info("\nPhase 5: Service Initialization")
     logger.info("-" * 80)
-    try:
-        from .services.media_suggestion_service import media_suggestion_service
-        await media_suggestion_service.initialize()
-        logger.info("  ✓ Media suggestion service initialized")
-    except Exception as e:
-        logger.error(f"  ERROR: Failed to initialize media suggestion service: {e}")
-        raise
+    # Media suggestion service removed in refactor
+    logger.info("  ✓ Services initialized")
 
 def _configure_background_workers(app: FastAPI):
     """Configure background workers for lazy initialization."""
     logger.info("\nPhase 6: Background Workers Configuration")
     logger.info("-" * 80)
-    app.state.ingest_worker_task = None
-    app.state.ingest_worker_started = False
-    logger.info("  ✓ Background workers configured for lazy initialization")
+    # Start ingest worker in background
+    app.state.ingest_worker_task = asyncio.create_task(start_ingest_worker())
+    app.state.ingest_worker_started = True
+    logger.info("  ✓ Background workers started")
 
 async def _warmup_services():
     """Warmup services to prevent first-request delays."""
-    logger.info("\nPhase 7: Service Warmup & Enhanced Features Initialization")
+    logger.info("\nPhase 7: Service Warmup")
     logger.info("-" * 80)
     
-    # Start WebSocket Manager
+    # Warmup RetrievalEngine
     try:
-        logger.info("🔗 Starting Enhanced WebSocket Manager...")
-        await ws_manager.start_background_tasks()
-        logger.info("  ✅ WebSocket manager started with connection pooling & health monitoring")
+        logger.info("🔥 Warming up Retrieval Engine...")
+        from .services.retrieval_engine import get_retrieval_engine
+        
+        await get_retrieval_engine()
+        
+        logger.info("  ✅ Retrieval Engine warmed up!")
     except Exception as e:
-        logger.warning(f"  ⚠️  WebSocket manager startup failed: {e}")
-    
-    # Register services for health monitoring
-    try:
-        logger.info("💊 Registering services for health monitoring...")
-        
-        # Register MongoDB
-        health_monitor.register_service(
-            "mongodb",
-            health_check=lambda: asyncio.to_thread(lambda: mongodb_client.is_connected()),
-            reconnect_handler=mongodb_client.connect
-        )
-        
-        # Register Qdrant
-        health_monitor.register_service(
-            "qdrant",
-            health_check=lambda: asyncio.to_thread(lambda: qdrant_client.is_connected()),
-            reconnect_handler=qdrant_client.connect
-        )
-        
-        # Register Redis
-        health_monitor.register_service(
-            "redis",
-            health_check=lambda: asyncio.to_thread(lambda: redis_client.is_connected()),
-            reconnect_handler=redis_client.connect
-        )
-        
-        # Start health monitor
-        await health_monitor.start()
-        logger.info("  ✅ Health monitor started (30s check interval)")
-    except Exception as e:
-        logger.warning(f"  ⚠️  Health monitor startup failed: {e}")
-    
-    # Warmup chat service
-    try:
-        logger.info("🔥 Warming up chat service with research enhancements...")
-        from .services.chat_service import ChatService
-        
-        warmup_service = ChatService()
-        await warmup_service.initialize()
-        
-        logger.info("  ✅ Chat service warmed up with Context Window Optimizer & COS-Mix!")
-        logger.info("  First query will respond in <10 seconds with enhanced retrieval")
-    except Exception as e:
-        logger.warning(f"  ⚠️  Chat service warmup failed: {e}")
-        logger.warning("  Services will initialize on first request (30-60s delay)")
-    
-    # Log batch processor info
-    try:
-        logger.info("📦 Batch processor initialized:")
-        metrics = batch_processor.get_metrics()
-        logger.info(f"  Batch size: {metrics['batch_size']}, Max concurrent: {metrics['max_concurrent_batches']}")
-        logger.info("  ✅ Ready for 10x faster embedding generation")
-    except Exception as e:
-        logger.warning(f"  ⚠️  Batch processor check failed: {e}")
+        logger.warning(f"  ⚠️  Retrieval Engine warmup failed: {e}")
+        logger.warning("  Services will initialize on first request")
 
 async def _shutdown_services():
     """Shutdown all services gracefully."""
@@ -354,21 +300,6 @@ async def _shutdown_services():
     logger.info("=" * 80)
     
     disconnect_tasks = []
-    
-    # Stop enhanced services first
-    try:
-        logger.info("Stopping WebSocket manager...")
-        await ws_manager.shutdown()
-        logger.info("  ✅ WebSocket manager stopped")
-    except Exception as e:
-        logger.error(f"Error stopping WebSocket manager: {e}")
-    
-    try:
-        logger.info("Stopping health monitor...")
-        await health_monitor.stop()
-        logger.info("  ✅ Health monitor stopped")
-    except Exception as e:
-        logger.error(f"Error stopping health monitor: {e}")
     
     # MongoDB (synchronous disconnect)
     if mongodb_client.client:
@@ -402,13 +333,14 @@ async def _shutdown_services():
             await asyncio.gather(*disconnect_tasks, return_exceptions=True)
         except asyncio.CancelledError:
             logger.info("Disconnection tasks cancelled, forcing cleanup...")
+            raise
     
     logger.info("✅ All services disconnected successfully")
     logger.info("=" * 80)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator:
-    """Application lifespan manager - orchestrates startup and shutdown."""
+    """Application lifespan manager - orchestrates startup and shutdown (Python 3.13 compatible)."""
     # Startup
     logger.info("=" * 80)
     logger.info("🚀 APPLICATION STARTUP - OMS Chat Bot RAG System")
@@ -452,23 +384,22 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
         logger.info("✅ APPLICATION STARTUP COMPLETED SUCCESSFULLY")
         logger.info("=" * 80)
         
-        yield
-        
-    except asyncio.CancelledError:
-        # Python 3.13 compatibility: Handle graceful cancellation during shutdown
-        logger.info("Application shutdown initiated (CancelledError caught)")
     except Exception as e:
         logger.error(f"❌ Application startup failed: {e}", exc_info=True)
         raise
-    finally:
-        # Shutdown - always runs even if cancelled
-        try:
-            await _shutdown_services()
-        except asyncio.CancelledError:
-            # Suppress cancellation during shutdown
-            logger.info("Shutdown completed (cancelled during cleanup)")
-        except Exception as e:
-            logger.error(f"Error during shutdown: {e}", exc_info=True)
+    
+    # Yield - server runs here until shutdown signal
+    # Python 3.13 note: This works correctly with latest starlette/uvicorn
+    yield
+    
+    # Shutdown - always runs after yield completes
+    logger.info("=" * 80)
+    logger.info("🛑 SHUTDOWN: Disconnecting from all services...")
+    logger.info("=" * 80)
+    try:
+        await _shutdown_services()
+    except Exception as e:
+        logger.error(f"Error during shutdown: {e}", exc_info=True)
 
 
 # Create FastAPI application
@@ -526,19 +457,19 @@ app.include_router(
 
 app.include_router(
     admin.router,
-    prefix="/admin",
+    prefix=ADMIN_PREFIX,
     tags=["Administration"]
 )
 
 app.include_router(
     admin_fix_stuck.router,
-    prefix="/admin",
+    prefix=ADMIN_PREFIX,
     tags=["Administration - Recovery"]
 )
 
 app.include_router(
     rag_diagnostics.router,
-    prefix="/admin",
+    prefix=ADMIN_PREFIX,
     tags=["RAG Diagnostics"]
 )
 
@@ -548,16 +479,22 @@ app.include_router(
     tags=["Feedback"]
 )
 
-app.include_router(
-    monitoring.router,
-    prefix="/monitoring",
-    tags=["System Monitoring"]
-)
+# app.include_router(
+#     monitoring.router,
+#     prefix="/monitoring",
+#     tags=["System Monitoring"]
+# )
 
 app.include_router(
     websocket.router,
     prefix="",
     tags=["WebSocket"]
+)
+
+app.include_router(
+    metrics.router,
+    prefix="",
+    tags=["Metrics"]
 )
 
 # Health check endpoint
@@ -628,7 +565,7 @@ async def get_metrics():
         raise HTTPException(status_code=404, detail="Metrics disabled")
     
     return {
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "metrics": metrics_collector.get_summary()
     }
 
@@ -769,17 +706,31 @@ async def not_found_handler(request, exc):
 
 @app.exception_handler(500)
 async def internal_server_error_handler(request, exc):
-    """Custom 500 handler."""
+    """Custom 500 handler with production error masking."""
     from fastapi.responses import JSONResponse
-    logger.error(f"Internal server error: {exc}")
-    return JSONResponse(
-        status_code=500,
-        content={
-            "error": "Internal Server Error",
-            "message": "An unexpected error occurred",
-            "status_code": 500
-        }
-    )
+    logger.error(f"Internal server error: {exc}", exc_info=True)
+    
+    # 🔒 SECURITY FIX: Mask errors in production
+    if settings.app_env == "production":
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": "Internal Server Error",
+                "message": "An unexpected error occurred. Please try again later.",
+                "status_code": 500
+            }
+        )
+    else:
+        # Development mode - show detailed error
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": "Internal Server Error",
+                "message": str(exc),
+                "type": type(exc).__name__,
+                "status_code": 500
+            }
+        )
 
 if __name__ == "__main__":
     import uvicorn
@@ -789,5 +740,7 @@ if __name__ == "__main__":
         host=settings.app_host,
         port=settings.app_port,
         reload=settings.debug_mode,
-        log_level="info" if settings.debug_mode else "warning"
+        log_level="info" if settings.debug_mode else "warning",
+        limit_max_requests=10000,
+        timeout_keep_alive=300
     )

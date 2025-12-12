@@ -1,22 +1,178 @@
 """Admin router for document uploads and management.
 
 Provides endpoints for document upload and processing.
-These endpoints are intentionally public for local/dev use.
-Add authentication and validation before using in production.
+
+SECURITY NOTE: Admin endpoints are currently PUBLIC for local/dev use.
+To enable authentication for production, uncomment the require_admin dependency:
+  current_user: Dict = Depends(require_admin)
+
+Example:
+  @router.post("/documents/upload")
+  async def upload_document_multipart(
+      ...
+      current_user: Dict = Depends(require_admin)  # <-- Uncomment for production
+  ):
 """
 
-from fastapi import APIRouter, File, UploadFile, HTTPException, Depends, BackgroundTasks, Query
+from fastapi import APIRouter, Depends, HTTPException, File, UploadFile, Form, Query, BackgroundTasks, Request
+from fastapi.responses import JSONResponse
+from typing import Dict, Optional, List
+import time
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 import base64
 import logging
 import json
+import shutil
+import os
+
+# Constants
+PARTIAL_SUCCESS_STATUS = "Partial success"
+MAX_FILE_SIZE_MB = 200
+SMALL_DOCUMENT_THRESHOLD = 100_000  # 100KB
+MSG_READY_FOR_QUERIES = "Document processed and ready for queries"
+UPLOAD_DIR = "temp_uploads"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+
+def _sanitize_filename(filename: str) -> str:
+    """Sanitize filename to prevent security issues."""
+    import os
+    import re
+    
+    # Remove path components
+    safe_filename = os.path.basename(filename)
+    safe_filename = safe_filename.replace("..", "").replace("/", "").replace("\\", "")
+    # Allow only alphanumeric, spaces, dots, hyphens, underscores
+    safe_filename = re.sub(r'[^a-zA-Z0-9._\- ]', '_', safe_filename)
+    # Ensure not empty
+    if not safe_filename or safe_filename.strip() == "":
+        safe_filename = f"document_{int(time.time())}.txt"
+    
+    return safe_filename
+
+
+def _check_file_size(content_length_header: Optional[str]) -> None:
+    """Check Content-Length header to prevent buffer overflow."""
+    if content_length_header:
+        size_mb = int(content_length_header) / (1024 * 1024)
+        if size_mb > MAX_FILE_SIZE_MB:
+            logger.warning(f"⚠️ File too large: {size_mb:.1f}MB (max {MAX_FILE_SIZE_MB}MB)")
+            raise HTTPException(
+                status_code=413,
+                detail=f"File too large: {size_mb:.1f}MB (max {MAX_FILE_SIZE_MB}MB)"
+            )
+
+
+def _sanitize_json_content(content: bytes, filename: str) -> bytes:
+    """Sanitize JSON files before saving."""
+    logger.info(f"🧹 Auto-sanitizing JSON file: {filename}")
+    success, sanitized_data, report = validate_json_file(content)
+    
+    if not success:
+        logger.error(f"❌ JSON sanitization failed: {report.get('error')}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid JSON file: {report.get('error', 'Unknown error')}"
+        )
+    
+    # Replace content with sanitized version
+    sanitized_content = json.dumps(sanitized_data, indent=2).encode('utf-8')
+    
+    logger.info(f"✅ JSON sanitized successfully - {len(report.get('cleaning_steps', []))} fixes applied")
+    logger.info(f"   Type: {report.get('type')}, Items: {report.get('statistics', {}).get('total_items', 'N/A')}")
+    
+    return sanitized_content
+
+
+async def _clear_document_cache():
+    """Clear document list cache in Redis."""
+    try:
+        from ..core.cache_redis import get_redis_client
+        redis_cache_client = await get_redis_client()
+        if redis_cache_client.is_connected():
+            await redis_cache_client.clear_pattern("docs:list:*")
+            logger.info("🔄 Cleared document list cache")
+    except Exception as e:
+        logger.warning(f"Failed to clear cache: {e}")
+
+
+async def _process_document_sync(doc_id: str, filename: str, size: int) -> Dict[str, Any]:
+    """Process document synchronously and return result."""
+    from ..services.ingestion_engine import get_ingestion_engine
+    engine = await get_ingestion_engine()
+    success = await engine.process_document(doc_id)
+    
+    if success:
+        return {
+            "success": True,
+            "filename": filename,
+            "size": size,
+            "document_id": str(doc_id),
+            "status": "completed",
+            "processing_time": "immediate",
+            "message": MSG_READY_FOR_QUERIES
+        }
+    else:
+        return {
+            "success": True,
+            "filename": filename,
+            "size": size,
+            "document_id": str(doc_id),
+            "status": "completed_with_warnings",
+            "processing_time": "immediate"
+        }
+
+
+def _process_document_async(doc_id: str, filename: str, size: int, background_tasks: BackgroundTasks) -> Dict[str, Any]:
+    """Queue document for async background processing."""
+    logger.info(f"🚀 ASYNC-PATH: Queuing document for background processing ({size} bytes)")
+    processing_task = asyncio.create_task(_process_document_with_retry(doc_id, filename))
+    background_tasks.add_task(lambda: processing_task)
+    
+    return {
+        "success": True,
+        "filename": filename,
+        "size": size,
+        "document_id": str(doc_id),
+        "status": "processing",
+        "message": "Document queued for processing"
+    }
+
+
+def _handle_upload_error(e: Exception) -> HTTPException:
+    """Convert exceptions to appropriate HTTP errors."""
+    if isinstance(e, HTTPException):
+        return e
+    
+    if isinstance(e, ValueError):
+        error_msg = str(e)
+        if "quota" in error_msg.lower() or "storage full" in error_msg.lower():
+            return HTTPException(status_code=507, detail=f"Upload failed: {error_msg}")
+        return HTTPException(status_code=400, detail=error_msg)
+    
+    # General error - check for MongoDB Atlas quota
+    logger.error(f"❌ Upload failed: {e}")
+    error_detail = str(e)
+    
+    if "space quota" in error_detail.lower() or "8000" in error_detail or "AtlasError" in error_detail:
+        return HTTPException(status_code=507, detail=f"Upload failed: MongoDB storage quota exceeded. {error_detail}")
+    
+    # Check for "Database service unavailable" message which is not an exception but might be passed here
+    if "Database service unavailable" in error_detail:
+        return HTTPException(status_code=503, detail="Database service unavailable. Please check your connection.")
+
+    return HTTPException(status_code=500, detail=f"Upload failed: {error_detail}")
+
+
 import asyncio
 from datetime import datetime
 
 from ..core.db_mongo import get_mongodb_client, MongoDBClient
 from ..utils.json_sanitizer import validate_json_file
 from ..config import settings
+from ..services.auth_service import require_admin
+from ..services.ingestion_engine import get_ingestion_engine
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -31,13 +187,109 @@ class UploadJSONRequest(BaseModel):
     content_type: Optional[str] = DEFAULT_CONTENT_TYPE
 
 
+@router.post("/documents/upload-chunk")
+async def upload_chunk(
+    file: UploadFile = File(...),
+    file_id: str = Form(...),
+    chunk_index: int = Form(...)
+):
+    """
+    Upload a single chunk of a large file.
+    """
+    try:
+        # Create a directory for this specific file upload
+        file_dir = os.path.join(UPLOAD_DIR, file_id)
+        os.makedirs(file_dir, exist_ok=True)
+        
+        # Save chunk with index as filename (e.g., "0", "1", "2")
+        chunk_path = os.path.join(file_dir, str(chunk_index))
+        with open(chunk_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+        
+        return {"status": "chunk_received", "chunk_index": chunk_index}
+    except Exception as e:
+        logger.error(f"Chunk upload failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Chunk upload failed: {str(e)}")
+
+@router.post("/documents/assemble")
+async def assemble_file(
+    file_id: str = Form(...), 
+    filename: str = Form(...),
+    background_tasks: BackgroundTasks = BackgroundTasks(),
+    mongo_client: MongoDBClient = Depends(get_mongodb_client)
+):
+    """
+    Assemble uploaded chunks into a final file and process it.
+    """
+    try:
+        file_dir = os.path.join(UPLOAD_DIR, file_id)
+        if not os.path.exists(file_dir):
+            raise HTTPException(status_code=404, detail="Upload session not found")
+
+        # Sort chunks by index
+        try:
+            chunks = sorted([int(f) for f in os.listdir(file_dir)])
+        except ValueError:
+             raise HTTPException(status_code=400, detail="Invalid chunk files found")
+
+        # Reassemble content
+        content = bytearray()
+        for chunk_index in chunks:
+            chunk_path = os.path.join(file_dir, str(chunk_index))
+            with open(chunk_path, "rb") as chunk_file:
+                content.extend(chunk_file.read())
+        
+        # Cleanup temp chunks
+        try:
+            shutil.rmtree(file_dir)
+        except Exception as e:
+            logger.warning(f"Failed to cleanup temp dir {file_dir}: {e}")
+
+        # Validate size
+        size = len(content)
+        if size == 0:
+             raise HTTPException(status_code=400, detail="Assembled file is empty")
+
+        # Save to MongoDB
+        safe_filename = _sanitize_filename(filename)
+        doc_id = await mongo_client.save_document(
+            filename=safe_filename,
+            content=bytes(content),
+            content_type="application/octet-stream", # Could infer type
+            size=size
+        )
+        
+        if not doc_id:
+             return JSONResponse(
+                status_code=503,
+                content={"success": False, "message": "Database unavailable, document not saved."}
+            )
+
+        logger.info(f"✅ Assembled document saved: {safe_filename} ({size} bytes) - ID: {doc_id}")
+        
+        # Trigger async processing
+        return _process_document_async(doc_id, safe_filename, size, background_tasks)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        if "Database service unavailable" in str(e):
+             return JSONResponse(
+                status_code=503,
+                content={"success": False, "message": "Database unavailable, document not saved."}
+            )
+        logger.error(f"Assembly failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Assembly failed: {str(e)}")
+
+
 @router.post("/documents/upload")
 async def upload_document_multipart(
+    request: Request,
     file: UploadFile = File(...),
     background_tasks: BackgroundTasks = BackgroundTasks(),
     mongo_client: MongoDBClient = Depends(get_mongodb_client),
     redis_client = Depends(lambda: None),  # Optional Redis dependency
-    sync_processing: bool = False  # New parameter for synchronous processing
+    sync_processing: bool = False
 ):
     """
     Accept a multipart/form-data file, save to MongoDB, and queue for processing.
@@ -50,35 +302,25 @@ async def upload_document_multipart(
         raise HTTPException(status_code=400, detail="No file provided")
     
     try:
+        # Validate and read file content
+        _check_file_size(request.headers.get("Content-Length"))
+        safe_filename = _sanitize_filename(file.filename)
+        logger.info(f"📁 Sanitized filename: {file.filename} → {safe_filename}")
+        file.filename = safe_filename
+        
         content = await file.read()
         size = len(content)
         
         if size == 0:
             raise HTTPException(status_code=400, detail="File is empty")
+        if size > MAX_FILE_SIZE_MB * 1024 * 1024:
+            raise HTTPException(status_code=413, detail=f"File too large (max {MAX_FILE_SIZE_MB}MB)")
         
-        if size > 50 * 1024 * 1024:  # 50MB limit
-            raise HTTPException(status_code=413, detail="File too large (max 50MB)")
-        
-        # AUTO-SANITIZE JSON FILES BEFORE SAVING
-        if file.filename and file.filename.lower().endswith('.json'):
-            logger.info(f"🧹 Auto-sanitizing JSON file: {file.filename}")
-            success, sanitized_data, report = validate_json_file(content)
-            
-            if not success:
-                logger.error(f"❌ JSON sanitization failed: {report.get('error')}")
-                raise HTTPException(
-                    status_code=400, 
-                    detail=f"Invalid JSON file: {report.get('error', 'Unknown error')}"
-                )
-            
-            # Replace content with sanitized version
-            content = json.dumps(sanitized_data, indent=2).encode('utf-8')
+        if file.filename.lower().endswith('.json'):
+            content = _sanitize_json_content(content, file.filename)
             size = len(content)
-            
-            logger.info(f"✅ JSON sanitized successfully - {len(report.get('cleaning_steps', []))} fixes applied")
-            logger.info(f"   Type: {report.get('type')}, Items: {report.get('statistics', {}).get('total_items', 'N/A')}")
         
-        # Save to MongoDB GridFS
+        # Save to MongoDB
         doc_id = await mongo_client.save_document(
             filename=file.filename,
             content=content,
@@ -86,80 +328,30 @@ async def upload_document_multipart(
             size=size
         )
         
-        logger.info(f"✅ Document saved to MongoDB: {file.filename} ({size} bytes) - ID: {doc_id}")
+        if not doc_id:
+            logger.warning("Failed to save document to MongoDB (service unavailable?)")
+            # Raise exception to be caught by _handle_upload_error
+            raise Exception("Database service unavailable")
+
+        logger.info(f"✅ Document saved: {file.filename} ({size} bytes) - ID: {doc_id}")
         
-        # Invalidate document list cache
-        try:
-            from ..core.cache_redis import get_redis_client
-            redis_cache_client = await get_redis_client()
-            if redis_cache_client.is_connected():
-                await redis_cache_client.clear_pattern("docs:list:*")
-                logger.info("🔄 Cleared document list cache")
-        except Exception as e:
-            logger.warning(f"Failed to clear cache: {e}")
+        await _clear_document_cache()
         
-        # Auto-detect: Small documents (<100KB) process synchronously for instant availability
-        small_document = size < 100_000  # 100KB threshold
-        should_process_sync = sync_processing or small_document
+        # Process sync or async based on size
+        should_sync = sync_processing or (size < SMALL_DOCUMENT_THRESHOLD)
         
-        if should_process_sync:
-            logger.info(f"⚡ FAST-PATH: Processing document synchronously ({size} bytes)")
+        if should_sync:
+            logger.info(f"⚡ FAST-PATH: Sync processing ({size} bytes)")
             try:
-                # Process immediately and wait for completion
-                success = await _process_document_sync(doc_id, file.filename, mongo_client)
-                
-                if success:
-                    return {
-                        "success": True,
-                        "filename": file.filename,
-                        "size": size,
-                        "document_id": str(doc_id),
-                        "status": "completed",
-                        "processing_time": "immediate",
-                        "message": "Document processed and ready for queries"
-                    }
-                else:
-                    return {
-                        "success": True,
-                        "filename": file.filename,
-                        "size": size,
-                        "document_id": str(doc_id),
-                        "status": "completed_with_warnings",
-                        "processing_time": "immediate"
-                    }
+                return await _process_document_sync(doc_id, file.filename, size)
             except Exception as proc_error:
-                logger.error(f"Sync processing failed, falling back to async: {proc_error}")
-                # Fall back to async processing
-                processing_task = asyncio.create_task(_process_document_with_retry(doc_id, file.filename))
-                background_tasks.add_task(lambda: processing_task)
-                return {
-                    "success": True,
-                    "filename": file.filename,
-                    "size": size,
-                    "document_id": str(doc_id),
-                    "status": "processing",
-                    "message": "Processing in background (sync failed)"
-                }
-        else:
-            # Large document: Queue for background processing
-            logger.info(f"🚀 ASYNC-PATH: Queuing large document for background processing ({size} bytes)")
-            processing_task = asyncio.create_task(_process_document_with_retry(doc_id, file.filename))
-            background_tasks.add_task(lambda: processing_task)
-            
-            return {
-                "success": True,
-                "filename": file.filename,
-                "size": size,
-                "document_id": str(doc_id),
-                "status": "processing",
-                "message": "Large document queued for processing"
-            }
+                logger.error(f"Sync failed, using async: {proc_error}")
+                return _process_document_async(doc_id, file.filename, size, background_tasks)
+        
+        return _process_document_async(doc_id, file.filename, size, background_tasks)
     
-    except HTTPException:
-        raise
     except Exception as e:
-        logger.error(f"❌ Upload failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
+        raise _handle_upload_error(e)
 
 
 @router.post("/documents/{doc_id}/reprocess")
@@ -178,19 +370,21 @@ async def reprocess_document(
         logger.info(f"🔄 Manual reprocessing triggered: {filename}")
         
         # Process synchronously so we can see errors
-        from ..services.ingest_service import IngestService
-        ingest_service = IngestService()
-        await ingest_service.initialize()
+        # from ..services.ingest_service import IngestService
+        # ingest_service = IngestService()
+        # await ingest_service.initialize()
+        
+        engine = await get_ingestion_engine()
         
         # Ensure Qdrant is connected
-        if not ingest_service.qdrant_client.is_connected():
-            await ingest_service.qdrant_client.connect()
+        if not engine.qdrant_client.is_connected():
+            await engine.qdrant_client.connect()
         
         # Update status
         await mongo_client.update_document_status(doc_id, "PROCESSING")
         
         # Process
-        success = await ingest_service.process_document(doc_id)
+        success = await engine.process_document(doc_id)
         
         if success:
             await mongo_client.update_document_status(doc_id, "COMPLETED")
@@ -242,6 +436,11 @@ async def upload_document_json(
             size=size
         )
         
+        if not doc_id:
+            logger.warning("Failed to save document to MongoDB (service unavailable?)")
+            # Raise exception to be caught by _handle_upload_error
+            raise Exception("Database service unavailable")
+        
         logger.info(f"✅ JSON document saved to MongoDB: {payload.filename} ({size} bytes) - ID: {doc_id}")
         
         # Auto-detect: Small documents (<100KB) process synchronously for instant availability
@@ -252,7 +451,7 @@ async def upload_document_json(
             logger.info(f"⚡ FAST-PATH: Processing document synchronously ({size} bytes)")
             try:
                 # Process immediately and wait for completion
-                success = await _process_document_sync(doc_id, payload.filename, mongo_client)
+                success = await _process_document_sync(doc_id, payload.filename, size)
                 
                 if success:
                     return {
@@ -333,17 +532,12 @@ async def _attempt_document_processing(doc_id: str, filename: str, mongo_client)
     await mongo_client.update_document_status(doc_id, "PROCESSING")
     
     # Initialize ingest service
-    from ..services.ingest_service import IngestService
-    ingest_service = IngestService()
-    await ingest_service.initialize()
-    
-    # Ensure Qdrant is connected
-    if not ingest_service.qdrant_client.is_connected():
-        await ingest_service.qdrant_client.connect()
+    from ..services.ingestion_engine import get_ingestion_engine
+    engine = await get_ingestion_engine()
     
     # Process the document
     logger.info(f"⚙️ Running RAG pipeline for {filename}...")
-    success = await ingest_service.process_document(doc_id)
+    success = await engine.process_document(doc_id)
     return success
 
 
@@ -391,7 +585,7 @@ async def _process_document_with_retry(doc_id: str, filename: str, max_retries: 
                     await asyncio.sleep(5 * attempt)  # Exponential backoff
                     continue
                 else:
-                    await mongo_client.update_document_status(doc_id, "COMPLETED", "Partial success after retries")
+                    await mongo_client.update_document_status(doc_id, "COMPLETED", PARTIAL_SUCCESS_STATUS)
                     return
                     
         except Exception as e:
@@ -413,20 +607,17 @@ async def _process_document_sync(doc_id: str, filename: str, mongo_client) -> bo
         await mongo_client.update_document_status(str(doc_id), "PROCESSING")
         
         # Initialize ingest service
-        from ..services.ingest_service import IngestService
-        
-        ingest_service = IngestService()
-        await ingest_service.initialize()
+        engine = await get_ingestion_engine()
         
         # Ensure Qdrant is connected
-        if not ingest_service.qdrant_client.is_connected():
-            await ingest_service.qdrant_client.connect()
+        if not engine.qdrant_client.is_connected():
+            await engine.qdrant_client.connect()
         
         # Process the document with timeout (5 minutes max)
         logger.info("⚙️ Running RAG pipeline: Extract → Chunk → Embed → Index")
         try:
             success = await asyncio.wait_for(
-                ingest_service.process_document(str(doc_id)),
+                engine.process_document(str(doc_id)),
                 timeout=300.0  # 5 minutes
             )
         except asyncio.TimeoutError:
@@ -438,18 +629,11 @@ async def _process_document_sync(doc_id: str, filename: str, mongo_client) -> bo
             await mongo_client.update_document_status(str(doc_id), "COMPLETED")
             logger.info(f"✅ SYNC SUCCESS: {filename} fully processed and ready!")
             
-            # Reload BM25 index to include new document
-            try:
-                from ..services.chat_service import get_chat_service
-                chat_service = await get_chat_service()
-                await chat_service._reload_bm25_index()
-                logger.info("🔄 BM25 index reloaded with new document")
-            except Exception as reload_error:
-                logger.warning(f"Failed to reload BM25: {reload_error}")
+            # Note: BM25 index reload removed - now handled by retrieval engine
             
             return True
         else:
-            await mongo_client.update_document_status(str(doc_id), "COMPLETED", "Partial success")
+            await mongo_client.update_document_status(str(doc_id), "COMPLETED", PARTIAL_SUCCESS_STATUS)
             logger.warning(f"⚠️ SYNC PARTIAL: {filename} processed with warnings")
             return False
             
@@ -457,6 +641,37 @@ async def _process_document_sync(doc_id: str, filename: str, mongo_client) -> bo
         logger.error(f"❌ SYNC FAILED: {filename} - {e}", exc_info=True)
         await mongo_client.update_document_status(str(doc_id), "FAILED", str(e))
         raise
+
+
+def _calculate_retry_delay(attempt: int, base_delay: float) -> float:
+    """Calculate exponential backoff delay."""
+    return base_delay * (settings.retry_backoff_multiplier ** (attempt - 1))
+
+
+async def _initialize_and_process(doc_id: str, filename: str, mongo_client) -> bool:
+    """Initialize engine and process document."""
+    # Update status to PROCESSING
+    await mongo_client.update_document_status(str(doc_id), "PROCESSING")
+    logger.info(f"📝 Status: PENDING → PROCESSING for {filename}")
+    
+    # Initialize engine
+    logger.info("🔧 Initializing ingest service...")
+    engine = await get_ingestion_engine()
+    logger.info("✅ Ingest service ready")
+    
+    # Process document
+    logger.info("⚙️ Running RAG pipeline: Extract → Chunk → Embed → Index")
+    return await engine.process_document(str(doc_id))
+
+
+async def _handle_processing_result(doc_id: str, filename: str, mongo_client, success: bool):
+    """Handle processing result and update status."""
+    if success:
+        await mongo_client.update_document_status(str(doc_id), "COMPLETED")
+        logger.info(f"✅ SUCCESS: {filename} fully processed and indexed!")
+    else:
+        await mongo_client.update_document_status(str(doc_id), "COMPLETED", PARTIAL_SUCCESS_STATUS)
+        logger.warning(f"⚠️ PARTIAL: {filename} processed with warnings")
 
 
 async def _process_document_immediate(doc_id, filename, mongo_client):
@@ -467,35 +682,18 @@ async def _process_document_immediate(doc_id, filename, mongo_client):
     for attempt in range(max_retries):
         try:
             if attempt > 0:
+                delay = _calculate_retry_delay(attempt, retry_delay)
                 logger.info(f"🔄 RETRY {attempt}/{max_retries}: {filename}")
-                await asyncio.sleep(retry_delay * (settings.retry_backoff_multiplier ** (attempt - 1)))
+                await asyncio.sleep(delay)
             else:
                 logger.info(f"🔥 IMMEDIATE PROCESSING STARTED: {filename} (doc_id: {doc_id})")
             
-            # Update status to PROCESSING immediately
-            await mongo_client.update_document_status(str(doc_id), "PROCESSING")
-            logger.info(f"📝 Status: PENDING → PROCESSING for {filename}")
+            # Process document
+            success = await _initialize_and_process(str(doc_id), filename, mongo_client)
             
-            # Lazy initialize ingest service
-            from ..services.ingest_service import IngestService
-            
-            logger.info("🔧 Initializing ingest service...")
-            ingest_service = IngestService()
-            await ingest_service.initialize()
-            logger.info("✅ Ingest service ready")
-            
-            # Process the document
-            logger.info("⚙️ Running RAG pipeline: Extract → Chunk → Embed → Index")
-            success = await ingest_service.process_document(str(doc_id))
-            
-            if success:
-                await mongo_client.update_document_status(str(doc_id), "COMPLETED")
-                logger.info(f"✅ SUCCESS: {filename} fully processed and indexed!")
-                return  # Success - exit retry loop
-            else:
-                await mongo_client.update_document_status(str(doc_id), "COMPLETED", "Partial success")
-                logger.warning(f"⚠️ PARTIAL: {filename} processed with warnings")
-                return  # Partial success - exit retry loop
+            # Handle result
+            await _handle_processing_result(str(doc_id), filename, mongo_client, success)
+            return  # Exit retry loop
                 
         except Exception as e:
             logger.error(f"❌ ATTEMPT {attempt + 1} FAILED: {filename} - {e}", exc_info=True)
@@ -508,7 +706,8 @@ async def _process_document_immediate(doc_id, filename, mongo_client):
                     logger.warning(f"Failed to update status: {update_error}")
             else:
                 # Will retry
-                logger.info(f"⏳ Waiting {retry_delay * (settings.retry_backoff_multiplier ** attempt)}s before retry...")
+                next_delay = _calculate_retry_delay(attempt, retry_delay)
+                logger.info(f"⏳ Waiting {next_delay}s before retry...")
 
 
 async def _process_document(doc_id, filename, mongo_client):
@@ -520,27 +719,36 @@ async def _process_document(doc_id, filename, mongo_client):
         await mongo_client.update_document_status(str(doc_id), "PROCESSING")
         logger.info(f"📝 Status updated to PROCESSING for {filename}")
         
+        # Get document metadata to check size
+        document = mongo_client.get_document(str(doc_id))
+        file_size_mb = document.get('file_size', 0) / (1024 * 1024) if document else 0
+        
         # Lazy initialize ingest service (import here to avoid circular imports)
-        from ..services.ingest_service import IngestService
+        # from ..services.ingest_service import IngestService
         from ..core.db_qdrant import get_qdrant_client
         from ..core.cache_redis import get_redis_client
         
         logger.info(f"🔧 Initializing ingest service for {filename}...")
         # Create ingest service instance
-        ingest_service = IngestService()
-        await ingest_service.initialize()
+        # ingest_service = IngestService()
+        # await ingest_service.initialize()
+        engine = await get_ingestion_engine()
         logger.info(f"✅ Ingest service initialized for {filename}")
         
-        # Process the document (chunks, embeddings, Qdrant storage)
-        logger.info(f"⚙️ Starting document processing pipeline for {filename}...")
-        success = await ingest_service.process_document(str(doc_id))
+        # Choose processing method based on file size
+        if file_size_mb > 200:
+            logger.info(f"📦 Large file detected ({file_size_mb:.1f}MB), using streaming ingestion...")
+            success = await engine.process_document(str(doc_id))
+        else:
+            logger.info(f"⚙️ Starting standard document processing pipeline for {filename}...")
+            success = await engine.process_document(str(doc_id))
         
         if success:
             logger.info(f"✅ Document processing completed successfully: {filename} (doc_id: {doc_id})")
             await mongo_client.update_document_status(str(doc_id), "COMPLETED")
         else:
             logger.warning(f"⚠️ Document processing partial success: {filename} (doc_id: {doc_id})")
-            await mongo_client.update_document_status(str(doc_id), "COMPLETED", "Partial success")
+            await mongo_client.update_document_status(str(doc_id), "COMPLETED", PARTIAL_SUCCESS_STATUS)
             
     except Exception as e:
         logger.error(f"❌ CRITICAL ERROR in document processing: {filename} (doc_id: {doc_id}) - {e}", exc_info=True)
@@ -574,7 +782,15 @@ async def list_documents(
     """
     try:
         if not mongo_client.is_connected():
-            raise HTTPException(status_code=503, detail="MongoDB not connected")
+            logger.warning("MongoDB not connected, returning empty document list")
+            return {
+                "documents": [],
+                "total": 0,
+                "page": 1,
+                "skip": skip,
+                "limit": limit,
+                "message": "Database unavailable"
+            }
         
         # Build query filter
         query_filter = {}

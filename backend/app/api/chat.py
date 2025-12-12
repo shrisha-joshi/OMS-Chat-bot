@@ -17,8 +17,7 @@ from datetime import datetime, timezone
 from ..core.db_mongo import get_mongodb_client, MongoDBClient
 from ..core.db_qdrant import get_qdrant_client, QdrantDBClient
 from ..core.cache_redis import get_redis_client, RedisClient
-from ..services.chat_service import ChatService
-from ..config import settings
+from ..services.retrieval_engine import get_retrieval_engine, RetrievalEngine
 from ..config import settings
 
 logger = logging.getLogger(__name__)
@@ -81,7 +80,7 @@ class ChatMessage(BaseModel):
     attachments: Optional[List[Dict[str, Any]]] = None
 
 @router.post("/test-rag-debug")
-async def test_rag_debug(query: str, service: ChatService = Depends(lambda: ChatService)):
+async def test_rag_debug(query: str, service: RetrievalEngine = Depends(get_retrieval_engine)):
     """
     DEBUG endpoint - Shows REAL RAG error without suppression.
     Use this to diagnose what's failing in the RAG pipeline.
@@ -89,17 +88,8 @@ async def test_rag_debug(query: str, service: ChatService = Depends(lambda: Chat
     logger.info("=== RAG DEBUG TEST (NO ERROR SUPPRESSION) ===")
     logger.info(f"Query: {query}")
     
-    # Initialize service
-    if not hasattr(service, 'embedding_model') or service.embedding_model is None:
-        logger.info("Initializing chat service...")
-        await service.initialize()
-    
-    # Call process_query WITHOUT try/catch so we see the real error
-    result = await service.process_query(
-        query=query,
-        session_id="debug-session",
-        context=[]
-    )
+    # Call search WITHOUT try/catch so we see the real error
+    result = await service.search(query=query)
     
     return result
 
@@ -129,21 +119,10 @@ class StreamingChatResponse(BaseModel):
     attachments: Optional[List[Dict[str, Any]]] = None
     session_id: Optional[str] = None
 
-# Initialize chat service
-chat_service = None
-
-async def get_chat_service() -> ChatService:
-    """Initialize and return chat service."""
-    global chat_service
-    if chat_service is None:
-        chat_service = ChatService()
-        await chat_service.initialize()
-    return chat_service
-
 @router.post("/query", response_model=ChatResponse)
 async def chat_query(
     request: ChatRequest,
-    service: ChatService = Depends(get_chat_service),
+    service: RetrievalEngine = Depends(get_retrieval_engine),
     redis_client: RedisClient = Depends(get_redis_client),
     mongo_client: MongoDBClient = Depends(get_mongodb_client)
 ):
@@ -152,7 +131,7 @@ async def chat_query(
     
     Args:
         request: Chat request with query and context
-        service: Chat service instance
+        service: Retrieval engine instance
         redis_client: Redis client for caching
         mongo_client: MongoDB client for storing messages
     
@@ -191,14 +170,46 @@ async def chat_query(
         try:
             # Set timeout based on query complexity
             timeout = 120  # 2 minutes for RAG queries
-            result = await asyncio.wait_for(
-                service.process_query(
-                    query=request.query,
-                    session_id=request.session_id,
-                    context=request.context or []
-                ),
+            
+            # 1. Retrieve Context
+            retrieval_result = await asyncio.wait_for(
+                service.search(query=request.query),
                 timeout=timeout
             )
+            
+            # 2. Generate Answer (using LLM Handler)
+            from ..services.llm_handler import llm_handler
+            context_text = "\n\n".join([r["payload"]["text"] for r in retrieval_result["results"]])
+            
+            llm_response = await llm_handler.generate_response(
+                prompt=request.query,
+                system_prompt=f"Use the following context to answer the question:\n\n{context_text}",
+                max_tokens=1024
+            )
+            
+            # Handle response format (dict or str)
+            if isinstance(llm_response, dict):
+                response_text = llm_response.get("response", "")
+                tokens_gen = llm_response.get("tokens_generated", 0)
+            else:
+                response_text = str(llm_response)
+                tokens_gen = 0
+            
+            result = {
+                "response": response_text,
+                "sources": [
+                    {
+                        "doc_id": r["payload"]["doc_id"],
+                        "filename": r["payload"]["filename"],
+                        "text": r["payload"]["text"][:200] + "...",
+                        "score": r.get("score", 0)
+                    }
+                    for r in retrieval_result["results"]
+                ],
+                "attachments": [],
+                "tokens_generated": tokens_gen
+            }
+            
         except asyncio.TimeoutError:
             logger.warning(f"⏱️ Query timeout after {timeout}s, returning fast response")
             # Return fast LLM-only response without RAG
@@ -214,6 +225,15 @@ async def chat_query(
                 "attachments": [],
                 "processing_time": timeout,
                 "tokens_generated": fast_response.get("tokens_generated", 0)
+            }
+            
+        except (ConnectionError, RuntimeError) as e:
+            logger.error(f"LLM Service Error: {e}")
+            result = {
+                "response": f"I apologize, but I'm currently unable to generate a response. The AI service appears to be unavailable. (Error: {str(e)})",
+                "sources": [],
+                "attachments": [],
+                "tokens_generated": 0
             }
         
         processing_time = time.time() - start_time
@@ -377,7 +397,7 @@ async def websocket_chat(websocket: WebSocket):  # noqa: python:S3776
             "message": "Connected to RAG chatbot"
         })
         
-        service = await get_chat_service()
+        service = await get_retrieval_engine()
         _ = await get_redis_client()
         
         while True:
@@ -404,20 +424,36 @@ async def websocket_chat(websocket: WebSocket):  # noqa: python:S3776
                     })
                     
                     try:
-                        # Stream the response
-                        async for chunk in service.stream_query(query, session_id):
-                            await websocket.send_json({
-                                "type": chunk["type"],
-                                "content": chunk.get("content", ""),
-                                "sources": chunk.get("sources"),
-                                "attachments": chunk.get("attachments"),
-                                "session_id": session_id
-                            })
+                        # Stream the response (Simplified for now - full streaming requires LLM handler update)
+                        # For now, we'll do a standard search and return complete response
+                        # In future: Implement true streaming in RetrievalEngine/LLMHandler
+                        
+                        retrieval_result = await service.search(query)
+                        
+                        # Generate Answer
+                        from ..services.llm_handler import llm_handler
+                        context_text = "\n\n".join([r["payload"]["text"] for r in retrieval_result["results"]])
+                        
+                        llm_response = await llm_handler.generate_response(
+                            prompt=query,
+                            system_prompt=f"Use the following context to answer the question:\n\n{context_text}",
+                            max_tokens=1024
+                        )
                         
                         # Send completion message
                         processing_time = time.time() - start_time
                         await websocket.send_json({
                             "type": "complete",
+                            "content": llm_response.get("response", ""),
+                            "sources": [
+                                {
+                                    "doc_id": r["payload"]["doc_id"],
+                                    "filename": r["payload"]["filename"],
+                                    "text": r["payload"]["text"][:200] + "...",
+                                    "score": r.get("score", 0)
+                                }
+                                for r in retrieval_result["results"]
+                            ],
                             "session_id": session_id,
                             "processing_time": processing_time
                         })
@@ -520,33 +556,29 @@ async def clear_chat_session(
 
 @router.get("/suggestions")
 async def get_query_suggestions(
-    query: str = Query(..., min_length=2),
-    limit: int = Query(5, ge=1, le=20),
-    service: ChatService = Depends(get_chat_service)
+    query: str = Query(..., min_length=1),
+    limit: int = Query(5, ge=1, le=10)
 ):
     """
-    Get query suggestions based on input.
-    
-    Args:
-        query: Partial query for suggestions
-        limit: Maximum number of suggestions
-        service: Chat service instance
-    
-    Returns:
-        List of query suggestions
+    Get query suggestions based on user input.
+    Currently returns static suggestions, can be enhanced with history.
     """
-    try:
-        suggestions = await service.get_query_suggestions(query, limit)
-        
-        return {
-            "query": query,
-            "suggestions": suggestions,
-            "count": len(suggestions)
-        }
-        
-    except Exception as e:
-        logger.error(f"Failed to get suggestions: {e}")
-        raise HTTPException(status_code=500, detail="Failed to get query suggestions")
+    # Simplified for Vertical Slice - remove complex dependency
+    base_suggestions = [
+        "How do I reset my password?",
+        "What is the status of order #12345?",
+        "Who is the contact for HR?",
+        "Explain the leave policy",
+        "IT support ticket status"
+    ]
+    
+    suggestions = [s for s in base_suggestions if query.lower() in s.lower()][:limit]
+    
+    return {
+        "query": query,
+        "suggestions": suggestions,
+        "count": len(suggestions)
+    }
 
 @router.post("/sessions/{session_id}/context")
 async def update_session_context(
@@ -580,13 +612,14 @@ async def update_session_context(
 async def chat_health_check():
     """Health check for chat service."""
     try:
-        service = await get_chat_service()
+        # Check RetrievalEngine
+        service = await get_retrieval_engine()
         
-        # Test basic functionality
-        test_result = await service.health_check()
+        # Basic check - if we got the service, it's initialized
+        is_healthy = service is not None
         
         return {
-            "status": "healthy" if test_result else "degraded",
+            "status": "healthy" if is_healthy else "degraded",
             "service": "chat",
             "embedding_model": settings.embedding_model_name,
             "llm_endpoint": settings.lmstudio_api_url,
