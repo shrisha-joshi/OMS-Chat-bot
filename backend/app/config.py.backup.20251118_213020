@@ -4,28 +4,18 @@ This module centralizes all configuration settings and provides type safety.
 """
 
 from pydantic import Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings
 from typing import Optional
 import os
 
 
 class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
     
-    # Production RAG Features
-    use_hybrid_retrieval: bool = Field(default=True, alias="USE_HYBRID_RETRIEVAL")
-    use_strict_validation: bool = Field(default=True, alias="USE_STRICT_VALIDATION")
-    use_conversation_history: bool = Field(default=True, alias="USE_CONVERSATION_HISTORY")
-    streaming_chunk_size_mb: int = Field(default=10, alias="STREAMING_CHUNK_SIZE_MB")
-    rrf_k: int = Field(default=60, alias="RRF_K")
-    mmr_lambda: float = Field(default=0.7, alias="MMR_LAMBDA")
-    citation_threshold: float = Field(default=0.7, alias="CITATION_THRESHOLD")
-
     # Application
     app_env: str = Field(default="development", alias="APP_ENV")
     app_host: str = Field(default="127.0.0.1", alias="APP_HOST")
-    app_port: int = Field(default=8001, alias="APP_PORT")
+    app_port: int = Field(default=8000, alias="APP_PORT")
     
     # Database URLs (optional for testing)
     mongodb_uri: Optional[str] = Field(default="", alias="MONGODB_URI")
@@ -52,13 +42,11 @@ class Settings(BaseSettings):
     jwt_secret_key: str = Field(default="test-secret-key-for-development-min-32-chars", alias="JWT_SECRET_KEY")
     jwt_algorithm: str = Field(default="HS256", alias="JWT_ALGORITHM")
     access_token_expire_minutes: int = Field(default=60, alias="ACCESS_TOKEN_EXPIRE_MINUTES")
-    admin_password: str = Field(default="admin123", alias="ADMIN_PASSWORD")
     
     # LLM Configuration  
-    lmstudio_api_url: str = Field(default="http://localhost:1234/v1", alias="LMSTUDIO_API_URL")
+    lmstudio_api_url: str = Field(default="http://192.168.56.1:1234/v1", alias="LMSTUDIO_API_URL")
     lmstudio_api_key: Optional[str] = Field(default="", alias="LMSTUDIO_API_KEY")
     lmstudio_model_name: str = Field(default="mistral-7b-instruct-v0.3", alias="LMSTUDIO_MODEL_NAME")
-    llm_timeout_seconds: int = Field(default=300, alias="LLM_TIMEOUT_SECONDS")
     
     # RAG Configuration (Industrial-Grade Optimized)
     embedding_model_name: str = Field(default="BAAI/bge-base-en-v1.5", alias="EMBEDDING_MODEL_NAME")
@@ -66,9 +54,9 @@ class Settings(BaseSettings):
     reranker_model_name: str = Field(default="cross-encoder/ms-marco-MiniLM-L-12-v2", alias="RERANKER_MODEL_NAME")  # Upgraded to 12-layer
     chunk_size: int = Field(default=800, alias="CHUNK_SIZE")  # Industrial: 800 tokens for better context
     chunk_overlap: int = Field(default=200, alias="CHUNK_OVERLAP")  # 25% overlap
-    top_k_retrieval: int = Field(default=50, alias="TOP_K_RETRIEVAL")  # Cast wider net for precision
-    top_k_rerank: int = Field(default=15, alias="TOP_K_RERANK")  # After reranking
-    top_k_final: int = Field(default=3, alias="TOP_K_FINAL")  # More context for complex queries
+    top_k_retrieval: int = Field(default=100, alias="TOP_K_RETRIEVAL")  # Cast wider net for precision
+    top_k_rerank: int = Field(default=20, alias="TOP_K_RERANK")  # After reranking
+    top_k_final: int = Field(default=10, alias="TOP_K_FINAL")  # More context for complex queries
     
     # Feature Flags
     use_reranker: bool = Field(default=True, alias="USE_RERANKER")

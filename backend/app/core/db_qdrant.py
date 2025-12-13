@@ -112,6 +112,10 @@ class QdrantDBClient:
         Returns:
             bool: Success status
         """
+        if not self.available or not self.client:
+            logger.warning("Qdrant not available, skipping vector upsert")
+            return False
+
         try:
             if len(chunks) != len(embeddings):
                 raise ValueError("Number of chunks must match number of embeddings")
@@ -166,6 +170,10 @@ class QdrantDBClient:
         Returns:
             List of search results with metadata
         """
+        if not self.available or not self.client:
+            logger.warning("Qdrant not available, returning empty search results")
+            return []
+
         try:
             if top_k is None:
                 top_k = settings.top_k_retrieval
@@ -201,14 +209,15 @@ class QdrantDBClient:
                 formatted_result = {
                     "id": result.id,
                     "score": float(result.score),
-                    "doc_id": result.payload.get("doc_id"),
-                    "chunk_id": result.payload.get("chunk_id"),
-                    "chunk_index": result.payload.get("chunk_index"),
-                    "text": result.payload.get("text", ""),
-                    "char_start": result.payload.get("char_start"),
-                    "char_end": result.payload.get("char_end"),
-                    "tokens": result.payload.get("tokens"),
-                    "metadata": {
+                    "payload": {
+                        "doc_id": result.payload.get("doc_id"),
+                        "chunk_id": result.payload.get("chunk_id"),
+                        "chunk_index": result.payload.get("chunk_index"),
+                        "text": result.payload.get("text", ""),
+                        "char_start": result.payload.get("char_start"),
+                        "char_end": result.payload.get("char_end"),
+                        "tokens": result.payload.get("tokens"),
+                        "filename": result.payload.get("filename", "unknown"),
                         "created_at": result.payload.get("created_at")
                     }
                 }

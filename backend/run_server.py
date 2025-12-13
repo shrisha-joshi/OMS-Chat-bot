@@ -1,46 +1,20 @@
-"""
-Direct server runner that bypasses uvicorn CLI to avoid Python 3.13 lifespan issues.
-"""
-import asyncio
-import signal
-import sys
 import uvicorn
-
-# Disable KeyboardInterrupt during import and startup
-def signal_handler(sig, frame):
-    """Ignore SIGINT during critical sections"""
-    pass
-
-# Temporarily ignore Ctrl+C during imports
-original_handler = signal.signal(signal.SIGINT, signal_handler)
-
-try:
-    from app.main import app
-finally:
-    # Restore original handler after import
-    signal.signal(signal.SIGINT, original_handler)
+import os
+import sys
 
 if __name__ == "__main__":
-    print("=" * 80)
-    print("Starting OMS Chatbot Backend Server")
-    print("=" * 80)
-    print("Server: http://127.0.0.1:8000")
-    print("API Docs: http://127.0.0.1:8000/docs")
-    print("Press Ctrl+C to stop")
-    print("=" * 80)
-    print()
+    # Add the current directory to sys.path
+    sys.path.append(os.path.dirname(os.path.abspath(__file__)))
     
-    try:
-        # Run server directly without uvicorn CLI
-        config = uvicorn.Config(
-            app=app,
-            host="127.0.0.1",
-            port=8000,
-            reload=False,  # Disable reload in Python 3.13 to avoid issues
-            log_level="info"
-        )
-        server = uvicorn.Server(config)
-        asyncio.run(server.serve())
-    except KeyboardInterrupt:
-        print("\nShutting down gracefully...")
-        sys.exit(0)
+    print("🚀 Starting OMS Chat Bot Backend...")
+    print("   Host: 127.0.0.1")
+    print("   Port: 8000")
+    print("   Reload: True")
+    
+    uvicorn.run(
+        "app.main:app",
+        host="127.0.0.1",
+        port=8000,
+        reload=True,
+        log_level="info"
+    )

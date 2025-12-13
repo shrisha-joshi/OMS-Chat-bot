@@ -180,7 +180,7 @@ class AuthService:
 auth_service = AuthService()
 
 
-async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> Dict[str, Any]:
+def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> Dict[str, Any]:
     """
     Dependency to get current authenticated user from JWT token.
     
@@ -211,11 +211,33 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
         return user_data
         
     except Exception as e:
-        logger.error(f"Authentication failed: {e}")
+        logger.error(f"Authentication error: {e}")
         raise credentials_exception
 
+def require_admin(current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    """
+    Dependency to require admin role for protected endpoints.
+    
+    Args:
+        current_user: Current authenticated user from get_current_user
+    
+    Returns:
+        Current user data if admin
+    
+    Raises:
+        HTTPException: If user is not an admin
+    """
+    if current_user.get("role") != "admin":
+        logger.warning(f"Access denied: User {current_user.get('username')} is not admin")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin access required"
+        )
+    
+    return current_user
 
-async def require_admin_role(current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+
+def require_admin_role(current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
     """
     Dependency that requires admin role.
     
@@ -237,7 +259,7 @@ async def require_admin_role(current_user: Dict[str, Any] = Depends(get_current_
     return current_user
 
 
-async def require_permission(permission: str):
+def require_permission(permission: str):
     """
     Factory function to create permission-checking dependencies.
     
