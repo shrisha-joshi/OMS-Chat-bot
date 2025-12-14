@@ -34,6 +34,8 @@ venv.bak/
 .env.development.local
 .env.test.local
 .env.production.local
+.env.backup*
+.env.*.backup
 
 # Node.js
 node_modules/
