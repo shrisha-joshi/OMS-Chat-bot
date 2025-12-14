@@ -14,12 +14,15 @@ Run with: pytest backend/tests/test_document_training_e2e.py -v -s
 """
 
 import pytest
+import pytest_asyncio
 import asyncio
 import tempfile
 import os
 from pathlib import Path
 from io import BytesIO
 import base64
+from bson import ObjectId
+import uuid
 
 # Add backend to path for imports
 import sys
@@ -29,8 +32,8 @@ from app.config import Settings
 from app.core.db_mongo import MongoDBClient
 from app.core.db_qdrant import QdrantDBClient
 from app.core.cache_redis import RedisClient
-from app.services.chat_service import ChatService
-from app.services.ingest_service import IngestService
+from app.services.retrieval_engine import RetrievalEngine
+from app.services.ingestion_engine import IngestionEngine
 from app.api.chat import ChatRequest
 
 
@@ -38,86 +41,102 @@ from app.api.chat import ChatRequest
 # Test Fixtures (Setup/Teardown)
 # ============================================================================
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def settings():
     """Load test settings from environment"""
     return Settings()
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def mongo_client(settings):
     """Create and connect MongoDB client for tests"""
-    client = MongoDBClient(settings.mongodb_uri)
+    client = MongoDBClient()
+    # Override settings if needed, but MongoDBClient uses global settings usually.
+    # Here we might need to patch settings or just rely on env vars.
     await client.connect()
     yield client
     # Cleanup: drop test collections
     if client.client:
         try:
-            db = client.client.get_database(settings.mongodb_database_name)
+            db = client.client.get_database(settings.mongodb_db) # Use correct attribute
             await db.documents.drop()
-            await db.document_chunks.drop()
+            await db.chunks.drop()
             await db.document_images.drop()
             await db.validation_logs.drop()
-            await db.ingest_logs.drop()
+            await db.ingestion_logs.drop()
         except Exception as e:
             print(f"Cleanup error: {e}")
-    await client.disconnect()
+    client.disconnect()
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def qdrant_client(settings):
     """Create and connect Qdrant client for tests"""
-    client = QdrantDBClient(settings.qdrant_url)
+    client = QdrantDBClient()
     await client.connect()
     
-    # Create test collection if it doesn't exist
+    # Use unique collection name to avoid dimension conflicts
+    collection_name = f"test_documents_{uuid.uuid4().hex}"
+    
+    # Create test collection
     try:
-        await client.create_collection(
-            collection_name="test_documents",
-            vector_size=384,
-            distance="Cosine"
-        )
-    except Exception:
-        pass  # Collection might already exist
+        from qdrant_client.models import VectorParams, Distance
+        if client.client:
+            await asyncio.to_thread(
+                client.client.recreate_collection,
+                collection_name=collection_name,
+                vectors_config=VectorParams(size=settings.embedding_dimension, distance=Distance.COSINE)
+            )
+    except Exception as e:
+        print(f"Collection creation error: {e}")
+        pass
+    
+    # Patch the client to use this collection
+    client.collection_name = collection_name
     
     yield client
     
     # Cleanup: delete test collection
     try:
-        await client.delete_collection("test_documents")
+        if client.client:
+            await asyncio.to_thread(client.client.delete_collection, collection_name)
     except Exception as e:
         print(f"Cleanup error: {e}")
     
     await client.disconnect()
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def redis_client(settings):
     """Create and connect Redis client for tests"""
-    client = RedisClient(settings.redis_url)
+    client = RedisClient()
     await client.connect()
     yield client
     await client.disconnect()
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def ingest_service(mongo_client, qdrant_client, redis_client):
-    """Create IngestService with test clients"""
-    service = IngestService()
+    """Create IngestionEngine with test clients"""
+    service = IngestionEngine()
     # Mock the client getters
     service.mongo_client = mongo_client
     service.qdrant_client = qdrant_client
-    service.redis_client = redis_client
+    # service.redis_client = redis_client
+    from app.core.model_manager import get_model_manager
+    service.model_manager = await get_model_manager()
     return service
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def chat_service(mongo_client, qdrant_client):
-    """Create ChatService with test clients"""
-    service = ChatService()
+    """Create RetrievalEngine with test clients"""
+    service = RetrievalEngine()
     # Mock the client getters
     service.mongo_client = mongo_client
     service.qdrant_client = qdrant_client
+    from app.core.model_manager import get_model_manager
+    service.model_manager = await get_model_manager()
     return service
 
 
@@ -176,31 +195,42 @@ def create_test_pdf() -> bytes:
         )
 
 
-async def upload_test_document(ingest_service: IngestService, filename: str, content: bytes) -> str:
+async def upload_test_document(ingest_service: IngestionEngine, filename: str, content: bytes) -> str:
     """
     Upload a test document and return document ID
     
     Args:
-        ingest_service: IngestService instance
+        ingest_service: IngestionEngine instance
         filename: Document filename
         content: Document content as bytes
         
     Returns:
         Document ID from MongoDB
     """
-    # Write to temporary file
+    # Write to temporary file (not strictly needed for IngestionEngine but good for simulation)
     # Note: Sync file ops acceptable in test setup
     with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp:
         tmp.write(content)
         tmp_path = tmp.name
     
     try:
-        # Call ingest service
-        doc_id = await ingest_service.process_document(
-            file_path=tmp_path,
+        # 1. Save document to MongoDB first (IngestionEngine expects doc_id)
+        # We need to access mongo_client from ingest_service or pass it in
+        mongo_client = ingest_service.mongo_client
+        
+        doc_id = await mongo_client.save_document(
             filename=filename,
-            file_ext=".pdf"
+            content=content,
+            content_type="application/pdf",
+            size=len(content)
         )
+        
+        # 2. Call ingest service
+        success = await ingest_service.process_document(doc_id)
+        
+        if not success:
+            raise RuntimeError("Document processing failed")
+            
         return doc_id
     finally:
         # Cleanup temp file
@@ -218,8 +248,9 @@ class TestPhase2DocumentTraining:
     @pytest.mark.asyncio
     async def test_document_upload_and_processing(
         self, 
-        ingest_service: IngestService,
-        mongo_client: MongoDBClient
+        ingest_service: IngestionEngine,
+        mongo_client: MongoDBClient,
+        settings: Settings
     ):
         """
         Test 1: Document Upload and Processing
@@ -246,21 +277,21 @@ class TestPhase2DocumentTraining:
         print(f"✓ Document uploaded successfully: {doc_id}")
         
         # Verify document in MongoDB
-        db = mongo_client.client.get_database(mongo_client.settings.mongodb_database_name)
-        doc = await db.documents.find_one({"_id": doc_id})
+        db = mongo_client.client.get_database(settings.mongodb_db)
+        doc = await db.documents.find_one({"_id": ObjectId(doc_id)})
         
         assert doc is not None, "Document should exist in MongoDB"
         assert doc.get("filename") == "test_document.pdf"
-        assert doc.get("status") == "PROCESSED"
-        print(f"✓ Document stored in MongoDB with status: {doc.get('status')}")
+        assert doc.get("ingest_status") == "PROCESSED"
+        print(f"✓ Document stored in MongoDB with status: {doc.get('ingest_status')}")
         
         # Verify chunks created
-        chunks = await db.document_chunks.find({"doc_id": doc_id}).to_list(None)
+        chunks = await db.chunks.find({"doc_id": doc_id}).to_list(None)
         assert len(chunks) > 0, "Document chunks should be created"
         print(f"✓ Document chunks created: {len(chunks)} chunks")
         
         # Verify ingestion logs
-        ingest_logs = await db.ingest_logs.find({"doc_id": doc_id}).to_list(None)
+        ingest_logs = await db.ingestion_logs.find({"doc_id": doc_id}).to_list(None)
         assert len(ingest_logs) > 0, "Ingestion logs should be created"
         print(f"✓ Ingestion logs created: {len(ingest_logs)} log entries")
     
@@ -268,8 +299,9 @@ class TestPhase2DocumentTraining:
     @pytest.mark.asyncio
     async def test_image_extraction_from_pdf(
         self,
-        ingest_service: IngestService,
-        mongo_client: MongoDBClient
+        ingest_service: IngestionEngine,
+        mongo_client: MongoDBClient,
+        settings: Settings
     ):
         """
         Test 2: Image Extraction from PDF
@@ -292,7 +324,7 @@ class TestPhase2DocumentTraining:
         )
         
         # Check for extracted images
-        db = mongo_client.client.get_database(mongo_client.settings.mongodb_database_name)
+        db = mongo_client.client.get_database(settings.mongodb_db)
         images = await db.document_images.find({"doc_id": doc_id}).to_list(None)
         
         # Image extraction is optional - may fail if pdf2image not installed
@@ -313,9 +345,10 @@ class TestPhase2DocumentTraining:
     @pytest.mark.asyncio
     async def test_document_chunks_and_embeddings(
         self,
-        ingest_service: IngestService,
+        ingest_service: IngestionEngine,
         qdrant_client: QdrantDBClient,
-        mongo_client: MongoDBClient
+        mongo_client: MongoDBClient,
+        settings: Settings
     ):
         """
         Test 3: Document Chunks and Embeddings
@@ -336,22 +369,22 @@ class TestPhase2DocumentTraining:
         )
         
         # Verify chunks in MongoDB
-        db = mongo_client.client.get_database(mongo_client.settings.mongodb_database_name)
-        chunks = await db.document_chunks.find({"doc_id": doc_id}).to_list(None)
+        db = mongo_client.client.get_database(settings.mongodb_db)
+        chunks = await db.chunks.find({"doc_id": doc_id}).to_list(None)
         
         assert len(chunks) > 0, "Should have at least one chunk"
         print(f"✓ Chunks created: {len(chunks)}")
         
         # Verify chunk metadata
         chunk = chunks[0]
-        assert chunk.get("content") is not None, "Chunk should have content"
-        assert chunk.get("chunk_number") is not None, "Chunk should have chunk number"
+        assert chunk.get("text") is not None, "Chunk should have content"
+        assert chunk.get("chunk_index") is not None, "Chunk should have chunk number"
         assert chunk.get("doc_id") == doc_id, "Chunk should reference correct document"
-        print(f"✓ Chunk 1 metadata valid: {len(chunk.get('content', ''))} chars")
+        print(f"✓ Chunk 1 metadata valid: {len(chunk.get('text', ''))} chars")
         
         # Verify embeddings in Qdrant (if available)
         try:
-            collection_info = await qdrant_client.get_collection_info("test_documents")
+            collection_info = await qdrant_client.get_collection_info()
             if collection_info and collection_info.get('points_count', 0) > 0:
                 print(f"✓ Embeddings stored in Qdrant: {collection_info.get('points_count')} points")
             else:
@@ -363,7 +396,8 @@ class TestPhase2DocumentTraining:
     @pytest.mark.asyncio
     async def test_validation_logging(
         self,
-        mongo_client: MongoDBClient
+        mongo_client: MongoDBClient,
+        settings: Settings
     ):
         """
         Test 4: Validation Logging Infrastructure
@@ -375,7 +409,7 @@ class TestPhase2DocumentTraining:
         """
         print("\n[TEST 4] Validation Logging Infrastructure")
         
-        db = mongo_client.client.get_database(mongo_client.settings.mongodb_database_name)
+        db = mongo_client.client.get_database(settings.mongodb_db)
         
         # Create test validation log
         test_log = {

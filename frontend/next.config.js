@@ -38,9 +38,46 @@ const nextConfig = {
     pagesBufferLength: 5,
   },
   
-  // Headers for CORS during development
+  // Headers for CORS and CSP during development
   async headers() {
+    // CSP policy to prevent eval() and unsafe inline scripts in production
+    const ContentSecurityPolicy = `
+      default-src 'self';
+      script-src 'self' 'unsafe-eval' 'unsafe-inline';
+      style-src 'self' 'unsafe-inline';
+      img-src 'self' data: blob:;
+      font-src 'self' data:;
+      connect-src 'self' http://localhost:* ws://localhost:* http://127.0.0.1:* ws://127.0.0.1:*;
+      frame-src 'none';
+      object-src 'none';
+    `.replaceAll(/\s{2,}/g, ' ').trim();
+    
     return [
+      {
+        source: '/:path*',
+        headers: [
+          {
+            key: 'Content-Security-Policy',
+            value: ContentSecurityPolicy
+          },
+          {
+            key: 'X-Content-Type-Options',
+            value: 'nosniff'
+          },
+          {
+            key: 'X-Frame-Options',
+            value: 'DENY'
+          },
+          {
+            key: 'X-XSS-Protection',
+            value: '1; mode=block'
+          },
+          {
+            key: 'Referrer-Policy',
+            value: 'strict-origin-when-cross-origin'
+          }
+        ]
+      },
       {
         source: '/api/:path*',
         headers: [

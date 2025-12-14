@@ -11,6 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from contextlib import asynccontextmanager
 import logging
 import asyncio
+import os
 from typing import AsyncGenerator
 from datetime import datetime, timezone
 
@@ -413,27 +414,55 @@ app = FastAPI(
 )
 
 # Add middleware with proper CORS for WebSocket + HTTP
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
+# SECURITY: Use environment variable for allowed origins in production
+cors_origins_str = os.getenv("CORS_ALLOWED_ORIGINS", "")
+if cors_origins_str:
+    # Production: use explicit whitelist from environment
+    allowed_origins = [origin.strip() for origin in cors_origins_str.split(",") if origin.strip()]
+    logger.info(f"CORS: Using {len(allowed_origins)} whitelisted origins from environment")
+elif settings.debug_mode:
+    # Development: allow common localhost variations
+    allowed_origins = [
         "http://localhost:3000",
         "http://localhost:3001",
         "http://127.0.0.1:3000",
         "http://127.0.0.1:3001",
-        "http://0.0.0.0:3000",
-        "http://0.0.0.0:8000",
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
         "ws://localhost:3000",
         "ws://127.0.0.1:3000",
         "ws://localhost:8000",
         "ws://127.0.0.1:8000",
-        settings.next_public_api_base
-    ],
+        settings.frontend_url,
+    ]
+    logger.warning("CORS: Using development origins (localhost). Set CORS_ALLOWED_ORIGINS for production!")
+else:
+    # Production without explicit whitelist: only allow configured frontend
+    allowed_origins = [settings.frontend_url]
+    logger.warning(f"CORS: Only allowing {settings.frontend_url}. Set CORS_ALLOWED_ORIGINS for multiple origins.")
+
+# Security validation: Never allow credentials with wildcard
+if "*" in allowed_origins:
+    raise ValueError("SECURITY ERROR: Cannot use '*' in CORS origins with credentials=True. Use explicit whitelist.")
+
+# Remove duplicates and filter out dangerous origins
+allowed_origins = list(set([
+    origin for origin in allowed_origins 
+    if origin and not origin.startswith("http://0.0.0.0") and not origin.startswith("ws://0.0.0.0")
+]))
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=["*"],
     expose_headers=["*"],
     max_age=3600,
 )
+
+logger.info(f"✅ CORS configured with {len(allowed_origins)} origins")
+logger.debug(f"Allowed origins: {allowed_origins}")
 
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 

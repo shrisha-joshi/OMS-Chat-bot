@@ -173,6 +173,7 @@ from ..utils.json_sanitizer import validate_json_file
 from ..config import settings
 from ..services.auth_service import require_admin
 from ..services.ingestion_engine import get_ingestion_engine
+from ..utils.input_validation import validate_filename, validate_file_size, validate_document_id
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -289,7 +290,8 @@ async def upload_document_multipart(
     background_tasks: BackgroundTasks = BackgroundTasks(),
     mongo_client: MongoDBClient = Depends(get_mongodb_client),
     redis_client = Depends(lambda: None),  # Optional Redis dependency
-    sync_processing: bool = False
+    sync_processing: bool = False,
+    current_user: Dict = Depends(require_admin)  # SECURITY: Admin authentication required
 ):
     """
     Accept a multipart/form-data file, save to MongoDB, and queue for processing.
@@ -357,7 +359,8 @@ async def upload_document_multipart(
 @router.post("/documents/{doc_id}/reprocess")
 async def reprocess_document(
     doc_id: str,
-    mongo_client: MongoDBClient = Depends(get_mongodb_client)
+    mongo_client: MongoDBClient = Depends(get_mongodb_client),
+    current_user: Dict = Depends(require_admin)
 ):
     """Manually trigger document reprocessing (synchronous for testing)."""
     try:
@@ -404,10 +407,12 @@ async def upload_document_json(
     payload: UploadJSONRequest,
     background_tasks: BackgroundTasks = BackgroundTasks(),
     mongo_client: MongoDBClient = Depends(get_mongodb_client),
-    sync_processing: bool = False  # New parameter for synchronous processing
+    sync_processing: bool = False,  # New parameter for synchronous processing
+    current_user: Dict = Depends(require_admin)  # SECURITY: Admin authentication required
 ):
     """
     Accept JSON payload with base64-encoded content.
+    SECURITY: Requires admin authentication via JWT token.
     
     Args:
         sync_processing: If True, process document synchronously before returning.
@@ -764,10 +769,12 @@ async def list_documents(
     skip: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=100),
     uploader: Optional[str] = Query(None),
-    status: Optional[str] = Query(None)
+    status: Optional[str] = Query(None),
+    current_user: Dict = Depends(require_admin)  # SECURITY: Admin authentication required
 ) -> Dict[str, Any]:
     """
     List all uploaded documents with metadata.
+    SECURITY: Requires admin authentication via JWT token.
     
     **Query Parameters:**
     - skip: Number of documents to skip (pagination)
@@ -903,10 +910,12 @@ async def _get_ingestion_logs(mongo_client: MongoDBClient, doc_id: str) -> List[
 @router.get("/documents/status/{doc_id}")
 async def get_document_status(
     doc_id: str,
-    mongo_client: MongoDBClient = Depends(get_mongodb_client)
+    mongo_client: MongoDBClient = Depends(get_mongodb_client),
+    current_user: Dict = Depends(require_admin)  # SECURITY: Admin authentication required
 ) -> Dict[str, Any]:
     """
     Get detailed processing status for a document.
+    SECURITY: Requires admin authentication via JWT token.
     
     **Path Parameters:**
     - doc_id: Document ID to get status for

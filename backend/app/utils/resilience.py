@@ -325,6 +325,60 @@ def circuit_breaker(
     return decorator
 
 
+def _calculate_backoff_delay(attempt: int, initial_delay: float, exponential_base: float, max_delay: float) -> float:
+    """Calculate exponential backoff delay."""
+    return min(initial_delay * (exponential_base ** attempt), max_delay)
+
+
+def _log_retry_attempt(func_name: str, attempt: int, max_attempts: int, error: Exception, delay: float):
+    """Log retry attempt information."""
+    logger.warning(
+        f"Function {func_name} attempt {attempt + 1}/{max_attempts} "
+        f"failed: {error}. Retrying in {delay:.1f}s..."
+    )
+
+
+def _log_final_failure(func_name: str, max_attempts: int, error: Exception):
+    """Log final failure after all retries exhausted."""
+    logger.error(f"Function {func_name} failed after {max_attempts} attempts: {error}")
+
+
+def _create_async_retry_wrapper(func, max_attempts, initial_delay, exponential_base, max_delay, exceptions):
+    """Create async wrapper with retry logic."""
+    @functools.wraps(func)
+    async def async_wrapper(*args, **kwargs):
+        for attempt in range(max_attempts):
+            try:
+                return await func(*args, **kwargs)
+            except exceptions as e:
+                if attempt == max_attempts - 1:
+                    _log_final_failure(func.__name__, max_attempts, e)
+                    raise
+                
+                delay = _calculate_backoff_delay(attempt, initial_delay, exponential_base, max_delay)
+                _log_retry_attempt(func.__name__, attempt, max_attempts, e, delay)
+                await asyncio.sleep(delay)
+    return async_wrapper
+
+
+def _create_sync_retry_wrapper(func, max_attempts, initial_delay, exponential_base, max_delay, exceptions):
+    """Create sync wrapper with retry logic."""
+    @functools.wraps(func)
+    def sync_wrapper(*args, **kwargs):
+        for attempt in range(max_attempts):
+            try:
+                return func(*args, **kwargs)
+            except exceptions as e:
+                if attempt == max_attempts - 1:
+                    _log_final_failure(func.__name__, max_attempts, e)
+                    raise
+                
+                delay = _calculate_backoff_delay(attempt, initial_delay, exponential_base, max_delay)
+                _log_retry_attempt(func.__name__, attempt, max_attempts, e, delay)
+                time.sleep(delay)
+    return sync_wrapper
+
+
 def retry_with_backoff(
     max_attempts: int = 3,
     initial_delay: float = 1.0,
@@ -343,68 +397,10 @@ def retry_with_backoff(
         exceptions: Tuple of exceptions to catch
     """
     def decorator(func: Callable[P, T]) -> Callable[P, T]:
-        @functools.wraps(func)
-        async def async_wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
-            last_exception = None
-            
-            for attempt in range(max_attempts):
-                try:
-                    return await func(*args, **kwargs)
-                except exceptions as e:
-                    last_exception = e
-                    
-                    if attempt == max_attempts - 1:
-                        logger.error(
-                            f"Function {func.__name__} failed after {max_attempts} attempts: {e}"
-                        )
-                        raise
-                    
-                    # Calculate delay with exponential backoff
-                    delay = min(
-                        initial_delay * (exponential_base ** attempt),
-                        max_delay
-                    )
-                    
-                    logger.warning(
-                        f"Function {func.__name__} attempt {attempt + 1}/{max_attempts} "
-                        f"failed: {e}. Retrying in {delay:.1f}s..."
-                    )
-                    
-                    await asyncio.sleep(delay)
-            
-            raise last_exception
-        
-        @functools.wraps(func)
-        def sync_wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
-            last_exception = None
-            
-            for attempt in range(max_attempts):
-                try:
-                    return func(*args, **kwargs)
-                except exceptions as e:
-                    last_exception = e
-                    
-                    if attempt == max_attempts - 1:
-                        logger.error(
-                            f"Function {func.__name__} failed after {max_attempts} attempts: {e}"
-                        )
-                        raise
-                    
-                    delay = min(
-                        initial_delay * (exponential_base ** attempt),
-                        max_delay
-                    )
-                    
-                    logger.warning(
-                        f"Function {func.__name__} attempt {attempt + 1}/{max_attempts} "
-                        f"failed: {e}. Retrying in {delay:.1f}s..."
-                    )
-                    
-                    time.sleep(delay)
-            
-            raise last_exception
-        
-        return async_wrapper if asyncio.iscoroutinefunction(func) else sync_wrapper
+        if asyncio.iscoroutinefunction(func):
+            return _create_async_retry_wrapper(func, max_attempts, initial_delay, exponential_base, max_delay, exceptions)
+        else:
+            return _create_sync_retry_wrapper(func, max_attempts, initial_delay, exponential_base, max_delay, exceptions)
     
     return decorator
 

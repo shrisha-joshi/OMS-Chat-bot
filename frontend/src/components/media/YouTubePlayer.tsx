@@ -36,9 +36,13 @@ const YouTubePlayer: React.FC<YouTubePlayerProps> = ({
     const exitFullscreen = async () => {
       if (document.exitFullscreen) {
         await document.exitFullscreen();
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       } else if ((document as any).webkitExitFullscreen) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
         (document as any).webkitExitFullscreen();
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       } else if ((document as any).msExitFullscreen) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
         (document as any).msExitFullscreen();
       }
       setIsFullscreen(false);
@@ -47,9 +51,13 @@ const YouTubePlayer: React.FC<YouTubePlayerProps> = ({
     const enterFullscreen = async () => {
       if (containerRef.requestFullscreen) {
         await containerRef.requestFullscreen();
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       } else if ((containerRef as any).webkitRequestFullscreen) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
         (containerRef as any).webkitRequestFullscreen();
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       } else if ((containerRef as any).msRequestFullscreen) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
         (containerRef as any).msRequestFullscreen();
       }
       setIsFullscreen(true);

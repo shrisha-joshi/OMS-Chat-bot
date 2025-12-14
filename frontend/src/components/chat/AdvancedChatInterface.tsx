@@ -3,7 +3,7 @@
 import React, { useState, useRef, useEffect } from 'react'
 import { useChat } from '@/contexts/ChatContext'
 import { useAuth } from '@/contexts/AuthContext'
-import { Send, Paperclip, Mic, StopCircle, Upload, FileText, Image, Bot, User, ExternalLink, Copy, ThumbsUp, ThumbsDown, BarChart3, Clock, Zap, Target, Brain, MessageSquare, Star } from 'lucide-react'
+import { Send, Paperclip, Mic, StopCircle, Upload, FileText, Image as ImageIcon, Bot, User, ExternalLink, Copy, ThumbsUp, ThumbsDown, BarChart3, Clock, Zap, Target, Brain, MessageSquare, Star } from 'lucide-react'
 
 interface Message {
   id: string
@@ -305,7 +305,7 @@ export function AdvancedChatInterface() {
                           {msg.attachments.map((attachment, idx) => (
                             <div key={`attachment-${msg.id}-${idx}`} className="flex items-center space-x-2 p-2 bg-gray-50 rounded border">
                               {attachment.type.startsWith('image') ? (
-                                <Image className="w-4 h-4 text-gray-500" />
+                                <ImageIcon className="w-4 h-4 text-gray-500" />
                               ) : (
                                 <FileText className="w-4 h-4 text-gray-500" />
                               )}

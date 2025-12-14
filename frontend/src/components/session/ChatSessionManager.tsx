@@ -12,8 +12,7 @@ import {
   Archive, 
   Star,
   Clock,
-  FileText,
-  Users
+  FileText
 } from 'lucide-react'
 
 interface ChatSessionManagerProps {
@@ -51,10 +50,12 @@ export function ChatSessionManager({ className = '' }: ChatSessionManagerProps) 
     }
   }
 
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const getSessionStats = (session: any) => {
     return {
       messageCount: session.messages?.length || 0,
       lastActivity: session.updated_at || session.created_at,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       hasAttachments: session.messages?.some((msg: any) => msg.attachments?.length > 0) || false
     }
   }

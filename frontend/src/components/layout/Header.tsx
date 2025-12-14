@@ -1,7 +1,9 @@
 'use client'
 
 import { useRouter } from 'next/navigation'
+import SystemStatus from './SystemStatus'
 
+// eslint-disable-next-line @typescript-eslint/no-empty-object-type
 export interface HeaderProps {}
 
 export function Header() {
@@ -13,7 +15,10 @@ export function Header() {
 
   return (
     <header style={{ padding: '16px 24px', background: 'white', borderBottom: '1px solid #e9ecef', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-      <h1 style={{ margin: 0, fontSize: '20px', fontWeight: 600 }}>OMS Chatbot</h1>
+      <div className="flex items-center gap-4">
+        <h1 style={{ margin: 0, fontSize: '20px', fontWeight: 600 }}>OMS Chatbot</h1>
+        <SystemStatus />
+      </div>
       <div style={{ display: 'flex', gap: '12px', alignItems: 'center' }}>
         <button 
           onClick={handleAdminClick}

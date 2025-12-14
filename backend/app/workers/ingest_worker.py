@@ -14,7 +14,7 @@ from ..core.db_mongo import get_mongodb_client, MongoDBClient
 from ..core.db_qdrant import get_qdrant_client, QdrantDBClient
 from ..core.db_arango import get_arango_client, ArangoDBClient
 from ..core.cache_redis import get_redis_client, RedisClient
-from ..services.ingest_service import IngestService
+from ..services.ingestion_engine import get_ingestion_engine
 from ..config import settings
 
 
@@ -45,8 +45,8 @@ class IngestWorker:
             
         try:
             logger.info("Lazy-initializing ingest worker services...")
-            self.ingest_service = IngestService()
-            await self.ingest_service.initialize()
+            self.ingest_service = await get_ingestion_engine()
+            # await self.ingest_service.initialize() # Already initialized by get_ingestion_engine
             self._initialized = True
             logger.info("Ingest worker initialized successfully")
         except Exception as e:

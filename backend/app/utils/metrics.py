@@ -82,7 +82,8 @@ class MetricsCollector:
         if metric_name not in self.metrics:
             return {}
         
-        cutoff = datetime.utcnow() - timedelta(minutes=minutes)
+        from datetime import timezone
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=minutes)
         recent_metrics = [
             m for m in self.metrics[metric_name]
             if m.timestamp > cutoff

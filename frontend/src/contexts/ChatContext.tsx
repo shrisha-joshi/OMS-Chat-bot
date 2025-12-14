@@ -1,6 +1,6 @@
 'use client'
 
-import React, { createContext, useContext, useState, useEffect, ReactNode } from 'react'
+import React, { createContext, useContext, useState, useEffect, ReactNode, useCallback } from 'react'
 
 interface ChatMessage {
   id: string
@@ -80,7 +80,7 @@ export function ChatProvider({ children }: Readonly<{ children: ReactNode }>) {
     }
   }, [sessions])
 
-  const createNewSession = (): ChatSession => {
+  const createNewSession = useCallback((): ChatSession => {
     const newSession: ChatSession = {
       id: `session_${Date.now()}`,
       title: 'New Chat',
@@ -92,16 +92,16 @@ export function ChatProvider({ children }: Readonly<{ children: ReactNode }>) {
     setSessions(prev => [newSession, ...prev])
     setCurrentSession(newSession)
     return newSession
-  }
+  }, [])
 
-  const switchSession = (sessionId: string) => {
+  const switchSession = useCallback((sessionId: string) => {
     const session = sessions.find(s => s.id === sessionId)
     if (session) {
       setCurrentSession(session)
     }
-  }
+  }, [sessions])
 
-  const sendMessage = async (content: string) => {
+  const sendMessage = useCallback(async (content: string) => {
     if (!currentSession || isProcessing || !content.trim()) return
 
     // Add user message
@@ -236,15 +236,15 @@ export function ChatProvider({ children }: Readonly<{ children: ReactNode }>) {
     } finally {
       setIsProcessing(false)
     }
-  }
+  }, [currentSession, isProcessing])
 
-  const clearSessions = () => {
+  const clearSessions = useCallback(() => {
     setSessions([])
     setCurrentSession(null)
     if (globalThis.window !== undefined) {
       localStorage.removeItem('chat_sessions')
     }
-  }
+  }, [])
 
   const value = React.useMemo(() => ({
     sessions,
@@ -255,7 +255,7 @@ export function ChatProvider({ children }: Readonly<{ children: ReactNode }>) {
     switchSession,
     sendMessage,
     clearSessions
-  }), [sessions, currentSession, isConnected, isProcessing])
+  }), [sessions, currentSession, isConnected, isProcessing, createNewSession, switchSession, sendMessage, clearSessions])
 
   return (
     <ChatContext.Provider value={value}>

@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from app.core.db_qdrant import get_qdrant_client
 from app.core.db_mongo import get_mongodb_client
-from app.services.ingest_service import get_ingest_service
+from app.services.ingestion_engine import get_ingestion_engine
 from app.config import settings
 
 logging.basicConfig(
@@ -46,8 +46,8 @@ class EmbeddingModelUpgrader:
         logger.info("Initializing database connections...")
         self.qdrant_client = await get_qdrant_client()
         self.mongo_client = get_mongodb_client()
-        self.ingest_service = get_ingest_service()
-        await self.ingest_service.initialize()
+        self.ingest_service = await get_ingestion_engine()
+        # await self.ingest_service.initialize() # Already initialized
         logger.info("✅ Database connections established")
     
     async def backup_collection(self):
@@ -206,7 +206,7 @@ class EmbeddingModelUpgrader:
             await asyncio.sleep(1)
         
         logger.info("=" * 60)
-        logger.info(f"✅ Re-indexing complete!")
+        logger.info("✅ Re-indexing complete!")
         logger.info(f"  Success: {success_count}/{len(documents)}")
         logger.info(f"  Failed: {fail_count}/{len(documents)}")
         logger.info("=" * 60)
@@ -300,7 +300,7 @@ class EmbeddingModelUpgrader:
                 logger.info(f"  Documents processed: {success_count}")
                 logger.info(f"  Duration: {duration:.1f} seconds")
                 logger.info(f"  Backup ID: {backup_id}")
-                logger.info("  Expected improvement: +18-25% retrieval quality")
+                logger.info("  Expected improvement: +18-25%% retrieval quality")
                 logger.info("=" * 60)
             elif fail_count > 0:
                 logger.warning("=" * 60)

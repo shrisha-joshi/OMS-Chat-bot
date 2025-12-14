@@ -49,10 +49,49 @@ class Settings(BaseSettings):
     neo4j_disabled: bool = Field(default=False, alias="NEO4J_DISABLED")
     
     # Security
-    jwt_secret_key: str = Field(default="test-secret-key-for-development-min-32-chars", alias="JWT_SECRET_KEY")
+    # CRITICAL: Change these in production! Generate with: openssl rand -hex 32
+    jwt_secret_key: str = Field(
+        default="test-secret-key-for-development-min-32-chars",
+        alias="JWT_SECRET_KEY",
+        description="JWT secret key (MUST be changed in production)"
+    )
     jwt_algorithm: str = Field(default="HS256", alias="JWT_ALGORITHM")
     access_token_expire_minutes: int = Field(default=60, alias="ACCESS_TOKEN_EXPIRE_MINUTES")
-    admin_password: str = Field(default="admin123", alias="ADMIN_PASSWORD")
+    # CRITICAL: Change admin password in production! Minimum 16 characters, mixed case, numbers, symbols
+    admin_password: str = Field(
+        default="admin123",
+        alias="ADMIN_PASSWORD",
+        description="Admin password (MUST be changed in production, min 16 chars)"
+    )
+    
+    def validate_security_settings(self):
+        """Validate security settings and warn about insecure defaults."""
+        warnings = []
+        
+        # Check JWT secret
+        if self.jwt_secret_key == "test-secret-key-for-development-min-32-chars":
+            warnings.append("⚠️  WARNING: Using default JWT_SECRET_KEY! Generate new key: openssl rand -hex 32")
+        elif len(self.jwt_secret_key) < 32:
+            warnings.append(f"⚠️  WARNING: JWT_SECRET_KEY too short ({len(self.jwt_secret_key)} chars). Use 32+ characters.")
+        
+        # Check admin password
+        if self.admin_password == "admin123":
+            warnings.append("⚠️  WARNING: Using default ADMIN_PASSWORD! Set a strong password (16+ chars).")
+        elif len(self.admin_password) < 16:
+            warnings.append(f"⚠️  WARNING: ADMIN_PASSWORD too short ({len(self.admin_password)} chars). Use 16+ characters.")
+        
+        # Check production mode
+        if not self.debug_mode and warnings:
+            # In production, these are CRITICAL
+            raise ValueError(
+                "CRITICAL SECURITY ERROR:\n" + "\n".join(warnings) +
+                "\n\nProduction mode requires secure credentials. Set APP_ENV=development to bypass this check."
+            )
+        elif warnings:
+            # In development, just warn
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning("\n" + "="*80 + "\n" + "\n".join(warnings) + "\n" + "="*80)
     
     # LLM Configuration  
     lmstudio_api_url: str = Field(default="http://localhost:1234/v1", alias="LMSTUDIO_API_URL")
@@ -122,6 +161,9 @@ class Settings(BaseSettings):
     ai_sdk_key: Optional[str] = Field(default="", alias="AI_SDK_KEY")
     freeapi_key: Optional[str] = Field(default="", alias="FREEAPI_KEY")
     
+    # CORS Configuration (for production security)
+    cors_allowed_origins: Optional[str] = Field(default="", alias="CORS_ALLOWED_ORIGINS")
+    
     model_config = {
         "env_file": ".env",
         "env_file_encoding": "utf-8",
@@ -143,11 +185,18 @@ class Settings(BaseSettings):
         """Check if application is in debug mode."""
         return self.app_env.lower() == "development"
     
-    @property 
+    @property
     def default_temperature(self) -> float:
         """Default temperature for LLM generation."""
         return 0.7
-    
+
+
+# Create settings instance and validate security
+settings = Settings()
+
+# Validate security settings on import (fail fast in production with weak credentials)
+if hasattr(settings, 'validate_security_settings'):
+    settings.validate_security_settings()
     @property
     def default_top_p(self) -> float:
         """Default top_p for LLM generation."""

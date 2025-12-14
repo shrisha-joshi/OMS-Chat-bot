@@ -33,12 +33,12 @@ interface Message {
   tokens_generated?: number
 }
 
-interface ChatSession {
-  id: string
-  title: string
-  messages: Message[]
-  created_at: string
-}
+// interface ChatSession {
+//   id: string
+//   title: string
+//   messages: Message[]
+//   created_at: string
+// }
 
 interface ChatInterfaceProps {
   sessionId: string
@@ -212,6 +212,7 @@ export function ChatInterfaceReal({ sessionId: propSessionId }: Readonly<ChatInt
       case 'image':
         return (
           <div key={`img-${index}`} className="my-3 rounded-lg overflow-hidden max-w-xl hover:shadow-lg transition-shadow group">
+            {/* eslint-disable-next-line @next/next/no-img-element */}
             <img
               src={attachment.url}
               alt={attachment.filename || 'Image'}

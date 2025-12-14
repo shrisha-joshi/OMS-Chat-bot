@@ -19,6 +19,7 @@ from ..core.db_qdrant import get_qdrant_client, QdrantDBClient
 from ..core.cache_redis import get_redis_client, RedisClient
 from ..services.retrieval_engine import get_retrieval_engine, RetrievalEngine
 from ..config import settings
+from ..utils.input_validation import validate_query
 
 logger = logging.getLogger(__name__)
 
@@ -140,6 +141,9 @@ async def chat_query(
     """
     try:
         start_time = time.time()
+        
+        # SECURITY: Validate input to prevent XSS/injection attacks
+        request.query = validate_query(request.query, max_length=10000)
         
         # DEBUG: Log incoming request
         logger.info("=" * 80)

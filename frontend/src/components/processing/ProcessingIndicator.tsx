@@ -1,6 +1,6 @@
 'use client'
 
-import React, { useState, useEffect } from 'react'
+import React, { useState, useEffect, useCallback } from 'react'
 import { 
   Loader, 
   CheckCircle, 
@@ -42,36 +42,7 @@ export function ProcessingIndicator({
   const [startTime, setStartTime] = useState<Date | null>(null)
   const [elapsedTime, setElapsedTime] = useState(0)
 
-  // Default RAG pipeline steps
-  const defaultSteps: ProcessingStep[] = [
-    { id: 'parse', name: 'Parsing query', status: 'pending', progress: 0 },
-    { id: 'embed', name: 'Generating embeddings', status: 'pending', progress: 0 },
-    { id: 'search', name: 'Searching knowledge base', status: 'pending', progress: 0 },
-    { id: 'retrieve', name: 'Retrieving documents', status: 'pending', progress: 0 },
-    { id: 'rerank', name: 'Reranking results', status: 'pending', progress: 0 },
-    { id: 'generate', name: 'Generating response', status: 'pending', progress: 0 }
-  ]
-
-  useEffect(() => {
-    if (isVisible) {
-      setCurrentSteps(steps || defaultSteps)
-      setStartTime(new Date())
-      setElapsedTime(0)
-      simulateProcessing()
-    }
-  }, [isVisible, steps])
-
-  useEffect(() => {
-    if (!isVisible || !startTime) return
-
-    const interval = setInterval(() => {
-      setElapsedTime((Date.now() - startTime.getTime()) / 1000)
-    }, 100)
-
-    return () => clearInterval(interval)
-  }, [isVisible, startTime])
-
-  const simulateProcessing = async () => {
+  const simulateProcessing = useCallback(async () => {
     const stepOrder = ['parse', 'embed', 'search', 'retrieve', 'rerank', 'generate']
     
     for (const stepId of stepOrder) {
@@ -116,7 +87,34 @@ export function ProcessingIndicator({
     setTimeout(() => {
       onComplete?.()
     }, 500)
-  }
+  }, [onComplete])
+
+  useEffect(() => {
+    if (isVisible) {
+      const defaultSteps: ProcessingStep[] = [
+        { id: 'parse', name: 'Parsing query', status: 'pending', progress: 0 },
+        { id: 'embed', name: 'Generating embeddings', status: 'pending', progress: 0 },
+        { id: 'search', name: 'Searching knowledge base', status: 'pending', progress: 0 },
+        { id: 'retrieve', name: 'Retrieving documents', status: 'pending', progress: 0 },
+        { id: 'rerank', name: 'Reranking results', status: 'pending', progress: 0 },
+        { id: 'generate', name: 'Generating response', status: 'pending', progress: 0 }
+      ]
+      setCurrentSteps(steps || defaultSteps)
+      setStartTime(new Date())
+      setElapsedTime(0)
+      simulateProcessing()
+    }
+  }, [isVisible, steps, simulateProcessing])
+
+  useEffect(() => {
+    if (!isVisible || !startTime) return
+
+    const interval = setInterval(() => {
+      setElapsedTime((Date.now() - startTime.getTime()) / 1000)
+    }, 100)
+
+    return () => clearInterval(interval)
+  }, [isVisible, startTime])
 
   const getStepIcon = (stepId: string, status: string) => {
     if (status === 'completed') return <CheckCircle className="w-4 h-4 text-green-500" />
@@ -153,7 +151,7 @@ export function ProcessingIndicator({
           </h3>
           {currentQuery && (
             <p className="text-sm text-gray-600 line-clamp-2">
-              "{currentQuery}"
+              &quot;{currentQuery}&quot;
             </p>
           )}
         </div>

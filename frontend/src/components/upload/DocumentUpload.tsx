@@ -2,7 +2,7 @@
 
 import React, { useState, useCallback } from 'react'
 import { useDropzone } from 'react-dropzone'
-import { Upload, FileText, Image, File, X, CheckCircle, AlertCircle, Loader } from 'lucide-react'
+import { Upload, FileText, Image as ImageIcon, File, X, CheckCircle, AlertCircle, Loader } from 'lucide-react'
 import toast from 'react-hot-toast'
 
 interface UploadedFile {
@@ -21,7 +21,7 @@ interface DocumentUploadProps {
   maxSize?: number
 }
 
-export function DocumentUpload({ onUploadComplete, maxFiles = 10, maxSize = 10485760 }: DocumentUploadProps) {
+export function DocumentUpload({ onUploadComplete, maxFiles = 10, maxSize = 209715200 }: DocumentUploadProps) {
   const [uploadedFiles, setUploadedFiles] = useState<UploadedFile[]>([])
   const [isUploading, setIsUploading] = useState(false)
 
@@ -46,7 +46,7 @@ export function DocumentUpload({ onUploadComplete, maxFiles = 10, maxSize = 1048
       
       try {
         // Upload simulation
-        await simulateUpload(fileId, file)
+        await simulateUpload(fileId)
         
         // Processing simulation
         setUploadedFiles(prev => 
@@ -69,7 +69,7 @@ export function DocumentUpload({ onUploadComplete, maxFiles = 10, maxSize = 1048
         )
         
         toast.success(`${file.name} processed successfully`)
-      } catch (error) {
+      } catch {
         setUploadedFiles(prev => 
           prev.map(f => 
             f.id === fileId 
@@ -85,7 +85,7 @@ export function DocumentUpload({ onUploadComplete, maxFiles = 10, maxSize = 1048
     onUploadComplete?.(uploadedFiles)
   }, [uploadedFiles, onUploadComplete])
 
-  const simulateUpload = (fileId: string, file: File): Promise<void> => {
+  const simulateUpload = (fileId: string): Promise<void> => {
     return new Promise((resolve) => {
       let progress = 0
       const interval = setInterval(() => {
@@ -148,7 +148,7 @@ export function DocumentUpload({ onUploadComplete, maxFiles = 10, maxSize = 1048
   }
 
   const getFileIcon = (type: string) => {
-    if (type.startsWith('image/')) return <Image className="w-5 h-5" />
+    if (type.startsWith('image/')) return <ImageIcon className="w-5 h-5" />
     if (type.includes('pdf')) return <FileText className="w-5 h-5 text-red-500" />
     if (type.includes('word')) return <FileText className="w-5 h-5 text-blue-500" />
     if (type.includes('excel') || type.includes('spreadsheet')) return <FileText className="w-5 h-5 text-green-500" />

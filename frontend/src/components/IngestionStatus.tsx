@@ -7,6 +7,7 @@ interface IngestionLog {
   step: string;
   status: 'PROCESSING' | 'SUCCESS' | 'FAILED';
   message: string;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   metadata?: any;
   timestamp: string;
 }
@@ -44,49 +45,70 @@ export default function IngestionStatus({ docId, onComplete }: Readonly<Ingestio
   const [error, setError] = useState<string | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
 
-  // Helper: add a new ingestion log entry if it doesn't already exist
-  const addLogEntry = (data: any) => {
-    setLogs((prev) => {
-      const exists = prev.find((log) => log.step === data.step && log.timestamp === data.timestamp);
-      if (exists) return prev;
-      return [
-        ...prev,
-        {
-          step: data.step,
-          status: data.status,
-          message: data.message,
-          metadata: data.metadata,
-          timestamp: data.timestamp,
-        },
-      ];
-    });
-  };
-
   // Helper: process parsed websocket message
-  const handleIngestionEvent = (data: any) => {
-    if (data.type === 'ingestion_progress') {
-      addLogEntry(data);
-    } else if (data.type === 'ingestion_complete') {
-      setIsProcessing(false);
-      if (data.status === 'SUCCESS' && onComplete) {
-        onComplete();
-      } else if (data.status === 'FAILED') {
-        setError('Document ingestion failed');
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const handleIngestionEvent = React.useCallback((data: any) => {
+    if (data.type === 'progress') {
+      // Map new backend format to component state
+      setLogs((prev) => {
+        // Check if we already have this update
+        const exists = prev.find((log) => log.step === data.stage && log.status === data.status);
+        if (exists) return prev;
+        
+        // Remove any previous log for this stage to update it
+        const filtered = prev.filter(log => log.step !== data.stage);
+        
+        return [
+          ...filtered,
+          {
+            step: data.stage,
+            status: data.status,
+            message: data.message,
+            metadata: {},
+            timestamp: new Date().toISOString(),
+          },
+        ];
+      });
+
+      if (data.status === 'FAILED') {
+        setError(data.message || 'Document ingestion failed');
+        setIsProcessing(false);
+      } else if (data.stage === 'COMPLETE' || (data.stage === 'EXTRACT_ENTITIES' && data.status === 'SUCCESS')) {
+        // If we hit the last stage or explicit complete
+        if (data.stage === 'COMPLETE') {
+             setIsProcessing(false);
+             if (onComplete) onComplete();
+        }
       }
     }
-  };
+  }, [onComplete]);
 
   useEffect(() => {
     // Fetch initial status
     const fetchInitialStatus = async () => {
       try {
-        const response = await apiClient.get(`/monitoring/documents/${docId}/ingestion-status`) as any;
-        if (response.data?.logs) {
-          setLogs(response.data.logs);
+        // Use the correct admin endpoint
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const response = await apiClient.get(`/admin/documents/status/${docId}`) as any;
+        
+        if (response.stages) {
+          // Map backend stages to frontend logs format
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const mappedLogs = response.stages.map((stage: any) => ({
+            step: stage.name,
+            status: stage.status === 'PENDING' ? 'pending' : stage.status, // Handle PENDING status
+            message: stage.message,
+            metadata: stage.metadata,
+            timestamp: stage.timestamp || new Date().toISOString()
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          })).filter((l: any) => l.status !== 'PENDING'); // Only show active/completed stages
+          
+          setLogs(mappedLogs);
         }
-        if (response.data?.ingest_status === 'SUCCESS' || response.data?.ingest_status === 'FAILED') {
+        
+        if (response.ingest_status === 'completed' || response.ingest_status === 'failed') {
           setIsProcessing(false);
-          if (response.data?.ingest_status === 'SUCCESS' && onComplete) {
+          if (response.ingest_status === 'completed' && onComplete) {
             onComplete();
           }
         }
@@ -100,34 +122,67 @@ export default function IngestionStatus({ docId, onComplete }: Readonly<Ingestio
     // Connect to WebSocket for real-time updates
     // Use backend WebSocket URL from environment or default to 127.0.0.1:8000
     const WS_BASE = process.env.NEXT_PUBLIC_WS_URL || 'ws://127.0.0.1:8000';
-    const wsUrl = `${WS_BASE}/monitoring/ws/ingestion/${docId}`;
+    const wsUrl = `${WS_BASE}/ws/document/${docId}`;
     
-    try {
-      const websocket = new WebSocket(wsUrl);
-      console.log("I am here 0")
-      websocket.onmessage = (event) => {
-        try {
-          const data = JSON.parse(event.data);
-          handleIngestionEvent(data);
-        } catch (error_) {
-          console.error('Failed to parse WebSocket message:', error_);
-        }
-      };
-      console.log("I am here")
-      websocket.onerror = () => {
-        setError('WebSocket connection error');
-      };
-      console.log("I am here 2")
-  wsRef.current = websocket;
+    let websocket: WebSocket | null = null;
+    let retryCount = 0;
+    const maxRetries = 3;
 
-      return () => {
+    const connectWebSocket = () => {
+      try {
+        console.log(`🔌 Connecting to WebSocket: ${wsUrl}`);
+        websocket = new WebSocket(wsUrl);
+        
+        websocket.onopen = () => {
+          console.log('✅ WebSocket Connected');
+          setError(null);
+          retryCount = 0;
+        };
+
+        websocket.onmessage = (event) => {
+          try {
+            const data = JSON.parse(event.data);
+            handleIngestionEvent(data);
+          } catch (error_) {
+            console.error('Failed to parse WebSocket message:', error_);
+          }
+        };
+
+        websocket.onerror = (e) => {
+          console.error('WebSocket error:', e);
+          // Don't set error immediately, let retry handle it
+        };
+
+        websocket.onclose = (e) => {
+          console.log(`WebSocket closed (code: ${e.code})`);
+          if (!e.wasClean && retryCount < maxRetries && isProcessing) {
+            retryCount++;
+            const timeout = Math.min(1000 * retryCount, 5000);
+            console.log(`🔄 Retrying connection in ${timeout}ms...`);
+            setTimeout(connectWebSocket, timeout);
+          } else if (!e.wasClean) {
+             // Only show error if we exhausted retries
+             // setError('Real-time updates disconnected');
+          }
+        };
+
+        wsRef.current = websocket;
+      } catch (error_) {
+        console.error('Failed to connect WebSocket:', error_);
+        setError('Failed to connect to real-time updates');
+      }
+    };
+
+    connectWebSocket();
+
+    return () => {
+      if (websocket) {
+        console.log('🧹 Cleaning up WebSocket');
         websocket.close();
-      };
-    } catch (error_) {
-      console.error('Failed to connect WebSocket:', error_);
-      setError('Failed to connect to real-time updates');
-    }
-  }, [docId, onComplete]);
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [docId, onComplete, handleIngestionEvent]); // Removed isProcessing from deps to avoid re-connection loops
 
   const getStageStatus = (step: string) => {
     const log = logs.find((l) => l.step === step);
@@ -153,7 +208,7 @@ export default function IngestionStatus({ docId, onComplete }: Readonly<Ingestio
       )}
 
       <div className="space-y-3">
-        {stages.map((stage, index) => {
+        {stages.map((stage) => {
           const status = getStageStatus(stage);
           const log = logs.find((l) => l.step === stage);
           const icon = stageIcons[stage] || '⚙️';

@@ -65,10 +65,14 @@ const ImageViewer: React.FC<ImageViewerProps> = ({
     } else if (containerRef.current.requestFullscreen) {
       containerRef.current.requestFullscreen();
       setIsFullscreen(true);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     } else if ((containerRef.current as any).webkitRequestFullscreen) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       (containerRef.current as any).webkitRequestFullscreen();
       setIsFullscreen(true);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     } else if ((containerRef.current as any).msRequestFullscreen) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       (containerRef.current as any).msRequestFullscreen();
       setIsFullscreen(true);
     }
@@ -130,6 +134,7 @@ const ImageViewer: React.FC<ImageViewerProps> = ({
         role="img"
         aria-label={alt}
       >
+        {/* eslint-disable-next-line @next/next/no-img-element */}
         <img
           ref={imageRef}
           src={currentSrc}

@@ -1,6 +1,6 @@
 'use client'
 
-import React, { useState, useRef, useEffect } from 'react'
+import React, { useState, useRef, useEffect, useCallback } from 'react'
 import { Upload, FileText, CheckCircle, AlertCircle, Loader, RefreshCw } from 'lucide-react'
 import IngestionStatus from '../IngestionStatus'
 
@@ -26,20 +26,16 @@ interface DocumentRecord {
   error_message?: string
 }
 
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE || 'http://localhost:8000'
+
 export function DocumentUpload() {
   const [files, setFiles] = useState<UploadedFile[]>([])
   const [previousDocs, setPreviousDocs] = useState<DocumentRecord[]>([])
   const [isUploading, setIsUploading] = useState(false)
   const [isLoadingDocs, setIsLoadingDocs] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
-  const API_BASE = process.env.NEXT_PUBLIC_API_BASE || 'http://localhost:8000'
 
-  // Load previously uploaded documents on mount
-  useEffect(() => {
-    loadPreviousDocuments()
-  }, [])
-
-  const loadPreviousDocuments = async () => {
+  const loadPreviousDocuments = useCallback(async () => {
     setIsLoadingDocs(true)
     try {
       const response = await fetch(`${API_BASE}/admin/documents/list`)
@@ -55,7 +51,12 @@ export function DocumentUpload() {
     } finally {
       setIsLoadingDocs(false)
     }
-  }
+  }, [])
+
+  // Load previously uploaded documents on mount
+  useEffect(() => {
+    loadPreviousDocuments()
+  }, [loadPreviousDocuments])
 
   const getStatusBadge = (status: string) => {
     switch (status) {
@@ -191,7 +192,7 @@ export function DocumentUpload() {
         <h3 className="font-medium text-blue-900 mb-2">📝 How to Upload Documents</h3>
         <ul className="text-sm text-blue-800 space-y-1 list-disc list-inside">
           <li>Supported formats: PDF, DOCX, TXT, HTML, JSON</li>
-          <li>Maximum file size: 50 MB</li>
+          <li>Maximum file size: 200 MB</li>
           <li>Drag and drop files or click to browse</li>
           <li>After upload, documents will be processed and indexed automatically</li>
         </ul>

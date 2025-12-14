@@ -22,7 +22,6 @@ import {
   Database, 
   Activity, 
   TrendingUp,
-  Server,
   Clock,
   Download,
   RefreshCw
@@ -137,6 +136,7 @@ export function AdminDashboard({ className = '' }: AdminDashboardProps) {
   }: {
     title: string
     value: string | number
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     icon: any
     change?: string
     color?: string

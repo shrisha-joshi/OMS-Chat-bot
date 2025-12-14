@@ -35,7 +35,8 @@ ADMIN_CREDENTIALS = {
 def get_admin_password_hash():
     """Get admin password hash, creating it if needed."""
     if ADMIN_CREDENTIALS["admin"]["password_hash"] is None:
-        ADMIN_CREDENTIALS["admin"]["password_hash"] = pwd_context.hash("admin123")
+        # Use ADMIN_PASSWORD from settings (configured via .env)
+        ADMIN_CREDENTIALS["admin"]["password_hash"] = pwd_context.hash(settings.admin_password)
     return ADMIN_CREDENTIALS["admin"]["password_hash"]
 
 class AuthService:

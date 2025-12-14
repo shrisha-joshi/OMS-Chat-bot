@@ -79,7 +79,7 @@ class LLMHandler:
         # LMStudio (primary)
         self.providers.append({
             "name": "lmstudio",
-            "url": settings.lmstudio_api_url or "http://localhost:1234/v1" or "http://192.168.56.1:1234",
+            "url": settings.lmstudio_api_url or "http://localhost:1234/v1",
             "type": "openai_compatible",
             "model": settings.lmstudio_model_name or "mistral-7b-instruct-v0.3",
             "enabled": True,
@@ -226,7 +226,12 @@ class LLMHandler:
                         
                 except Exception as e:
                     logger.warning(f"Provider '{provider['name']}' failed (attempt {attempt + 1}/{self.max_retries}): {e}", exc_info=True)
+                    
+                    # Safely update health status
+                    if provider["name"] not in self.provider_health:
+                        self.provider_health[provider["name"]] = {}
                     self.provider_health[provider["name"]]["healthy"] = False
+                    
                     logger.warning(f"Marked '{provider['name']}' as unhealthy")
                     
                     if attempt < self.max_retries - 1:
@@ -249,8 +254,8 @@ class LLMHandler:
         top_p: float,
         max_tokens: int,
         prompt_tokens: int
-    ) -> str:
-        """Get non-streaming response from provider. Returns response text directly."""
+    ) -> Dict[str, Any]:
+        """Get non-streaming response from provider. Returns response dict."""
         try:
             url = f"{provider['url']}/chat/completions"
             logger.info(f"🔗 Connecting to LMStudio at {url}")
@@ -322,7 +327,11 @@ class LLMHandler:
             # Log token usage
             logger.debug(f"Token usage - Prompt: {prompt_tokens}, Completion: {completion_tokens}, Total: {total_tokens}")
             
-            return response_content  # Return just the string, not dict
+            return {
+                "response": response_content,
+                "tokens_generated": completion_tokens,
+                "model": provider["model"]
+            }
             
             
         except Exception as e:

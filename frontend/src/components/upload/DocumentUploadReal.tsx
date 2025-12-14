@@ -23,10 +23,18 @@ interface DocumentUploadProps {
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE || 'http://localhost:8000'
 
+// Get auth token (you'll need to implement auth)
+const getAuthToken = () => {
+  if (globalThis.window !== undefined) {
+    return localStorage.getItem('auth_token') || 'admin_token'
+  }
+  return 'admin_token'
+}
+
 export function DocumentUploadReal({
   onUploadComplete,
   maxFiles = 10,
-  maxSize = 10485760 // 10MB
+  maxSize = 209715200 // 200MB
 }: Readonly<DocumentUploadProps>) {
   const [uploadedFiles, setUploadedFiles] = useState<UploadedFile[]>([])
   const [isUploading, setIsUploading] = useState(false)
@@ -37,14 +45,6 @@ export function DocumentUploadReal({
   React.useEffect(() => {
     setIsMounted(true)
   }, [])
-
-  // Get auth token (you'll need to implement auth)
-  const getAuthToken = () => {
-    if (globalThis.window !== undefined) {
-      return localStorage.getItem('auth_token') || 'admin_token'
-    }
-    return 'admin_token'
-  }
 
   const handleDragEnter = useCallback((e: React.DragEvent) => {
     e.preventDefault()
@@ -66,7 +66,7 @@ export function DocumentUploadReal({
     e.stopPropagation()
   }, [])
 
-  const uploadFile = async (file: File): Promise<void> => {
+  const uploadFile = useCallback(async (file: File): Promise<void> => {
     const fileId = `${Date.now()}-${Math.random()}`
 
     const newFile: UploadedFile = {
@@ -173,7 +173,7 @@ export function DocumentUploadReal({
       )
       toast.error(`${file.name}: ${errorMessage}`)
     }
-  }
+  }, [maxSize])
 
   const handleDrop = useCallback(async (e: React.DragEvent) => {
     e.preventDefault()
@@ -197,7 +197,7 @@ export function DocumentUploadReal({
     }
     setIsUploading(false)
     onUploadComplete?.(uploadedFiles)
-  }, [uploadedFiles, maxFiles, onUploadComplete])
+  }, [uploadedFiles, maxFiles, onUploadComplete, uploadFile])
 
   const handleFileSelect = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files || [])
@@ -214,7 +214,7 @@ export function DocumentUploadReal({
     }
     setIsUploading(false)
     onUploadComplete?.(uploadedFiles)
-  }, [uploadedFiles, maxFiles, onUploadComplete])
+  }, [uploadedFiles, maxFiles, onUploadComplete, uploadFile])
 
   const removeFile = (fileId: string) => {
     setUploadedFiles(prev => prev.filter(f => f.id !== fileId))
