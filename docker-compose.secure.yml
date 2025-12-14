@@ -1,0 +1,120 @@
+# SECURITY: Docker Compose Template with Environment Variables
+# Copy this to docker-compose.yml and create a .env file with actual secrets
+# NEVER commit .env file to version control!
+
+version: '3.8'
+
+services:
+  # MongoDB - Document storage and GridFS
+  mongodb:
+    image: mongo:7.0
+    container_name: oms_mongodb
+    restart: always
+    ports:
+      - "${MONGODB_PORT:-27017}:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGODB_ROOT_USERNAME}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGODB_ROOT_PASSWORD}
+      MONGO_INITDB_DATABASE: ${MONGODB_DB_NAME:-company_kb}
+    volumes:
+      - mongodb_data:/data/db
+    healthcheck:
+      test: echo 'db.runCommand("ping").ok' | mongosh localhost/test --quiet
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - oms_network
+
+  # Qdrant Vector Database
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: oms_qdrant
+    restart: always
+    ports:
+      - "${QDRANT_PORT:-6333}:6333"
+      - "${QDRANT_GRPC_PORT:-6334}:6334"
+    environment:
+      QDRANT_API_KEY: ${QDRANT_API_KEY}
+    volumes:
+      - qdrant_data:/qdrant/storage
+    healthcheck:
+      test: curl -f http://localhost:6333/health || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - oms_network
+
+  # ArangoDB Graph Database  
+  arangodb:
+    image: arangodb:3.11
+    container_name: oms_arangodb
+    restart: always
+    ports:
+      - "${ARANGODB_PORT:-8529}:8529"
+    environment:
+      ARANGO_ROOT_PASSWORD: ${ARANGO_ROOT_PASSWORD}
+      ARANGO_STORAGE_ENGINE: rocksdb
+    volumes:
+      - arangodb_data:/var/lib/arangodb3
+      - arangodb_apps:/var/lib/arangodb3-apps
+    healthcheck:
+      test: curl -f http://localhost:8529/_api/version || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - oms_network
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: oms_redis
+    restart: always
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    command: redis-server --appendonly yes ${REDIS_PASSWORD:+--requirepass ${REDIS_PASSWORD}}
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: redis-cli ${REDIS_PASSWORD:+-a ${REDIS_PASSWORD}} ping
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - oms_network
+
+volumes:
+  mongodb_data:
+  arangodb_data:
+  arangodb_apps:
+  qdrant_data:
+  redis_data:
+
+networks:
+  oms_network:
+    driver: bridge
+
+# ========== SECURITY NOTES ==========
+#
+# 1. Create a .env file in the same directory with:
+#    MONGODB_ROOT_USERNAME=your_secure_username
+#    MONGODB_ROOT_PASSWORD=your_secure_password_min_16_chars
+#    QDRANT_API_KEY=your_qdrant_key_min_32_chars
+#    ARANGO_ROOT_PASSWORD=your_arango_password_min_16_chars
+#    REDIS_PASSWORD=your_redis_password_min_16_chars
+#
+# 2. Generate secure passwords:
+#    openssl rand -base64 32
+#
+# 3. Add .env to .gitignore (should already be there)
+#
+# 4. For production, use secrets management:
+#    - Docker Swarm: docker secret create
+#    - Kubernetes: kubectl create secret
+#    - Cloud: AWS Secrets Manager, Azure Key Vault, GCP Secret Manager
+#
+# 5. Never use default passwords like "password", "admin123", etc.
+#
+# 6. Rotate credentials every 90 days in production
